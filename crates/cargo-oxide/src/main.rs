@@ -23,6 +23,7 @@
 //! ```
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 mod backend;
 mod commands;
@@ -96,6 +97,28 @@ enum Commands {
         /// Also settable via CUDA_OXIDE_NO_FMA=1.
         #[arg(long)]
         no_fmad: bool,
+    },
+    /// Compile a crate's device code to a binary LTOIR artifact in one step.
+    ///
+    /// Produces the SIMT artifact a tile or C++ kernel links against
+    /// (NVVM IR emission followed by libNVVM `-gen-lto`), writing
+    /// `<crate>.ltoir`. See the Tile-to-SIMT interop tracker (#96).
+    EmitLtoir {
+        /// Crate name (required in workspace, optional for standalone projects)
+        example: Option<String>,
+        /// Target architecture (e.g. sm_90, sm_100, sm_120). Required: LTOIR is
+        /// architecture-specific.
+        #[arg(long)]
+        arch: String,
+        /// Comma-separated list of features to enable
+        #[arg(long)]
+        features: Option<String>,
+        /// Output path for the `.ltoir` file (default: <crate-dir>/<crate>.ltoir)
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+        /// Show verbose compilation output
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Show the full compilation pipeline (MIR -> PTX/NVVM IR) with verbose output
     Pipeline {
@@ -207,6 +230,24 @@ fn main() {
                 arch.as_deref(),
                 features.as_deref(),
                 no_fmad,
+            );
+        }
+        Commands::EmitLtoir {
+            example,
+            arch,
+            features,
+            output,
+            verbose,
+        } => {
+            let ctx = commands::resolve_context();
+            let example = resolve_example_name(example, &ctx, "emit-ltoir");
+            commands::emit_ltoir(
+                &ctx,
+                &example,
+                &arch,
+                features.as_deref(),
+                output.as_deref(),
+                verbose,
             );
         }
         Commands::Pipeline {
