@@ -763,12 +763,21 @@ fn write_device_artifact_object(
         .join(&safe_output_name)
         .join(sanitize_path_component(host_target));
     std::fs::create_dir_all(&object_dir)?;
+    let object_extension = embedded_object_extension(host_target);
     let object_path = object_dir.join(format!(
-        "{safe_output_name}.{}.{artifact_id}.embed.o",
+        "{safe_output_name}.{}.{artifact_id}.embed.{object_extension}",
         std::process::id(),
     ));
     std::fs::write(&object_path, object)?;
     Ok(object_path)
+}
+
+fn embedded_object_extension(host_target: &str) -> &'static str {
+    if host_target.to_ascii_lowercase().contains("windows") {
+        "obj"
+    } else {
+        "o"
+    }
 }
 
 fn sanitize_path_component(name: &str) -> String {

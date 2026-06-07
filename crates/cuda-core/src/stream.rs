@@ -100,7 +100,7 @@ impl CudaStream {
         let cu_stream = unsafe {
             cuda_bindings::cuStreamCreate(
                 cu_stream.as_mut_ptr(),
-                cuda_bindings::CUstream_flags_enum_CU_STREAM_NON_BLOCKING,
+                cuda_bindings::CUstream_flags_enum_CU_STREAM_NON_BLOCKING as _,
             )
             .result()?;
             cu_stream.assume_init()
@@ -148,7 +148,7 @@ impl CudaStream {
             cuda_bindings::cuStreamWaitEvent(
                 self.cu_stream,
                 event.cu_event(),
-                cuda_bindings::CUevent_wait_flags_enum_CU_EVENT_WAIT_DEFAULT,
+                cuda_bindings::CUevent_wait_flags_enum_CU_EVENT_WAIT_DEFAULT as _,
             )
             .result()
         }
@@ -172,14 +172,21 @@ impl CudaStream {
         &self,
         host_func: F,
     ) -> Result<(), DriverError> {
-        let boxed = Box::new(host_func);
-        unsafe {
+        let callback = Box::into_raw(Box::new(host_func)) as *mut c_void;
+        let result = unsafe {
             cuda_bindings::cuLaunchHostFunc(
                 self.cu_stream,
                 Some(Self::callback_wrapper::<F>),
-                Box::into_raw(boxed) as *mut c_void,
+                callback,
             )
             .result()
+        };
+
+        if let Err(err) = result {
+            let _ = unsafe { Box::from_raw(callback as *mut F) };
+            Err(err)
+        } else {
+            Ok(())
         }
     }
 

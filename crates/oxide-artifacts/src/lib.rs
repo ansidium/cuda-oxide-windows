@@ -531,7 +531,7 @@ pub fn build_host_object_for_target(
     anchor_symbol: Option<&str>,
 ) -> Result<Vec<u8>, ArtifactError> {
     use object::write::{Object, Symbol, SymbolSection};
-    use object::{SectionFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
+    use object::{SectionKind, SymbolFlags, SymbolKind, SymbolScope};
 
     if section_data.is_empty() {
         return Err(ArtifactError::EmptyPayload);
@@ -546,9 +546,7 @@ pub fn build_host_object_for_target(
     );
     let section = object.section_mut(section_id);
     section.set_data(section_data.to_vec(), 8);
-    section.flags = SectionFlags::Elf {
-        sh_flags: elf::SHF_ALLOC | elf::SHF_GNU_RETAIN,
-    };
+    section.flags = target.section_flags();
 
     if let Some(anchor_symbol) = anchor_symbol {
         // Global binding so the symbol can satisfy undefined references
@@ -597,6 +595,8 @@ impl HostObjectTarget {
 
         let format = if target.contains("linux") {
             object::BinaryFormat::Elf
+        } else if target.contains("windows-msvc") {
+            object::BinaryFormat::Coff
         } else {
             return Err(ArtifactError::UnsupportedHostTarget(target));
         };
@@ -606,6 +606,19 @@ impl HostObjectTarget {
             architecture,
             endianness,
         })
+    }
+
+    fn section_flags(self) -> object::SectionFlags {
+        match self.format {
+            object::BinaryFormat::Elf => object::SectionFlags::Elf {
+                sh_flags: elf::SHF_ALLOC | elf::SHF_GNU_RETAIN,
+            },
+            object::BinaryFormat::Coff => object::SectionFlags::Coff {
+                characteristics: object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA
+                    | object::pe::IMAGE_SCN_MEM_READ,
+            },
+            _ => object::SectionFlags::None,
+        }
     }
 }
 
@@ -879,13 +892,46 @@ mod tests {
     #[cfg(all(feature = "object-read", feature = "object-write"))]
     #[test]
     fn host_object_round_trips_section_on_supported_formats() {
+        use object::{Object, ObjectSection, SectionFlags};
+
         let blob = build_artifact_blob(&ArtifactBundleSpec::new("demo", "sm_90").with_payload(
             ArtifactPayloadSpec::new(ArtifactPayloadKind::Ptx, "demo.ptx", b"ptx"),
         ))
         .unwrap();
 
-        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
+        ] {
             let object = build_host_object_for_target(&blob, target, None).unwrap();
+            let file = object::File::parse(&*object).unwrap();
+            let section = file
+                .sections()
+                .find(|section| section.name() == Ok(ARTIFACT_SECTION_NAME))
+                .unwrap();
+            match file.format() {
+                object::BinaryFormat::Elf => assert_eq!(
+                    section.flags(),
+                    SectionFlags::Elf {
+                        sh_flags: elf::SHF_ALLOC | elf::SHF_GNU_RETAIN,
+                    }
+                ),
+                object::BinaryFormat::Coff => match section.flags() {
+                    SectionFlags::Coff { characteristics } => {
+                        assert_ne!(
+                            characteristics & object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA,
+                            0
+                        );
+                        assert_ne!(characteristics & object::pe::IMAGE_SCN_MEM_READ, 0);
+                        assert_eq!(characteristics & object::pe::IMAGE_SCN_MEM_WRITE, 0);
+                    }
+                    flags => panic!("expected COFF section flags, got {flags:?}"),
+                },
+                format => panic!("unexpected object format {format:?}"),
+            }
+
             let bundles = read_artifact_bundles_from_object_bytes(&object).unwrap();
             assert_eq!(bundles.len(), 1);
             assert_eq!(
@@ -940,10 +986,14 @@ mod tests {
 
     #[cfg(feature = "object-write")]
     #[test]
-    fn host_object_rejects_non_cuda_host_targets() {
+    fn host_object_rejects_unsupported_host_targets() {
         let blob = sample_blob();
 
-        for target in ["powerpc64le-unknown-linux-gnu", "x86_64-apple-darwin"] {
+        for target in [
+            "powerpc64le-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+            "x86_64-pc-windows-gnu",
+        ] {
             assert!(matches!(
                 build_host_object_for_target(&blob, target, None),
                 Err(ArtifactError::UnsupportedHostTarget(_))

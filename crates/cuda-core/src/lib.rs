@@ -239,21 +239,8 @@ pub unsafe fn launch_kernel_ex(
     stream: cuda_bindings::CUstream,
     kernel_params: &mut [*mut std::ffi::c_void],
 ) -> Result<(), DriverError> {
-    // CUlaunchAttribute_st is opaque (see cuda-bindings/build.rs) for CUDA 13.2+
-    // compatibility. C layout: { id: u32 @ 0, pad: [u8;4] @ 4, value: union @ 8 }.
-    // clusterDim is three u32 fields (x, y, z) at offset 0 within the value union.
     let mut cluster_attr: cuda_bindings::CUlaunchAttribute_st = unsafe { std::mem::zeroed() };
-    unsafe {
-        let base = &mut cluster_attr as *mut _ as *mut u8;
-        // id at offset 0
-        (base as *mut u32)
-            .write(cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION);
-        // clusterDim.x/y/z at offsets 8, 12, 16
-        let dim_ptr = base.add(8) as *mut u32;
-        dim_ptr.write(cluster_dim.0);
-        dim_ptr.add(1).write(cluster_dim.1);
-        dim_ptr.add(2).write(cluster_dim.2);
-    }
+    unsafe { write_cluster_dim_attribute(&mut cluster_attr, cluster_dim) };
 
     let config = cuda_bindings::CUlaunchConfig_st {
         gridDimX: grid_dim.0,
@@ -361,18 +348,8 @@ pub unsafe fn launch_kernel_cooperative(
     stream: cuda_bindings::CUstream,
     kernel_params: &mut [*mut std::ffi::c_void],
 ) -> Result<(), DriverError> {
-    // CUlaunchAttribute_st is opaque (see cuda-bindings/build.rs) for CUDA 13.2+
-    // compatibility. C layout: { id: u32 @ 0, pad: [u8;4] @ 4, value: union @ 8 }.
-    // For the COOPERATIVE attribute the value union holds a single `int cooperative`
-    // at offset 0 — set to 1 to enable, 0 to disable.
     let mut coop_attr: cuda_bindings::CUlaunchAttribute_st = unsafe { std::mem::zeroed() };
-    unsafe {
-        let base = &mut coop_attr as *mut _ as *mut u8;
-        (base as *mut u32)
-            .write(cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_COOPERATIVE);
-        let val_ptr = base.add(8) as *mut i32;
-        val_ptr.write(1);
-    }
+    unsafe { write_cooperative_attribute(&mut coop_attr, 1) };
 
     let config = cuda_bindings::CUlaunchConfig_st {
         gridDimX: grid_dim.0,
@@ -470,25 +447,10 @@ pub unsafe fn launch_kernel_ex_cooperative(
     stream: cuda_bindings::CUstream,
     kernel_params: &mut [*mut std::ffi::c_void],
 ) -> Result<(), DriverError> {
-    // CUlaunchAttribute_st is opaque (see cuda-bindings/build.rs) for CUDA 13.2+
-    // compatibility. C layout: { id: u32 @ 0, pad: [u8;4] @ 4, value: union @ 8 }.
-    // attrs[0]: clusterDim — three u32 fields (x, y, z) at offset 0 of the union.
-    // attrs[1]: cooperative — a single `int` at offset 0 of the union; 1 = enabled.
     let mut attrs: [cuda_bindings::CUlaunchAttribute_st; 2] = unsafe { std::mem::zeroed() };
     unsafe {
-        let base = &mut attrs[0] as *mut _ as *mut u8;
-        (base as *mut u32)
-            .write(cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION);
-        let dim_ptr = base.add(8) as *mut u32;
-        dim_ptr.write(cluster_dim.0);
-        dim_ptr.add(1).write(cluster_dim.1);
-        dim_ptr.add(2).write(cluster_dim.2);
-
-        let base = &mut attrs[1] as *mut _ as *mut u8;
-        (base as *mut u32)
-            .write(cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_COOPERATIVE);
-        let val_ptr = base.add(8) as *mut i32;
-        val_ptr.write(1);
+        write_cluster_dim_attribute(&mut attrs[0], cluster_dim);
+        write_cooperative_attribute(&mut attrs[1], 1);
     }
 
     let config = cuda_bindings::CUlaunchConfig_st {
@@ -551,5 +513,121 @@ pub unsafe fn launch_kernel_ex_cooperative_on_stream(
             stream.cu_stream(),
             kernel_params,
         )
+    }
+}
+
+/// Writes the opaque `CUlaunchAttribute_st` id field.
+///
+/// CUDA 13.2+ bindgen keeps `CUlaunchAttribute_st` opaque for compatibility.
+/// C layout: `{ id: u32 @ 0, pad: [u8; 4] @ 4, value: union @ 8 }`.
+unsafe fn write_launch_attribute_id(
+    attr: &mut cuda_bindings::CUlaunchAttribute_st,
+    id: cuda_bindings::CUlaunchAttributeID,
+) {
+    let base = attr as *mut _ as *mut u8;
+    unsafe { (base as *mut u32).write(launch_attribute_id_bits(id)) };
+}
+
+fn launch_attribute_id_bits(id: cuda_bindings::CUlaunchAttributeID) -> u32 {
+    #[allow(clippy::unnecessary_cast)]
+    {
+        id as u32
+    }
+}
+
+/// Writes `CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION`.
+///
+/// `clusterDim` is three `u32` fields (`x`, `y`, `z`) at offset 0 within the
+/// value union, so the fields live at byte offsets 8, 12, and 16.
+unsafe fn write_cluster_dim_attribute(
+    attr: &mut cuda_bindings::CUlaunchAttribute_st,
+    cluster_dim: (u32, u32, u32),
+) {
+    unsafe {
+        write_launch_attribute_id(
+            attr,
+            cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION,
+        );
+        let base = attr as *mut _ as *mut u8;
+        let dim_ptr = base.add(8) as *mut u32;
+        dim_ptr.write(cluster_dim.0);
+        dim_ptr.add(1).write(cluster_dim.1);
+        dim_ptr.add(2).write(cluster_dim.2);
+    }
+}
+
+/// Writes `CU_LAUNCH_ATTRIBUTE_COOPERATIVE`.
+///
+/// The `cooperative` integer lives at offset 0 within the value union, so it is
+/// written at byte offset 8.
+unsafe fn write_cooperative_attribute(
+    attr: &mut cuda_bindings::CUlaunchAttribute_st,
+    cooperative: i32,
+) {
+    unsafe {
+        write_launch_attribute_id(
+            attr,
+            cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_COOPERATIVE,
+        );
+        let base = attr as *mut _ as *mut u8;
+        (base.add(8) as *mut i32).write(cooperative);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::TryInto;
+
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn read_i32(bytes: &[u8], offset: usize) -> i32 {
+        i32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn launch_attribute_manual_offsets_fit_bindgen_blob() {
+        let size = std::mem::size_of::<cuda_bindings::CUlaunchAttribute_st>();
+        assert!(size >= 20);
+        assert!(
+            std::mem::align_of::<cuda_bindings::CUlaunchAttribute_st>()
+                >= std::mem::align_of::<u32>()
+        );
+
+        let mut cluster_attr: cuda_bindings::CUlaunchAttribute_st = unsafe { std::mem::zeroed() };
+        unsafe { write_cluster_dim_attribute(&mut cluster_attr, (11, 12, 13)) };
+        let cluster_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&cluster_attr as *const cuda_bindings::CUlaunchAttribute_st).cast::<u8>(),
+                size,
+            )
+        };
+        assert_eq!(
+            read_u32(cluster_bytes, 0),
+            launch_attribute_id_bits(
+                cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+            )
+        );
+        assert_eq!(read_u32(cluster_bytes, 8), 11);
+        assert_eq!(read_u32(cluster_bytes, 12), 12);
+        assert_eq!(read_u32(cluster_bytes, 16), 13);
+
+        let mut coop_attr: cuda_bindings::CUlaunchAttribute_st = unsafe { std::mem::zeroed() };
+        unsafe { write_cooperative_attribute(&mut coop_attr, 1) };
+        let coop_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&coop_attr as *const cuda_bindings::CUlaunchAttribute_st).cast::<u8>(),
+                size,
+            )
+        };
+        assert_eq!(
+            read_u32(coop_bytes, 0),
+            launch_attribute_id_bits(
+                cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_COOPERATIVE
+            )
+        );
+        assert_eq!(read_i32(coop_bytes, 8), 1);
     }
 }

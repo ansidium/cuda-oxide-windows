@@ -131,6 +131,7 @@ unsafe impl DeviceCopy for half::f16 {}
 pub struct DeviceBuffer<T> {
     ptr: CUdeviceptr,
     len: usize,
+    num_bytes: usize,
     ctx: Arc<CudaContext>,
     /// When the allocation came from the stream-ordered pool
     /// (`cuMemAllocAsync`), this holds an `Arc` to the owning stream so the
@@ -192,7 +193,7 @@ impl<T> DeviceBuffer<T> {
     /// Total size in bytes (`len * size_of::<T>()`).
     #[inline]
     pub fn num_bytes(&self) -> usize {
-        self.len * std::mem::size_of::<T>()
+        self.num_bytes
     }
 
     /// Returns a reference to the owning context.
@@ -213,9 +214,12 @@ impl<T> DeviceBuffer<T> {
     ///   freed with the synchronous `cuMemFree` on drop. Do not pass a
     ///   stream-ordered (`cuMemAllocAsync`) pointer here.
     pub unsafe fn from_raw_parts(ptr: CUdeviceptr, len: usize, ctx: Arc<CudaContext>) -> Self {
+        let num_bytes = crate::memory::allocation_size::<T>(len)
+            .expect("device buffer byte size overflow in from_raw_parts");
         Self {
             ptr,
             len,
+            num_bytes,
             ctx,
             dealloc_stream: None,
             _marker: PhantomData,
@@ -273,6 +277,37 @@ impl<T> DeviceBuffer<T> {
     }
 }
 
+struct DeviceAllocationGuard {
+    ptr: CUdeviceptr,
+    ctx: Arc<CudaContext>,
+    armed: bool,
+}
+
+impl DeviceAllocationGuard {
+    fn new(ptr: CUdeviceptr, ctx: Arc<CudaContext>) -> Self {
+        Self {
+            ptr,
+            ctx,
+            armed: true,
+        }
+    }
+
+    fn into_ptr(mut self) -> CUdeviceptr {
+        self.armed = false;
+        self.ptr
+    }
+}
+
+impl Drop for DeviceAllocationGuard {
+    fn drop(&mut self) {
+        if self.armed && self.ptr != 0 {
+            self.ctx.record_err(self.ctx.bind_to_thread());
+            self.ctx
+                .record_err(unsafe { crate::memory::free_sync(self.ptr) });
+        }
+    }
+}
+
 impl<T: DeviceCopy> DeviceBuffer<T> {
     /// Allocates device memory and copies `data` from the host, enqueued on
     /// `stream`.
@@ -281,44 +316,34 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
     /// the next synchronization point on `stream`). For pageable host memory
     /// the driver may internally synchronize; use pinned memory for true
     /// async overlap.
-    ///
-    /// An empty `data` slice yields an empty buffer without touching the
-    /// driver allocator.
-    ///
-    /// # Allocation safety on error
-    ///
-    /// The returned buffer takes ownership of the device allocation
-    /// immediately after `malloc_sync`, before the fallible
-    /// `memcpy_htod_async` enqueue runs. If the enqueue fails, the early
-    /// return drops the buffer and its `Drop` impl frees the allocation, so
-    /// no device memory is leaked.
     pub fn from_host(stream: &CudaStream, data: &[T]) -> Result<Self, DriverError> {
         let ctx = stream.context().clone();
         let len = data.len();
-        let num_bytes = std::mem::size_of_val(data);
+        let num_bytes = crate::memory::allocation_size::<T>(len)?;
 
-        // cuMemAlloc rejects zero-byte requests with CUDA_ERROR_INVALID_VALUE,
-        // so represent an empty buffer as a null pointer (Drop skips it).
-        if num_bytes == 0 {
-            // SAFETY: a null pointer with zero bytes is never dereferenced
-            // and Drop ignores it.
-            return Ok(unsafe { Self::from_raw_parts(0, len, ctx) });
-        }
-
-        let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
-        // SAFETY: `ptr` was just allocated with `num_bytes` bytes in the
-        // stream's context; ownership transfers to `buf` here so any early
-        // return below frees it through the buffer's own `Drop`.
-        let buf = unsafe { Self::from_raw_parts(ptr, len, ctx) };
-        unsafe {
-            crate::memory::memcpy_htod_async(
-                buf.ptr,
-                data.as_ptr(),
-                num_bytes,
-                stream.cu_stream(),
-            )?;
-        }
-        Ok(buf)
+        let ptr = if num_bytes == 0 {
+            0
+        } else {
+            ctx.bind_to_thread()?;
+            let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
+            let guard = DeviceAllocationGuard::new(ptr, ctx.clone());
+            unsafe {
+                crate::memory::memcpy_htod_async(
+                    ptr,
+                    data.as_ptr(),
+                    num_bytes,
+                    stream.cu_stream(),
+                )?;
+            }
+            guard.into_ptr()
+        };
+        Ok(Self {
+            ptr,
+            len,
+            num_bytes,
+            ctx,
+            _marker: PhantomData,
+        })
     }
 
     /// Allocates device memory and enqueues a host-to-device copy from a
@@ -362,38 +387,28 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
 
     /// Allocates zero-initialized device memory of `len` elements, enqueued
     /// on `stream`.
-    ///
-    /// A `len` of zero (or a zero-sized `T`) yields an empty buffer without
-    /// touching the driver allocator.
-    ///
-    /// # Allocation safety on error
-    ///
-    /// The returned buffer takes ownership of the device allocation
-    /// immediately after `malloc_sync`, before the fallible
-    /// `memset_d8_async` enqueue runs. If the enqueue fails, the early
-    /// return drops the buffer and its `Drop` impl frees the allocation, so
-    /// no device memory is leaked.
     pub fn zeroed(stream: &CudaStream, len: usize) -> Result<Self, DriverError> {
         let ctx = stream.context().clone();
-        let num_bytes = len * std::mem::size_of::<T>();
+        let num_bytes = crate::memory::allocation_size::<T>(len)?;
 
-        // cuMemAlloc rejects zero-byte requests with CUDA_ERROR_INVALID_VALUE,
-        // so represent an empty buffer as a null pointer (Drop skips it).
-        if num_bytes == 0 {
-            // SAFETY: a null pointer with zero bytes is never dereferenced
-            // and Drop ignores it.
-            return Ok(unsafe { Self::from_raw_parts(0, len, ctx) });
-        }
-
-        let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
-        // SAFETY: `ptr` was just allocated with `num_bytes` bytes in the
-        // stream's context; ownership transfers to `buf` here so any early
-        // return below frees it through the buffer's own `Drop`.
-        let buf = unsafe { Self::from_raw_parts(ptr, len, ctx) };
-        unsafe {
-            crate::memory::memset_d8_async(buf.ptr, 0, num_bytes, stream.cu_stream())?;
-        }
-        Ok(buf)
+        let ptr = if num_bytes == 0 {
+            0
+        } else {
+            ctx.bind_to_thread()?;
+            let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
+            let guard = DeviceAllocationGuard::new(ptr, ctx.clone());
+            unsafe {
+                crate::memory::memset_d8_async(ptr, 0, num_bytes, stream.cu_stream())?;
+            }
+            guard.into_ptr()
+        };
+        Ok(Self {
+            ptr,
+            len,
+            num_bytes,
+            ctx,
+            _marker: PhantomData,
+        })
     }
 
     /// Copies the entire buffer back to the host, returning a `Vec<T>`.
@@ -402,15 +417,17 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
     /// to read immediately.
     pub fn to_host_vec(&self, stream: &CudaStream) -> Result<Vec<T>, DriverError> {
         let mut host = Vec::with_capacity(self.len);
-        unsafe {
-            crate::memory::memcpy_dtoh_async(
-                host.as_mut_ptr(),
-                self.ptr,
-                self.num_bytes(),
-                stream.cu_stream(),
-            )?;
+        if self.num_bytes != 0 {
+            unsafe {
+                crate::memory::memcpy_dtoh_async(
+                    host.as_mut_ptr(),
+                    self.ptr,
+                    self.num_bytes,
+                    stream.cu_stream(),
+                )?;
+            }
+            stream.synchronize()?;
         }
-        stream.synchronize()?;
         unsafe { host.set_len(self.len) };
         Ok(host)
     }
@@ -426,15 +443,18 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             dst.len(),
             self.len
         );
-        unsafe {
-            crate::memory::memcpy_dtoh_async(
-                dst.as_mut_ptr(),
-                self.ptr,
-                self.num_bytes(),
-                stream.cu_stream(),
-            )?;
+        if self.num_bytes != 0 {
+            unsafe {
+                crate::memory::memcpy_dtoh_async(
+                    dst.as_mut_ptr(),
+                    self.ptr,
+                    self.num_bytes,
+                    stream.cu_stream(),
+                )?;
+            }
+            stream.synchronize()?;
         }
-        stream.synchronize()
+        Ok(())
     }
 
     /// Copies the buffer contents into an existing pinned host buffer and
@@ -493,13 +513,17 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             dst.len(),
             self.len
         );
-        unsafe {
-            crate::memory::memcpy_dtoh_async(
-                dst.as_mut_ptr(),
-                self.ptr,
-                self.num_bytes(),
-                stream.cu_stream(),
-            )
+        if self.num_bytes == 0 {
+            Ok(())
+        } else {
+            unsafe {
+                crate::memory::memcpy_dtoh_async(
+                    dst.as_mut_ptr(),
+                    self.ptr,
+                    self.num_bytes,
+                    stream.cu_stream(),
+                )
+            }
         }
     }
 
@@ -546,8 +570,17 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             self.len
         );
         let num_bytes = src.num_bytes();
-        unsafe {
-            crate::memory::memcpy_htod_async(self.ptr, src.as_ptr(), num_bytes, stream.cu_stream())
+        if num_bytes == 0 {
+            Ok(())
+        } else {
+            unsafe {
+                crate::memory::memcpy_htod_async(
+                    self.ptr,
+                    src.as_ptr(),
+                    num_bytes,
+                    stream.cu_stream(),
+                )
+            }
         }
     }
 

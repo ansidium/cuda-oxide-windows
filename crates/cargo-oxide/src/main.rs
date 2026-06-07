@@ -26,6 +26,7 @@ use clap::{Parser, Subcommand};
 
 mod backend;
 mod commands;
+mod platform;
 
 /// Top-level CLI structure parsed by clap.
 ///

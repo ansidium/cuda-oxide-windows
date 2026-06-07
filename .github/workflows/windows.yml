@@ -1,0 +1,139 @@
+---
+name: windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_cuda_compile:
+        description: "Run the best-effort Windows CUDA compile lane"
+        required: false
+        default: false
+        type: boolean
+      run_gpu_smoke:
+        description: "Run the self-hosted Windows GPU smoke lane"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows-msvc-no-gpu:
+    name: windows-latest MSVC no-GPU canary
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - name: Configure MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install rustfmt for the pinned nightly
+        run: rustup component add rustfmt
+
+      - name: Install CUDA toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.2.0"
+          method: local
+
+      - name: Configure Windows CUDA and libclang paths
+        shell: pwsh
+        run: |
+          $cudaPath = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_HOME=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_TOOLKIT_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIB=$cudaPath\lib\x64;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INCLUDE=$cudaPath\include;$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          if (Test-Path $llvmBin) {
+            "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+            $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Build cargo-oxide
+        run: cargo build -p cargo-oxide
+
+      - name: Test oxide-artifacts object feature
+        run: cargo test -p oxide-artifacts --features object
+
+  windows-cuda-compile:
+    name: Windows CUDA compile (manual best effort)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_cuda_compile
+    runs-on: windows-latest
+    timeout-minutes: 90
+    continue-on-error: true
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - name: Configure MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CUDA toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.2.0"
+          method: local
+
+      - name: Configure Windows CUDA and libclang paths
+        shell: pwsh
+        run: |
+          $cudaPath = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_HOME=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_TOOLKIT_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIB=$cudaPath\lib\x64;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INCLUDE=$cudaPath\include;$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          if (Test-Path $llvmBin) {
+            "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+            $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+
+      - name: Build codegen backend
+        run: cargo oxide setup
+
+      - name: Compile vecadd
+        run: cargo oxide build vecadd --arch sm_75
+
+  windows-gpu-smoke:
+    name: Windows GPU smoke (self-hosted best effort)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu_smoke
+    runs-on: [self-hosted, Windows, X64, cuda-oxide-gpu]
+    timeout-minutes: 90
+    continue-on-error: true
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - name: Run PowerShell smoke test
+        shell: pwsh
+        run: .\scripts\smoketest.ps1

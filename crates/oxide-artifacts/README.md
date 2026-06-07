@@ -32,7 +32,7 @@ section by reading each blob's `total_len` field.
 The section-object writer is behind the `object-write` feature and uses the
 Rust `object` crate rather than hand-writing ELF. That keeps the common
 infrastructure portable across the CUDA host platforms this crate supports
-today: Linux on AMD64 and ARM64.
+today: Linux ELF on AMD64/ARM64 and Windows COFF on MSVC AMD64/ARM64.
 
 ## Wire Format
 
@@ -136,6 +136,12 @@ relocatable object with a single `.oxart` data section.
 The writer marks the ELF section as retained with
 `SHF_ALLOC | SHF_GNU_RETAIN`.
 
+For Windows MSVC host targets, the writer emits a COFF object and marks `.oxart`
+as initialized readable data with `IMAGE_SCN_CNT_INITIALIZED_DATA |
+IMAGE_SCN_MEM_READ`. The CUDA rustc backend writes those Windows artifact
+objects with the `.embed.obj` suffix; non-Windows targets continue to use
+`.embed.o`.
+
 The rustc CUDA backend writes the generated device artifact into one bundle
 blob, emits a host object for the current host target, and appends that object
 to rustc's compiled module list before linking. At runtime, `cuda-host` can read
@@ -168,4 +174,3 @@ cubin from embedded NVVM IR/LTOIR before loading.
 - Investigate whether compression is useful or necessary for embedded payloads,
   especially for large PTX bundles, and whether it belongs in this crate
   or in a higher-level packaging layer.
-- Consider Windows support later.

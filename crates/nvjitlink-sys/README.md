@@ -18,14 +18,18 @@ None. The library is loaded at runtime, so the CUDA Toolkit only needs to be pre
 `LibNvJitLink::load()` tries (in order):
 
 1. `LIBNVJITLINK_PATH` env var, if set.
-2. The system loader (`libnvJitLink.so.13`, `libnvJitLink.so.12`, `libnvJitLink.so`).
-3. `<root>/lib64/libnvJitLink.so` for `<root>` in `CUDA_TOOLKIT_PATH`, `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
+2. Platform loader candidates:
+   - Linux: `libnvJitLink.so.13`, `libnvJitLink.so.12`, `libnvJitLink.so`.
+   - Windows: discovered `nvJitLink_*.dll` files on the normal DLL search path.
+3. CUDA Toolkit roots from the shared toolkit discovery helper:
+   - Linux: `<root>/lib64/libnvJitLink.so`.
+   - Windows: `<root>\bin\x64\nvJitLink_*.dll`, then `<root>\bin\nvJitLink_*.dll`.
 
-nvJitLink ships with the standard CUDA Toolkit at `<cuda>/lib64/`. No separate download.
+nvJitLink ships with the standard CUDA Toolkit. On Linux it is under `<cuda>/lib64/`; on Windows it is typically a versioned DLL such as `nvJitLink_130_0.dll` under `<cuda>\bin\` or `<cuda>\bin\x64\`. Set `LIBNVJITLINK_PATH` to a full library path when you need an explicit override.
 
 ## Symbol naming
 
-`nvJitLink.h` `#define`s every public function to a versioned mangled name (e.g. `nvJitLinkCreate -> __nvJitLinkCreate_13_0`), but the library also exports the unversioned name with default ELF symbol versioning. `dlsym(handle, "nvJitLinkCreate")` resolves to the right function on every CUDA Toolkit version, so this binding does not need to probe per-CUDA-version symbol suffixes.
+`nvJitLink.h` `#define`s every public function to a versioned mangled name (e.g. `nvJitLinkCreate -> __nvJitLinkCreate_13_0`), but the runtime library also exports the public unversioned names used by this binding. `dlsym` / `GetProcAddress` for `nvJitLinkCreate` resolves to the right function, so this binding does not need to probe per-CUDA-version symbol suffixes.
 
 ## Usage
 
