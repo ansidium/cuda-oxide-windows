@@ -8,24 +8,26 @@
 //! libNVVM is the front-end of NVIDIA's PTX-targeting compiler. It accepts
 //! NVVM IR (an LLVM-IR dialect) and produces either PTX or LTOIR.
 //!
-//! This crate is a thin, RAII Rust binding that loads `libnvvm.so` lazily
-//! at runtime via `libloading`. It is not a `bindgen`-generated wrapper, so
-//! it does not require the CUDA Toolkit to be present at build time, only
-//! at run time.
+//! This crate is a thin, RAII Rust binding that loads libNVVM lazily at
+//! runtime via `libloading`. It is not a `bindgen`-generated wrapper, so it
+//! does not require the CUDA Toolkit to be present at build time, only at run
+//! time.
 //!
 //! # Library discovery
 //!
 //! [`LibNvvm::load`] tries (in order):
 //! 1. `LIBNVVM_PATH` env var, if set.
-//! 2. The system loader (`libnvvm.so.4`, `libnvvm.so.3`, `libnvvm.so`).
-//! 3. `<root>/nvvm/lib64/libnvvm.so` for `<root>` in `CUDA_TOOLKIT_PATH`,
-//!    `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
+//! 2. Platform loader names (`libnvvm.so.4`, `libnvvm.so.3`, `libnvvm.so` on
+//!    Linux; discovered `nvvm64_*.dll` files on Windows).
+//! 3. CUDA Toolkit roots from `cuda-toolkit-discovery`, including
+//!    `<root>/nvvm/lib64/libnvvm.so` on Linux and
+//!    `<root>/nvvm/bin/x64/nvvm64_*.dll` on Windows.
 //!
 //! # Symbol naming
 //!
 //! libNVVM uses plain unversioned symbol names (`nvvmCreateProgram` etc.),
-//! so a single `dlsym` lookup per function is sufficient across CUDA
-//! versions.
+//! so a single `dlsym` / `GetProcAddress` lookup per function is sufficient
+//! across CUDA versions.
 //!
 //! # Example
 //!
@@ -41,6 +43,7 @@
 
 use libloading::{Library, Symbol};
 use std::ffi::{CString, c_char, c_int, c_void};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use thiserror::Error;
@@ -54,21 +57,72 @@ use thiserror::Error;
 #[derive(Copy, Clone)]
 struct NvvmProgram(*mut c_void);
 
-/// libNVVM result codes (`nvvmResult`). Mirrors `nvvm.h`.
+type NvvmResultRaw = c_int;
+
+/// Known libNVVM result codes (`nvvmResult`). Mirrors `nvvm.h`.
 #[allow(dead_code)]
-#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum NvvmResult {
-    Success = 0,
-    OutOfMemory = 1,
-    ProgramCreationFailure = 2,
-    IrVersionMismatch = 3,
-    InvalidInput = 4,
-    InvalidProgram = 5,
-    InvalidIr = 6,
-    InvalidOption = 7,
-    NoModuleInProgram = 8,
-    CompilationFailure = 9,
+pub enum NvvmResultCode {
+    Success,
+    OutOfMemory,
+    ProgramCreationFailure,
+    IrVersionMismatch,
+    InvalidInput,
+    InvalidProgram,
+    InvalidIr,
+    InvalidOption,
+    NoModuleInProgram,
+    CompilationFailure,
+}
+
+impl NvvmResultCode {
+    fn from_raw(raw: NvvmResultRaw) -> Option<Self> {
+        Some(match raw {
+            0 => Self::Success,
+            1 => Self::OutOfMemory,
+            2 => Self::ProgramCreationFailure,
+            3 => Self::IrVersionMismatch,
+            4 => Self::InvalidInput,
+            5 => Self::InvalidProgram,
+            6 => Self::InvalidIr,
+            7 => Self::InvalidOption,
+            8 => Self::NoModuleInProgram,
+            9 => Self::CompilationFailure,
+            _ => return None,
+        })
+    }
+
+    fn as_raw(self) -> NvvmResultRaw {
+        match self {
+            Self::Success => 0,
+            Self::OutOfMemory => 1,
+            Self::ProgramCreationFailure => 2,
+            Self::IrVersionMismatch => 3,
+            Self::InvalidInput => 4,
+            Self::InvalidProgram => 5,
+            Self::InvalidIr => 6,
+            Self::InvalidOption => 7,
+            Self::NoModuleInProgram => 8,
+            Self::CompilationFailure => 9,
+        }
+    }
+}
+
+impl fmt::Display for NvvmResultCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Success => f.write_str("Success"),
+            Self::OutOfMemory => f.write_str("OutOfMemory"),
+            Self::ProgramCreationFailure => f.write_str("ProgramCreationFailure"),
+            Self::IrVersionMismatch => f.write_str("IrVersionMismatch"),
+            Self::InvalidInput => f.write_str("InvalidInput"),
+            Self::InvalidProgram => f.write_str("InvalidProgram"),
+            Self::InvalidIr => f.write_str("InvalidIr"),
+            Self::InvalidOption => f.write_str("InvalidOption"),
+            Self::NoModuleInProgram => f.write_str("NoModuleInProgram"),
+            Self::CompilationFailure => f.write_str("CompilationFailure"),
+        }
+    }
 }
 
 // ============================================================================
@@ -78,20 +132,21 @@ enum NvvmResult {
 /// All errors surfaced by this crate.
 #[derive(Debug, Error)]
 pub enum NvvmError {
-    /// `libnvvm.so` could not be located on this system. `tried` lists every
-    /// path or SONAME that was probed, in order, joined by newlines.
+    /// libNVVM could not be located on this system. `tried` lists every path,
+    /// loader name, or search pattern that was probed, in order, joined by
+    /// newlines.
     #[error(
-        "libnvvm.so could not be located. Set LIBNVVM_PATH, CUDA_TOOLKIT_PATH, or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
+        "libNVVM could not be located. Set LIBNVVM_PATH or a CUDA Toolkit root, or install the CUDA Toolkit. Tried:\n  {tried}"
     )]
     LibraryNotFound {
-        /// Newline-joined list of paths and SONAMEs that were probed.
+        /// Newline-joined list of paths, loader names, and search patterns.
         tried: String,
     },
 
-    /// `libnvvm.so` was loaded, but `dlsym` failed to resolve a function this
+    /// libNVVM was loaded, but `dlsym` failed to resolve a function this
     /// crate requires. Indicates an old or broken libNVVM that does not
     /// export the standard NVVM IR API.
-    #[error("libnvvm.so was found but a required symbol is missing: {symbol}: {source}")]
+    #[error("libNVVM was found but a required symbol is missing: {symbol}: {source}")]
     SymbolNotFound {
         /// Name of the missing libNVVM function (e.g. `nvvmCreateProgram`).
         symbol: &'static str,
@@ -100,18 +155,29 @@ pub enum NvvmError {
         source: libloading::Error,
     },
 
-    /// A libNVVM call returned a non-`Success` `nvvmResult`. `log` carries
-    /// the libNVVM program log when it is available, or the
+    /// A libNVVM call returned a known non-`Success` `nvvmResult`. `log`
+    /// carries the libNVVM program log when it is available, or the
     /// `nvvmGetErrorString` text otherwise.
-    #[error("libnvvm error in {operation}: {code:?}{}", .log.as_ref().map(|l| format!("\n--- libNVVM log ---\n{l}")).unwrap_or_default())]
+    #[error("libNVVM error in {operation}: {code}{}", .log.as_ref().map(|l| format!("\n--- libNVVM log ---\n{l}")).unwrap_or_default())]
     Call {
         /// Name of the libNVVM function that failed.
         operation: &'static str,
-        /// Raw `nvvmResult` integer.
-        code: i32,
+        /// Known `nvvmResult` value.
+        code: NvvmResultCode,
         /// Best-effort error message: program log first, then
         /// `nvvmGetErrorString`. `None` only if both were unavailable.
         log: Option<String>,
+    },
+
+    /// A libNVVM call returned an integer that does not map to any known
+    /// `nvvmResult` value. The raw value is preserved without constructing an
+    /// invalid Rust enum.
+    #[error("libNVVM returned unknown nvvmResult in {operation}: {code}")]
+    UnknownResult {
+        /// Name of the libNVVM function that returned the unknown result.
+        operation: &'static str,
+        /// Raw result integer returned by libNVVM.
+        code: c_int,
     },
 }
 
@@ -119,7 +185,7 @@ pub enum NvvmError {
 /// every path that was probed, in order, joined by newlines.
 #[derive(Debug, Error)]
 #[error(
-    "Could not locate libdevice.10.bc. Set CUDA_OXIDE_LIBDEVICE, CUDA_TOOLKIT_PATH, or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
+    "Could not locate libdevice.10.bc. Set CUDA_OXIDE_LIBDEVICE or a CUDA Toolkit root, or install the CUDA Toolkit. Tried:\n  {tried}"
 )]
 pub struct LibdeviceNotFound {
     /// Newline-joined list of paths that were probed.
@@ -141,17 +207,18 @@ pub struct LibdeviceNotFound {
 /// its own symbols.
 pub struct LibNvvm {
     _lib: Library,
-    create_program: unsafe extern "C" fn(*mut NvvmProgram) -> NvvmResult,
-    destroy_program: unsafe extern "C" fn(*mut NvvmProgram) -> NvvmResult,
+    create_program: unsafe extern "C" fn(*mut NvvmProgram) -> NvvmResultRaw,
+    destroy_program: unsafe extern "C" fn(*mut NvvmProgram) -> NvvmResultRaw,
     add_module:
-        unsafe extern "C" fn(NvvmProgram, *const c_char, usize, *const c_char) -> NvvmResult,
-    compile_program: unsafe extern "C" fn(NvvmProgram, c_int, *const *const c_char) -> NvvmResult,
-    get_compiled_result_size: unsafe extern "C" fn(NvvmProgram, *mut usize) -> NvvmResult,
-    get_compiled_result: unsafe extern "C" fn(NvvmProgram, *mut c_char) -> NvvmResult,
-    get_program_log_size: unsafe extern "C" fn(NvvmProgram, *mut usize) -> NvvmResult,
-    get_program_log: unsafe extern "C" fn(NvvmProgram, *mut c_char) -> NvvmResult,
-    get_error_string: unsafe extern "C" fn(NvvmResult) -> *const c_char,
-    version: unsafe extern "C" fn(*mut c_int, *mut c_int) -> NvvmResult,
+        unsafe extern "C" fn(NvvmProgram, *const c_char, usize, *const c_char) -> NvvmResultRaw,
+    compile_program:
+        unsafe extern "C" fn(NvvmProgram, c_int, *const *const c_char) -> NvvmResultRaw,
+    get_compiled_result_size: unsafe extern "C" fn(NvvmProgram, *mut usize) -> NvvmResultRaw,
+    get_compiled_result: unsafe extern "C" fn(NvvmProgram, *mut c_char) -> NvvmResultRaw,
+    get_program_log_size: unsafe extern "C" fn(NvvmProgram, *mut usize) -> NvvmResultRaw,
+    get_program_log: unsafe extern "C" fn(NvvmProgram, *mut c_char) -> NvvmResultRaw,
+    get_error_string: unsafe extern "C" fn(NvvmResultRaw) -> *const c_char,
+    version: unsafe extern "C" fn(*mut c_int, *mut c_int) -> NvvmResultRaw,
 }
 
 // SAFETY: After `load()`, the struct contains only `extern "C"` function
@@ -327,13 +394,13 @@ impl<'a> Program<'a> {
     fn try_log(&self) -> Option<String> {
         let mut size: usize = 0;
         let r = unsafe { (self.nvvm.get_program_log_size)(self.handle, &mut size) };
-        if r != NvvmResult::Success || size <= 1 {
+        if NvvmResultCode::from_raw(r) != Some(NvvmResultCode::Success) || size <= 1 {
             return None;
         }
         let mut buf = vec![0u8; size];
         let r =
             unsafe { (self.nvvm.get_program_log)(self.handle, buf.as_mut_ptr() as *mut c_char) };
-        if r != NvvmResult::Success {
+        if NvvmResultCode::from_raw(r) != Some(NvvmResultCode::Success) {
             return None;
         }
         // Trim trailing NUL.
@@ -358,22 +425,26 @@ impl Drop for Program<'_> {
 
 fn check(
     nvvm: &LibNvvm,
-    r: NvvmResult,
+    r: NvvmResultRaw,
     op: &'static str,
     log: Option<String>,
 ) -> Result<(), NvvmError> {
-    if r == NvvmResult::Success {
+    let code = NvvmResultCode::from_raw(r).ok_or(NvvmError::UnknownResult {
+        operation: op,
+        code: r,
+    })?;
+    if code == NvvmResultCode::Success {
         return Ok(());
     }
     Err(NvvmError::Call {
         operation: op,
-        code: r as i32,
-        log: log.or_else(|| error_string(nvvm, r)),
+        code,
+        log: log.or_else(|| error_string(nvvm, code)),
     })
 }
 
-fn error_string(nvvm: &LibNvvm, r: NvvmResult) -> Option<String> {
-    let p = unsafe { (nvvm.get_error_string)(r) };
+fn error_string(nvvm: &LibNvvm, r: NvvmResultCode) -> Option<String> {
+    let p = unsafe { (nvvm.get_error_string)(r.as_raw()) };
     if p.is_null() {
         return None;
     }
@@ -384,47 +455,199 @@ fn error_string(nvvm: &LibNvvm, r: NvvmResult) -> Option<String> {
     )
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LibraryCandidate {
+    Path(PathBuf),
+    LoaderName(&'static str),
+    SearchPattern {
+        dir: Option<PathBuf>,
+        pattern: &'static str,
+    },
+}
+
+impl LibraryCandidate {
+    fn description(&self) -> String {
+        match self {
+            Self::Path(path) => path.display().to_string(),
+            Self::LoaderName(name) => (*name).to_string(),
+            Self::SearchPattern {
+                dir: Some(dir),
+                pattern,
+            } => dir.join(pattern).display().to_string(),
+            Self::SearchPattern { dir: None, pattern } => (*pattern).to_string(),
+        }
+    }
+}
+
 fn open_library(tried: &mut Vec<String>) -> Option<Library> {
-    if let Ok(p) = std::env::var("LIBNVVM_PATH") {
-        let path = PathBuf::from(&p);
-        tried.push(path.display().to_string());
-        if let Ok(lib) = unsafe { Library::new(&path) } {
-            return Some(lib);
-        }
-    }
+    let override_path = std::env::var_os("LIBNVVM_PATH").map(PathBuf::from);
+    let discovered = cuda_toolkit_discovery::libnvvm_dll_candidates(target_triple_hint());
+    let candidates = library_candidates(override_path, &discovered);
+    open_library_from_candidates(&candidates, tried)
+}
 
-    for soname in ["libnvvm.so.4", "libnvvm.so.3", "libnvvm.so"] {
-        tried.push(soname.to_string());
-        if let Ok(lib) = unsafe { Library::new(soname) } {
-            return Some(lib);
-        }
-    }
-
-    for root in cuda_roots() {
-        let path = root.join("nvvm/lib64/libnvvm.so");
-        tried.push(path.display().to_string());
-        if let Ok(lib) = unsafe { Library::new(&path) } {
-            return Some(lib);
+fn open_library_from_candidates(
+    candidates: &[LibraryCandidate],
+    tried: &mut Vec<String>,
+) -> Option<Library> {
+    for candidate in candidates {
+        match candidate {
+            LibraryCandidate::Path(path) => {
+                if let Some(lib) = try_open_path(path, tried) {
+                    return Some(lib);
+                }
+            }
+            LibraryCandidate::LoaderName(name) => {
+                tried.push((*name).to_string());
+                if let Ok(lib) = unsafe { Library::new(*name) } {
+                    return Some(lib);
+                }
+            }
+            LibraryCandidate::SearchPattern { dir, pattern } => {
+                tried.push(candidate.description());
+                for path in matching_files(dir.as_deref(), pattern) {
+                    if let Some(lib) = try_open_path(&path, tried) {
+                        return Some(lib);
+                    }
+                }
+            }
         }
     }
 
     None
 }
 
-fn cuda_roots() -> Vec<PathBuf> {
-    cuda_roots_from_env(|var| std::env::var(var).ok())
+fn try_open_path(path: &Path, tried: &mut Vec<String>) -> Option<Library> {
+    tried.push(path.display().to_string());
+    unsafe { Library::new(path) }.ok()
 }
 
-fn cuda_roots_from_env(mut get_env: impl FnMut(&str) -> Option<String>) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    for var in ["CUDA_TOOLKIT_PATH", "CUDA_HOME", "CUDA_PATH"] {
-        if let Some(r) = get_env(var) {
-            roots.push(PathBuf::from(r));
+fn library_candidates(
+    override_path: Option<PathBuf>,
+    discovered_paths: &[PathBuf],
+) -> Vec<LibraryCandidate> {
+    let mut candidates = Vec::new();
+    if let Some(path) = override_path {
+        candidates.push(LibraryCandidate::Path(path));
+    }
+
+    platform_library_candidates(&mut candidates, discovered_paths);
+    candidates
+}
+
+#[cfg(windows)]
+fn platform_library_candidates(
+    candidates: &mut Vec<LibraryCandidate>,
+    discovered_paths: &[PathBuf],
+) {
+    candidates.push(LibraryCandidate::SearchPattern {
+        dir: None,
+        pattern: "nvvm64_*.dll",
+    });
+
+    for path in discovered_paths {
+        if let Some(parent) = path.parent() {
+            push_candidate_once(
+                candidates,
+                LibraryCandidate::SearchPattern {
+                    dir: Some(parent.to_path_buf()),
+                    pattern: "nvvm64_*.dll",
+                },
+            );
         }
     }
-    roots.push(PathBuf::from("/usr/local/cuda"));
-    roots.push(PathBuf::from("/opt/cuda"));
-    roots
+
+    for path in discovered_paths {
+        push_candidate_once(candidates, LibraryCandidate::Path(path.clone()));
+    }
+}
+
+#[cfg(not(windows))]
+fn platform_library_candidates(
+    candidates: &mut Vec<LibraryCandidate>,
+    discovered_paths: &[PathBuf],
+) {
+    for soname in ["libnvvm.so.4", "libnvvm.so.3", "libnvvm.so"] {
+        candidates.push(LibraryCandidate::LoaderName(soname));
+    }
+
+    for path in discovered_paths {
+        push_candidate_once(candidates, LibraryCandidate::Path(path.clone()));
+    }
+}
+
+fn push_candidate_once(candidates: &mut Vec<LibraryCandidate>, candidate: LibraryCandidate) {
+    if !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn matching_files(dir: Option<&Path>, pattern: &str) -> Vec<PathBuf> {
+    let mut matches = Vec::new();
+    let Some((prefix, suffix)) = pattern.split_once('*') else {
+        return matches;
+    };
+
+    for dir in search_dirs(dir) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if wildcard_match(file_name, prefix, suffix) {
+                matches.push(path);
+            }
+        }
+    }
+
+    matches.sort_by(|a, b| b.file_name().cmp(&a.file_name()).then_with(|| b.cmp(a)));
+    matches.dedup();
+    matches
+}
+
+fn wildcard_match(file_name: &str, prefix: &str, suffix: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let file_name = file_name.to_ascii_lowercase();
+        let prefix = prefix.to_ascii_lowercase();
+        let suffix = suffix.to_ascii_lowercase();
+        file_name.starts_with(&prefix) && file_name.ends_with(&suffix)
+    }
+
+    #[cfg(not(windows))]
+    {
+        file_name.starts_with(prefix) && file_name.ends_with(suffix)
+    }
+}
+
+fn search_dirs(dir: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(dir) = dir {
+        return vec![dir.to_path_buf()];
+    }
+
+    let mut dirs = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs
+}
+
+fn target_triple_hint() -> &'static str {
+    if cfg!(windows) {
+        "x86_64-pc-windows-msvc"
+    } else {
+        "x86_64-unknown-linux-gnu"
+    }
 }
 
 // ============================================================================
@@ -433,41 +656,45 @@ fn cuda_roots_from_env(mut get_env: impl FnMut(&str) -> Option<String>) -> Vec<P
 
 /// Locate `libdevice.10.bc` from the CUDA Toolkit.
 ///
-/// libdevice ships in the toolkit's `nvvm/` component alongside `libnvvm.so`
-/// and is consumed together with libNVVM in the LTOIR pipeline, so its
-/// discovery lives here next to the library discovery in [`LibNvvm::load`].
+/// libdevice ships in the toolkit's `nvvm/` component alongside libNVVM and is
+/// consumed together with libNVVM in the LTOIR pipeline, so its discovery lives
+/// here next to the library discovery in [`LibNvvm::load`].
 ///
 /// Search order:
-/// 1. `CUDA_OXIDE_LIBDEVICE` env var (used as-is if it points to an
-///    existing file).
-/// 2. `<root>/nvvm/libdevice/libdevice.10.bc` for `<root>` in
-///    `CUDA_TOOLKIT_PATH`, `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`,
-///    `/opt/cuda`.
+/// 1. `CUDA_OXIDE_LIBDEVICE` env var (used as-is if it points to an existing
+///    file).
+/// 2. CUDA Toolkit roots discovered by `cuda-toolkit-discovery`.
 ///
-/// Returns [`LibdeviceNotFound`] with the full list of probed paths if
-/// nothing matches.
+/// Returns [`LibdeviceNotFound`] with the full list of probed paths if nothing
+/// matches.
 pub fn find_libdevice() -> Result<PathBuf, LibdeviceNotFound> {
-    find_libdevice_with(|var| std::env::var(var).ok(), |path| path.exists())
+    find_libdevice_with(
+        || std::env::var_os("CUDA_OXIDE_LIBDEVICE").map(PathBuf::from),
+        cuda_toolkit_discovery::libdevice_candidates,
+        |path| path.exists(),
+    )
 }
 
 fn find_libdevice_with(
-    mut get_env: impl FnMut(&str) -> Option<String>,
+    mut override_path: impl FnMut() -> Option<PathBuf>,
+    candidates: impl FnOnce() -> Vec<PathBuf>,
     mut exists: impl FnMut(&Path) -> bool,
 ) -> Result<PathBuf, LibdeviceNotFound> {
-    if let Some(p) = get_env("CUDA_OXIDE_LIBDEVICE") {
-        let path = PathBuf::from(p);
+    let mut tried = Vec::new();
+    if let Some(path) = override_path() {
+        tried.push(path.display().to_string());
         if exists(&path) {
             return Ok(path);
         }
     }
-    let mut tried = Vec::new();
-    for root in cuda_roots_from_env(&mut get_env) {
-        let candidate = root.join("nvvm/libdevice/libdevice.10.bc");
+
+    for candidate in candidates() {
         tried.push(candidate.display().to_string());
         if exists(&candidate) {
             return Ok(candidate);
         }
     }
+
     Err(LibdeviceNotFound {
         tried: tried.join("\n  "),
     })
@@ -476,32 +703,109 @@ fn find_libdevice_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn candidate_descriptions(override_path: Option<PathBuf>, roots: &[PathBuf]) -> Vec<String> {
+        library_candidates(override_path, roots)
+            .iter()
+            .map(LibraryCandidate::description)
+            .collect()
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{now}", std::process::id()))
+    }
 
     #[test]
-    fn cuda_roots_prefers_project_toolkit_env_var() {
-        let roots = cuda_roots_from_env(|var| match var {
-            "CUDA_TOOLKIT_PATH" => Some("/cuda/toolkit".to_string()),
-            "CUDA_HOME" => Some("/cuda/home".to_string()),
-            "CUDA_PATH" => Some("/cuda/path".to_string()),
-            _ => None,
-        });
+    fn direct_override_is_first_candidate() {
+        let override_path = PathBuf::from(r"C:\custom\nvvm64_40_0.dll");
+        let descriptions =
+            candidate_descriptions(Some(override_path.clone()), &[PathBuf::from(r"C:\CUDA")]);
 
+        assert_eq!(descriptions[0], override_path.display().to_string());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_candidates_include_loader_and_toolkit_patterns() {
+        let root = PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0");
+        let discovered = vec![
+            root.join("nvvm")
+                .join("bin")
+                .join("x64")
+                .join("nvvm64_40_0.dll"),
+        ];
+        let descriptions = candidate_descriptions(None, &discovered);
+
+        assert!(descriptions.contains(&"nvvm64_*.dll".to_string()));
+        assert!(
+            descriptions.contains(
+                &root
+                    .join("nvvm")
+                    .join("bin")
+                    .join("x64")
+                    .join("nvvm64_*.dll")
+                    .display()
+                    .to_string()
+            )
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_candidates_preserve_loader_names_and_toolkit_path() {
+        let root = PathBuf::from("/usr/local/cuda");
+        let discovered = vec![root.join("nvvm/lib64/libnvvm.so")];
+        let descriptions = candidate_descriptions(None, &discovered);
+
+        assert_eq!(descriptions[0], "libnvvm.so.4");
+        assert_eq!(descriptions[1], "libnvvm.so.3");
+        assert_eq!(descriptions[2], "libnvvm.so");
+        assert!(descriptions.contains(&root.join("nvvm/lib64/libnvvm.so").display().to_string()));
+    }
+
+    #[test]
+    fn wildcard_scan_finds_versioned_dlls_without_glob_dependency() {
+        let dir = unique_temp_dir("libnvvm-sys-dll-scan");
+        fs::create_dir_all(&dir).expect("create temp dll scan dir");
+        fs::write(dir.join("nvvm64_30_0.dll"), []).expect("write old dll");
+        fs::write(dir.join("nvvm64_40_0.dll"), []).expect("write new dll");
+        fs::write(dir.join("not-nvvm64_40_0.dll"), []).expect("write nonmatch");
+
+        let matches = matching_files(Some(&dir), "nvvm64_*.dll");
+        let names: Vec<_> = matches
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(names, ["nvvm64_40_0.dll", "nvvm64_30_0.dll"]);
+
+        fs::remove_dir_all(dir).expect("remove temp dll scan dir");
+    }
+
+    #[test]
+    fn unknown_result_code_is_not_mapped_to_known_enum() {
+        assert_eq!(NvvmResultCode::from_raw(10_000), None);
+    }
+
+    #[test]
+    fn known_result_code_displays_symbolic_name() {
         assert_eq!(
-            roots,
-            vec![
-                PathBuf::from("/cuda/toolkit"),
-                PathBuf::from("/cuda/home"),
-                PathBuf::from("/cuda/path"),
-                PathBuf::from("/usr/local/cuda"),
-                PathBuf::from("/opt/cuda"),
-            ]
+            NvvmResultCode::from_raw(7).unwrap().to_string(),
+            "InvalidOption"
         );
     }
 
     #[test]
     fn find_libdevice_honors_explicit_override_file() {
         let found = find_libdevice_with(
-            |var| (var == "CUDA_OXIDE_LIBDEVICE").then(|| "/elsewhere/libdevice.10.bc".to_string()),
+            || Some(PathBuf::from("/elsewhere/libdevice.10.bc")),
+            Vec::new,
             |path| path == Path::new("/elsewhere/libdevice.10.bc"),
         );
 
@@ -509,44 +813,46 @@ mod tests {
     }
 
     #[test]
-    fn find_libdevice_probes_roots_in_order() {
-        // CUDA_HOME has the file, but CUDA_TOOLKIT_PATH is probed first and
-        // also has it; the first match must win.
+    fn find_libdevice_probes_candidates_in_order() {
         let found = find_libdevice_with(
-            |var| match var {
-                "CUDA_TOOLKIT_PATH" => Some("/cuda/toolkit".to_string()),
-                "CUDA_HOME" => Some("/cuda/home".to_string()),
-                _ => None,
+            || None,
+            || {
+                vec![
+                    PathBuf::from("/cuda/first/nvvm/libdevice/libdevice.10.bc"),
+                    PathBuf::from("/cuda/second/nvvm/libdevice/libdevice.10.bc"),
+                ]
             },
-            |path| {
-                path == Path::new("/cuda/toolkit/nvvm/libdevice/libdevice.10.bc")
-                    || path == Path::new("/cuda/home/nvvm/libdevice/libdevice.10.bc")
-            },
+            |path| path == Path::new("/cuda/second/nvvm/libdevice/libdevice.10.bc"),
         );
 
         assert_eq!(
             found.unwrap(),
-            PathBuf::from("/cuda/toolkit/nvvm/libdevice/libdevice.10.bc")
+            PathBuf::from("/cuda/second/nvvm/libdevice/libdevice.10.bc")
         );
     }
 
     #[test]
     fn find_libdevice_failure_lists_every_probed_path() {
         let err = find_libdevice_with(
-            |var| (var == "CUDA_HOME").then(|| "/cuda/home".to_string()),
+            || Some(PathBuf::from("/override/libdevice.10.bc")),
+            || vec![PathBuf::from("/cuda/nvvm/libdevice/libdevice.10.bc")],
             |_| false,
         )
         .unwrap_err();
 
         assert_eq!(
             err.tried,
-            "/cuda/home/nvvm/libdevice/libdevice.10.bc\n  \
-             /usr/local/cuda/nvvm/libdevice/libdevice.10.bc\n  \
-             /opt/cuda/nvvm/libdevice/libdevice.10.bc"
+            "/override/libdevice.10.bc\n  /cuda/nvvm/libdevice/libdevice.10.bc"
         );
         let message = err.to_string();
         assert!(message.contains("CUDA_OXIDE_LIBDEVICE"));
-        assert!(message.contains("CUDA_TOOLKIT_PATH"));
-        assert!(message.contains("CUDA_HOME"));
+        assert!(message.contains("CUDA Toolkit root"));
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA Toolkit libNVVM library available to the loader"]
+    fn smoke_load_libnvvm_version() {
+        let nvvm = LibNvvm::load().expect("load libNVVM");
+        let _version = nvvm.version().expect("query libNVVM version");
     }
 }

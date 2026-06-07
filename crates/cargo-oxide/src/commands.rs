@@ -9,10 +9,11 @@
 //! - Backend path resolved via discovery chain instead of hardcoded relative path
 //! - Workspace root resolved by walking up from CWD instead of assuming CWD
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::backend;
+use crate::{backend, platform};
 
 /// Pre-resolved context shared across all commands.
 ///
@@ -25,7 +26,7 @@ pub struct Context {
     pub codegen_crate: PathBuf,
     /// Path to `crates/rustc-codegen-cuda/examples/`.
     pub examples_dir: PathBuf,
-    /// Path to the built `librustc_codegen_cuda.so` shared object.
+    /// Path to the built `rustc_codegen_cuda` backend dynamic library.
     pub backend_so: PathBuf,
     /// True when running from inside the cuda-oxide workspace; false for
     /// standalone projects scaffolded by `cargo oxide new`.
@@ -80,8 +81,8 @@ pub fn resolve_context() -> Context {
 
 /// Resolve a context for `cargo oxide doctor` with NO side effects.
 ///
-/// Identical discovery to [`resolve_context`], except the backend `.so` is
-/// only *located* (via [`backend::backend_so_candidate`]), never built and
+/// Identical discovery to [`resolve_context`], except the backend is
+/// only *located* (via [`backend::backend_candidate`]), never built and
 /// never cloned. A diagnostic command must be runnable on a machine where
 /// nothing is set up yet; gating it behind a multi-minute backend build (or
 /// a network clone) would hide the very problems it exists to report.
@@ -90,7 +91,7 @@ pub fn resolve_doctor_context() -> Context {
     if let Some(workspace_root) = backend::find_workspace_root() {
         let codegen_crate = workspace_root.join("crates/rustc-codegen-cuda");
         let examples_dir = codegen_crate.join("examples");
-        let backend_so = backend::backend_so_candidate(&workspace_root);
+        let backend_so = backend::backend_candidate(&workspace_root);
         return Context {
             workspace_root,
             codegen_crate,
@@ -106,7 +107,7 @@ pub fn resolve_doctor_context() -> Context {
     });
 
     if cwd.join("Cargo.toml").is_file() {
-        let backend_so = backend::backend_so_candidate(&cwd);
+        let backend_so = backend::backend_candidate(&cwd);
         return Context {
             workspace_root: cwd.clone(),
             codegen_crate: cwd.clone(),
@@ -129,7 +130,7 @@ pub fn resolve_doctor_context() -> Context {
 
 /// Build and run an example with the custom codegen backend.
 ///
-/// Cleans stale artifacts, sets `RUSTFLAGS` to point at the backend `.so`,
+/// Cleans stale artifacts, sets encoded rustflags to point at the backend,
 /// and invokes `cargo run --release` from the example directory. Environment
 /// variables control output format (PTX / NVVM IR) and verbosity.
 #[allow(clippy::too_many_arguments)]
@@ -204,17 +205,14 @@ pub fn codegen_run(
         println!();
     }
     println!("This is the proper cargo workflow:");
-    println!("  RUSTFLAGS=\"-Z codegen-backend=...\" cargo run");
+    println!("  CARGO_ENCODED_RUSTFLAGS=\"-Z\\x1fcodegen-backend=...\" cargo run");
     println!();
-
-    let rustflags = build_rustflags(&ctx.backend_so, false);
 
     touch_main_rs(&example_dir);
 
     let mut cmd = Command::new("cargo");
-    cmd.args(["run", "--release"])
-        .current_dir(&example_dir)
-        .env("RUSTFLAGS", &rustflags);
+    cmd.args(["run", "--release"]).current_dir(&example_dir);
+    apply_codegen_rustflags(&mut cmd, &ctx.backend_so, false);
 
     if let Some(bin) = bin {
         cmd.args(["--bin", bin]);
@@ -234,7 +232,7 @@ pub fn codegen_run(
 
     apply_output_mode(&mut cmd, emit_nvvm_ir, arch);
     apply_device_arch_hint(&mut cmd, arch, detected_device_arch.as_deref());
-    apply_ld_library_path(&mut cmd);
+    apply_loader_path(&mut cmd);
 
     if let Some(bin) = bin {
         println!("Building and running {} (bin: {})...", example, bin);
@@ -400,14 +398,12 @@ fn build_interop_device_crate(
 
     println!("Building device crate {}...", manifest_path.display());
 
-    let rustflags = build_rustflags(&ctx.backend_so, false);
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--release", "--manifest-path"])
         .arg(&manifest_path)
         .current_dir(device_dir)
-        .env("RUSTFLAGS", &rustflags)
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env("CUDA_OXIDE_PTX_DIR", &ptx_dir);
+    apply_codegen_rustflags(&mut cmd, &ctx.backend_so, false);
 
     if verbose || std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
         cmd.env("CUDA_OXIDE_VERBOSE", "1");
@@ -419,7 +415,7 @@ fn build_interop_device_crate(
     forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_LLVM");
     apply_output_mode(&mut cmd, false, arch);
     apply_device_arch_hint(&mut cmd, arch, detected_device_arch);
-    apply_ld_library_path(&mut cmd);
+    apply_loader_path(&mut cmd);
 
     let status = cmd.status().expect("Failed to build interop device crate");
     if !status.success() {
@@ -463,7 +459,7 @@ fn run_host_cargo(
         cmd.args(["--features", features]);
     }
 
-    apply_ld_library_path(&mut cmd);
+    apply_loader_path(&mut cmd);
 
     if cargo_subcommand == "run" {
         if let Some(bin) = bin {
@@ -536,14 +532,11 @@ pub fn codegen_build(
     println!("=========================================");
     println!();
 
-    let rustflags = build_rustflags(&ctx.backend_so, false);
-
     touch_main_rs(&example_dir);
 
     let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--release"])
-        .current_dir(&example_dir)
-        .env("RUSTFLAGS", &rustflags);
+    cmd.args(["build", "--release"]).current_dir(&example_dir);
+    apply_codegen_rustflags(&mut cmd, &ctx.backend_so, false);
 
     if let Some(features) = features {
         cmd.args(["--features", features]);
@@ -559,7 +552,7 @@ pub fn codegen_build(
     forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_LLVM");
 
     apply_output_mode(&mut cmd, emit_nvvm_ir, arch);
-    apply_ld_library_path(&mut cmd);
+    apply_loader_path(&mut cmd);
 
     println!("Building {}...", example);
     println!();
@@ -607,7 +600,7 @@ pub fn codegen_show_pipeline(ctx: &Context, example: &str, emit_nvvm_ir: bool, a
         (true, None) => unreachable!("--emit-nvvm-ir requires --arch"),
     }
     println!();
-    println!("Required flags (applied via RUSTFLAGS):");
+    println!("Required flags (applied via CARGO_ENCODED_RUSTFLAGS):");
     println!("  -C opt-level=3              MIR optimization");
     println!("  -C debug-assertions=off     Remove debug checks");
     println!("  -Z mir-enable-passes=-JumpThreading");
@@ -617,14 +610,11 @@ pub fn codegen_show_pipeline(ctx: &Context, example: &str, emit_nvvm_ir: bool, a
     println!("      unwind paths as unreachable (CUDA toolchain limitation, not HW).");
     println!();
 
-    let rustflags = build_rustflags(&ctx.backend_so, false);
-
     touch_main_rs(&example_dir);
 
     let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--release"])
-        .current_dir(&example_dir)
-        .env("RUSTFLAGS", &rustflags);
+    cmd.args(["build", "--release"]).current_dir(&example_dir);
+    apply_codegen_rustflags(&mut cmd, &ctx.backend_so, false);
 
     cmd.env("CUDA_OXIDE_VERBOSE", "1");
     cmd.env("CUDA_OXIDE_SHOW_RUSTC_MIR", "1");
@@ -632,7 +622,7 @@ pub fn codegen_show_pipeline(ctx: &Context, example: &str, emit_nvvm_ir: bool, a
     cmd.env("CUDA_OXIDE_DUMP_LLVM", "1");
 
     apply_output_mode(&mut cmd, emit_nvvm_ir, arch);
-    apply_ld_library_path(&mut cmd);
+    apply_loader_path(&mut cmd);
 
     println!("Building {}...", example);
     println!();
@@ -658,6 +648,23 @@ pub fn codegen_show_pipeline(ctx: &Context, example: &str, emit_nvvm_ir: bool, a
 /// quick-reference cheat sheet for common cuda-gdb commands before handing
 /// control to the debugger.
 pub fn codegen_debug(ctx: &Context, example: &str, use_cgdb: bool, use_tui: bool) {
+    let host_target = backend::active_host_target();
+    if platform::is_windows_target(&host_target) {
+        eprintln!("Error: `cargo oxide debug` does not launch a Windows debugger yet.");
+        eprintln!();
+        eprintln!(
+            "On Windows, use NVIDIA Nsight Visual Studio Edition or Visual Studio CUDA debugging."
+        );
+        eprintln!(
+            "Build first with `cargo oxide build {}` and attach from the IDE.",
+            example
+        );
+        eprintln!(
+            "If your environment provides cuda-gdb.exe, launch it manually against the release binary."
+        );
+        std::process::exit(2);
+    }
+
     let cuda_gdb = find_executable(
         "cuda-gdb",
         &[
@@ -692,15 +699,13 @@ pub fn codegen_debug(ctx: &Context, example: &str, use_cgdb: bool, use_tui: bool
 
     println!("Building {} with debug info...", example);
 
-    let rustflags = build_rustflags(&ctx.backend_so, true);
-
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--release"])
         .current_dir(&example_dir)
-        .env("RUSTFLAGS", &rustflags)
         .env("CARGO_PROFILE_RELEASE_DEBUG", "2");
+    apply_codegen_rustflags(&mut cmd, &ctx.backend_so, true);
 
-    apply_ld_library_path(&mut cmd);
+    apply_loader_path(&mut cmd);
 
     let status = cmd.status().expect("Failed to run cargo build");
     if !status.success() {
@@ -708,7 +713,9 @@ pub fn codegen_debug(ctx: &Context, example: &str, use_cgdb: bool, use_tui: bool
         std::process::exit(status.code().unwrap_or(1));
     }
 
-    let binary = example_dir.join("target/release").join(example);
+    let binary = example_dir
+        .join("target/release")
+        .join(platform::executable_filename(example, &host_target));
     if !binary.exists() {
         eprintln!("Error: Binary not found at {:?}", binary);
         std::process::exit(1);
@@ -859,7 +866,7 @@ fn run_cargo_fmt(dir: &Path, check: bool) -> bool {
 /// Validate the development environment.
 ///
 /// Checks for: Rust nightly toolchain, `rust-toolchain.toml`, the codegen
-/// backend `.so` (informational), CUDA headers (`cuda.h`), CUDA toolkit
+/// backend dynamic library (informational), CUDA headers (`cuda.h`), CUDA toolkit
 /// (`nvcc`, libNVVM, nvJitLink, libdevice), LLVM (`llc`), clang/libclang,
 /// the NVIDIA driver / GPU (informational), and optionally `cuda-gdb`.
 /// Exits non-zero if any required check fails.
@@ -869,6 +876,25 @@ fn run_cargo_fmt(dir: &Path, check: bool) -> bool {
 /// caller resolves the context via [`resolve_doctor_context`] so nothing is
 /// built first. This is what lets it diagnose a bare machine (issue #87).
 pub fn doctor(ctx: &Context) {
+    let host_target = backend::active_host_target();
+    let is_windows = platform::is_windows_target(&host_target);
+    let backend_name = platform::dylib_filename("rustc_codegen_cuda", &host_target);
+    let object_ext = platform::object_extension(&host_target);
+    let nvcc_name = platform::executable_filename("nvcc", &host_target);
+    let llc_name = platform::executable_filename("llc", &host_target);
+    let clang_name = platform::executable_filename("clang", &host_target);
+    let cuda_gdb_name = platform::executable_filename("cuda-gdb", &host_target);
+    let libnvvm_name = if is_windows {
+        "nvvm64_*.dll"
+    } else {
+        "libnvvm.so"
+    };
+    let nvjitlink_name = if is_windows {
+        "nvJitLink_*.dll"
+    } else {
+        "libnvJitLink.so"
+    };
+
     println!("cargo-oxide environment check");
     println!("==============================");
     println!();
@@ -904,15 +930,17 @@ pub fn doctor(ctx: &Context) {
         ok = false;
     }
 
-    // 3. Backend .so. Informational, not fatal: `run`/`build`/`pipeline`
+    // 3. Backend dynamic library. Informational, not fatal:
+    // `run`/`build`/`pipeline`
     // build the backend on demand, so "not built yet" is a healthy state
     // for a fresh clone.
-    print!("Codegen backend... ");
+    print!("Codegen backend ({})... ", backend_name);
     if ctx.backend_so.exists() {
         println!("✓ {}", ctx.backend_so.display());
     } else {
         println!("- not built yet (run `cargo oxide setup`)");
     }
+    println!("Host object extension... .{}", object_ext);
 
     // 4. CUDA headers (cuda.h). The host `cuda-bindings` crate cannot build
     // without them; cargo-oxide itself deliberately can, which is what makes
@@ -937,9 +965,12 @@ pub fn doctor(ctx: &Context) {
     }
 
     // 5. CUDA toolkit
-    print!("CUDA toolkit (nvcc)... ");
-    match Command::new("nvcc").arg("--version").output() {
-        Ok(output) if output.status.success() => {
+    print!("CUDA toolkit ({})... ", nvcc_name);
+    match find_executable("nvcc", &[])
+        .and_then(|nvcc| Command::new(nvcc).arg("--version").output().ok())
+        .filter(|output| output.status.success())
+    {
+        Some(output) => {
             let version = String::from_utf8_lossy(&output.stdout);
             if let Some(line) = version.lines().find(|l| l.contains("release")) {
                 println!("✓ {}", line.trim());
@@ -947,9 +978,32 @@ pub fn doctor(ctx: &Context) {
                 println!("✓ (version unknown)");
             }
         }
-        _ => {
-            println!("✗ nvcc not found");
+        None => {
+            println!("✗ {} not found", nvcc_name);
             ok = false;
+        }
+    }
+
+    if is_windows {
+        print!("CUDA driver import library (cuda.lib)... ");
+        match find_cuda_import_library() {
+            Some(path) => println!("✓ {}", path.display()),
+            None => {
+                println!("✗ cuda.lib not found");
+                eprintln!("  Installed with the CUDA Toolkit under <CUDA>\\lib\\x64\\cuda.lib.");
+                eprintln!("  Set CUDA_PATH or add that directory to the LIB environment variable.");
+                ok = false;
+            }
+        }
+
+        print!("libffi import library (ffi.lib)... ");
+        match backend::windows_libffi_library_dir() {
+            Some(path) => println!("✓ {}", path.join("ffi.lib").display()),
+            None => {
+                println!("✗ ffi.lib not found");
+                eprintln!("  Install `libffi:x64-windows` with vcpkg or set LIBFFI_LIB_DIR.");
+                ok = false;
+            }
         }
     }
 
@@ -957,7 +1011,7 @@ pub fn doctor(ctx: &Context) {
     // CUDA libdevice math, e.g. sin/cos/exp/pow). All three ship with the
     // CUDA Toolkit; checking them here surfaces missing or split packagings
     // before a runtime failure inside `cuda_host::ltoir::load_kernel_module`.
-    print!("libNVVM (libnvvm.so)... ");
+    print!("libNVVM ({})... ", libnvvm_name);
     match libnvvm_sys::LibNvvm::load() {
         Ok(nvvm) => match nvvm.version() {
             Ok((major, minor)) => println!("✓ libNVVM {}.{}", major, minor),
@@ -966,13 +1020,24 @@ pub fn doctor(ctx: &Context) {
         Err(e) => {
             println!("✗ {}", e);
             eprintln!("  Required only when kernels call CUDA libdevice math");
-            eprintln!("  (sin/cos/exp/pow/...). Ships with the CUDA Toolkit at");
-            eprintln!("  <CUDA>/nvvm/lib64/libnvvm.so. No separate download.");
+            if is_windows {
+                eprintln!("  (sin/cos/exp/pow/...). Ships with the CUDA Toolkit at");
+                eprintln!(
+                    "  <CUDA>\\nvvm\\bin\\{}. Ensure that directory is on PATH.",
+                    libnvvm_name
+                );
+            } else {
+                eprintln!("  (sin/cos/exp/pow/...). Ships with the CUDA Toolkit at");
+                eprintln!(
+                    "  <CUDA>/nvvm/lib64/{}. No separate download.",
+                    libnvvm_name
+                );
+            }
             ok = false;
         }
     }
 
-    print!("nvJitLink (libnvJitLink.so)... ");
+    print!("nvJitLink ({})... ", nvjitlink_name);
     match nvjitlink_sys::LibNvJitLink::load() {
         Ok(nvj) => match nvj.version() {
             Some((major, minor)) => println!("✓ nvJitLink {}.{}", major, minor),
@@ -981,7 +1046,17 @@ pub fn doctor(ctx: &Context) {
         Err(e) => {
             println!("✗ {}", e);
             eprintln!("  Required only when kernels call CUDA libdevice math.");
-            eprintln!("  Ships with the CUDA Toolkit at <CUDA>/lib64/libnvJitLink.so.");
+            if is_windows {
+                eprintln!(
+                    "  Ships with the CUDA Toolkit under <CUDA>\\bin\\{}. Ensure <CUDA>\\bin is on PATH.",
+                    nvjitlink_name
+                );
+            } else {
+                eprintln!(
+                    "  Ships with the CUDA Toolkit at <CUDA>/lib64/{}.",
+                    nvjitlink_name
+                );
+            }
             ok = false;
         }
     }
@@ -993,7 +1068,11 @@ pub fn doctor(ctx: &Context) {
             println!("✗ {}", e);
             eprintln!("  Required only when kernels call CUDA libdevice math.");
             eprintln!("  Ships with the CUDA Toolkit at");
-            eprintln!("  <CUDA>/nvvm/libdevice/libdevice.10.bc. Override the search");
+            if is_windows {
+                eprintln!("  <CUDA>\\nvvm\\libdevice\\libdevice.10.bc. Override the search");
+            } else {
+                eprintln!("  <CUDA>/nvvm/libdevice/libdevice.10.bc. Override the search");
+            }
             eprintln!("  with `CUDA_OXIDE_LIBDEVICE=<path>` if you have it elsewhere.");
             ok = false;
         }
@@ -1008,14 +1087,14 @@ pub fn doctor(ctx: &Context) {
     //   2. Rust toolchain's `llvm-tools` component (auto-installed via rustup)
     //   3. `llc-22`, `llc-21`, `llc` on `PATH`
     // Whatever we pick, reject if the major version is < 21.
-    print!("llc (LLVM)... ");
+    print!("{} (LLVM)... ", llc_name);
 
     // The pipeline's primary entry: the `llc` bundled with the pinned Rust
     // toolchain's `llvm-tools` component. Built with the NVPTX backend
     // enabled, so the typical novice path is `rustup component add llvm-tools`
     // and that's it. Surface the absolute path so doctor's output matches
     // what the pipeline actually invokes.
-    let rustup_llc_path: Option<String> = Command::new("rustc")
+    let rustup_llc_path: Option<PathBuf> = Command::new("rustc")
         .args(["--print", "sysroot", "--print", "host-tuple"])
         .output()
         .ok()
@@ -1025,23 +1104,23 @@ pub fn doctor(ctx: &Context) {
             let mut lines = stdout.lines();
             let sysroot = lines.next()?;
             let host = lines.next()?;
-            let path: std::path::PathBuf = [sysroot, "lib", "rustlib", host, "bin", "llc"]
+            let path: PathBuf = [sysroot, "lib", "rustlib", host, "bin", &llc_name]
                 .iter()
                 .collect();
-            path.is_file()
-                .then(|| path.to_str().map(str::to_string))
-                .flatten()
+            path.is_file().then_some(path)
         });
 
-    let mut candidates: Vec<String> = Vec::new();
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(env_llc) = std::env::var("CUDA_OXIDE_LLC") {
-        candidates.push(env_llc);
+        candidates.push(PathBuf::from(env_llc));
     }
-    if let Some(rustup) = rustup_llc_path.clone() {
+    if let Some(rustup) = rustup_llc_path {
         candidates.push(rustup);
     }
     for name in ["llc-22", "llc-21", "llc"] {
-        candidates.push(name.to_string());
+        if let Some(path) = find_executable(name, &[]) {
+            candidates.push(path);
+        }
     }
 
     let llc_pick = candidates.iter().find_map(|candidate| {
@@ -1052,7 +1131,7 @@ pub fn doctor(ctx: &Context) {
             .filter(|o| o.status.success())
             .map(|o| {
                 (
-                    candidate.clone(),
+                    candidate.display().to_string(),
                     String::from_utf8_lossy(&o.stdout).into_owned(),
                 )
             })
@@ -1079,21 +1158,39 @@ pub fn doctor(ctx: &Context) {
                         binary, v
                     );
                     eprintln!("  WGMMA intrinsic signatures cuda-oxide emits. Install a newer");
-                    eprintln!("  toolchain (`rustup component add llvm-tools` is usually enough,");
-                    eprintln!("  or `sudo apt install llvm-21`) and either add it to PATH or set");
-                    eprintln!("  `CUDA_OXIDE_LLC=/path/to/llc`.");
+                    eprintln!("  toolchain (`rustup component add llvm-tools` is usually enough)");
+                    if is_windows {
+                        eprintln!(
+                            "  or install LLVM 21+ for Windows and add its bin directory to PATH."
+                        );
+                        eprintln!(
+                            "  You can also set `CUDA_OXIDE_LLC=C:\\path\\to\\{}`.",
+                            llc_name
+                        );
+                    } else {
+                        eprintln!(
+                            "  or `sudo apt install llvm-21`) and either add it to PATH or set"
+                        );
+                        eprintln!("  `CUDA_OXIDE_LLC=/path/to/llc`.");
+                    }
                     ok = false;
                 }
                 None => println!("✓ {} ({}, version could not be parsed)", banner, binary),
             }
         }
         None => {
-            println!("✗ llc not found");
+            println!("✗ {} not found", llc_name);
             eprintln!("  cuda-oxide probes (in order): $CUDA_OXIDE_LLC, the Rust toolchain's");
             eprintln!("  llvm-tools llc, then llc-22/llc-21/llc on PATH. Easiest fix:");
             eprintln!("    rustup component add llvm-tools");
-            eprintln!("  Alternative: `sudo apt install llvm-21` (older versions reject");
-            eprintln!("  modern TMA / tcgen05 / WGMMA intrinsics).");
+            if is_windows {
+                eprintln!(
+                    "  Alternative: install LLVM 21+ for Windows and add its bin directory to PATH."
+                );
+            } else {
+                eprintln!("  Alternative: `sudo apt install llvm-21` (older versions reject");
+                eprintln!("  modern TMA / tcgen05 / WGMMA intrinsics).");
+            }
             ok = false;
         }
     }
@@ -1107,13 +1204,15 @@ pub fn doctor(ctx: &Context) {
     // bare `libclang1-*` (without the matching `libclang-common-*-dev`)
     // leave `/usr/lib/clang/*/include` empty and bindgen explodes with a
     // mysterious "'stddef.h' file not found". Catch that up front.
-    print!("clang / libclang resource dir... ");
-    let clang_resource_dir = Command::new("clang")
-        .arg("-print-resource-dir")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    print!("{} / libclang resource dir... ", clang_name);
+    let clang_resource_dir = find_executable("clang", &[]).and_then(|clang| {
+        Command::new(clang)
+            .arg("-print-resource-dir")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    });
     match clang_resource_dir {
         Some(ref dir) if std::path::Path::new(&format!("{}/include/stddef.h", dir)).exists() => {
             println!("✓ {}", dir);
@@ -1124,17 +1223,37 @@ pub fn doctor(ctx: &Context) {
                 dir
             );
             eprintln!("  Host `cuda-bindings` uses bindgen, which needs clang's own stddef.h.");
-            eprintln!("  Install the matching dev headers: sudo apt install clang-21");
-            eprintln!("  (or libclang-common-21-dev)");
+            if is_windows {
+                eprintln!(
+                    "  Install LLVM/Clang for Windows and ensure {} is on PATH.",
+                    clang_name
+                );
+                eprintln!(
+                    "  If libclang is installed elsewhere, set LIBCLANG_PATH to its bin directory."
+                );
+            } else {
+                eprintln!("  Install the matching dev headers: sudo apt install clang-21");
+                eprintln!("  (or libclang-common-21-dev)");
+            }
             ok = false;
         }
         None => {
-            println!("✗ clang not found");
+            println!("✗ {} not found", clang_name);
             eprintln!(
                 "  Host `cuda-bindings` uses bindgen, which needs clang + its resource headers."
             );
-            eprintln!("  Install with: sudo apt install clang-21");
-            eprintln!("  (or at minimum `libclang-common-21-dev` alongside your libclang)");
+            if is_windows {
+                eprintln!(
+                    "  Install LLVM/Clang for Windows and ensure {} is on PATH.",
+                    clang_name
+                );
+                eprintln!(
+                    "  If libclang is installed elsewhere, set LIBCLANG_PATH to its bin directory."
+                );
+            } else {
+                eprintln!("  Install with: sudo apt install clang-21");
+                eprintln!("  (or at minimum `libclang-common-21-dev` alongside your libclang)");
+            }
             ok = false;
         }
     }
@@ -1167,9 +1286,12 @@ pub fn doctor(ctx: &Context) {
     }
 
     // 9. cuda-gdb (optional)
-    print!("cuda-gdb (optional)... ");
-    match Command::new("cuda-gdb").arg("--version").output() {
-        Ok(output) if output.status.success() => {
+    print!("{} (optional)... ", cuda_gdb_name);
+    match find_executable("cuda-gdb", &[])
+        .and_then(|cuda_gdb| Command::new(cuda_gdb).arg("--version").output().ok())
+        .filter(|output| output.status.success())
+    {
+        Some(output) => {
             let version = String::from_utf8_lossy(&output.stdout);
             if let Some(line) = version.lines().next() {
                 println!("✓ {}", line.trim());
@@ -1177,8 +1299,12 @@ pub fn doctor(ctx: &Context) {
                 println!("✓");
             }
         }
-        _ => {
-            println!("- not found (only needed for `cargo oxide debug`)");
+        None => {
+            if is_windows {
+                println!("- not found (Windows debugging usually uses Nsight / Visual Studio)");
+            } else {
+                println!("- not found (only needed for `cargo oxide debug`)");
+            }
         }
     }
 
@@ -1408,36 +1534,85 @@ fn resolve_example_dir(ctx: &Context, example: &str) -> PathBuf {
     example_dir
 }
 
-/// Construct the `RUSTFLAGS` string that configures rustc to use our backend.
+const RUSTFLAGS_SEPARATOR: char = '\x1f';
+
+/// Configure child cargo to use encoded rustflags for the codegen backend.
+///
+/// `CARGO_ENCODED_RUSTFLAGS` preserves backend paths with spaces. When we set
+/// it, remove `RUSTFLAGS` from the child env so cargo does not merge two flag
+/// sources and accidentally split a path.
+fn apply_codegen_rustflags(cmd: &mut Command, backend_so: &Path, debug: bool) {
+    let encoded = build_encoded_rustflags(backend_so, debug);
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", encoded);
+    cmd.env_remove("RUSTFLAGS");
+}
+
+/// Construct encoded rustflags that configure rustc to use our backend.
 ///
 /// Always includes `-Z codegen-backend`, `-C opt-level=3`, disabled debug
 /// assertions, suppressed JumpThreading (prevents barrier duplication), and
 /// v0 symbol mangling. Appends `-C debuginfo=2` when `debug` is true, then
-/// appends any existing user-provided `RUSTFLAGS`.
-fn build_rustflags(backend_so: &Path, debug: bool) -> String {
-    let existing = std::env::var("RUSTFLAGS").ok();
-    build_rustflags_with_existing(backend_so, debug, existing.as_deref())
+/// appends user-provided `CARGO_ENCODED_RUSTFLAGS` followed by `RUSTFLAGS`.
+fn build_encoded_rustflags(backend_so: &Path, debug: bool) -> String {
+    let existing_encoded = std::env::var("CARGO_ENCODED_RUSTFLAGS").ok();
+    let existing_rustflags = std::env::var("RUSTFLAGS").ok();
+    build_encoded_rustflags_with_existing(
+        backend_so,
+        debug,
+        existing_encoded.as_deref(),
+        existing_rustflags.as_deref(),
+    )
 }
 
-fn build_rustflags_with_existing(
+fn build_encoded_rustflags_with_existing(
     backend_so: &Path,
     debug: bool,
+    existing_encoded: Option<&str>,
     existing_rustflags: Option<&str>,
 ) -> String {
-    let mut flags = format!(
-        "-Z codegen-backend={} -C opt-level=3 -C debug-assertions=off -Z mir-enable-passes=-JumpThreading -Csymbol-mangling-version=v0",
-        backend_so.display()
-    );
+    let mut flags = required_codegen_rustflags(backend_so, debug);
+    flags.extend(parse_encoded_rustflags(existing_encoded));
+    flags.extend(parse_rustflags(existing_rustflags));
+    encode_rustflags(&flags)
+}
+
+fn required_codegen_rustflags(backend_so: &Path, debug: bool) -> Vec<String> {
+    let mut flags = vec![
+        "-Z".to_string(),
+        format!("codegen-backend={}", backend_so.display()),
+        "-C".to_string(),
+        "opt-level=3".to_string(),
+        "-C".to_string(),
+        "debug-assertions=off".to_string(),
+        "-Z".to_string(),
+        "mir-enable-passes=-JumpThreading".to_string(),
+        "-Csymbol-mangling-version=v0".to_string(),
+    ];
     if debug {
-        flags.push_str(" -C debuginfo=2");
-    }
-    if let Some(existing) = existing_rustflags
-        && !existing.is_empty()
-    {
-        flags.push(' ');
-        flags.push_str(existing);
+        flags.extend(["-C".to_string(), "debuginfo=2".to_string()]);
     }
     flags
+}
+
+fn parse_encoded_rustflags(existing: Option<&str>) -> Vec<String> {
+    existing
+        .unwrap_or_default()
+        .split(RUSTFLAGS_SEPARATOR)
+        .filter(|flag| !flag.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_rustflags(existing: Option<&str>) -> Vec<String> {
+    existing
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+fn encode_rustflags(flags: &[String]) -> String {
+    flags.join(&RUSTFLAGS_SEPARATOR.to_string())
 }
 
 /// Set environment variables for the codegen backend.
@@ -1641,24 +1816,38 @@ fn forward_env_var(cmd: &mut Command, var: &str) {
     }
 }
 
-/// Build `LD_LIBRARY_PATH` for the child cargo process.
+/// Build the platform loader path for the child cargo process.
 ///
 /// Includes the rustc sysroot lib (for `librustc_driver.so` etc.), the
 /// libmathdx lib (when `LIBMATHDX_PATH` is set), and any existing
-/// `LD_LIBRARY_PATH` from the parent environment.
-fn apply_ld_library_path(cmd: &mut Command) {
-    let mut ld_paths: Vec<String> = Vec::new();
+/// loader path from the parent environment.
+fn apply_loader_path(cmd: &mut Command) {
+    let host_target = backend::active_host_target();
+    let loader_env = platform::loader_env_var(&host_target);
+    let mut paths: Vec<PathBuf> = Vec::new();
     if let Some(sysroot) = backend::get_rustc_sysroot() {
-        ld_paths.push(format!("{}/lib", sysroot));
+        paths.push(rustc_sysroot_loader_dir(&sysroot, &host_target));
+    }
+    if platform::is_windows_target(&host_target)
+        && let Some(libffi_bin_dir) = backend::windows_libffi_loader_dir()
+    {
+        paths.push(libffi_bin_dir);
     }
     if let Ok(libmathdx_path) = std::env::var("LIBMATHDX_PATH") {
-        ld_paths.push(format!("{}/lib", libmathdx_path));
+        paths.push(PathBuf::from(libmathdx_path).join("lib"));
     }
-    if let Ok(existing) = std::env::var("LD_LIBRARY_PATH") {
-        ld_paths.push(existing);
+    if !paths.is_empty()
+        && let Some(value) = platform::prepend_env_paths(loader_env, paths)
+    {
+        cmd.env(loader_env, value);
     }
-    if !ld_paths.is_empty() {
-        cmd.env("LD_LIBRARY_PATH", ld_paths.join(":"));
+}
+
+fn rustc_sysroot_loader_dir(sysroot: &str, target: &str) -> PathBuf {
+    if platform::is_windows_target(target) {
+        PathBuf::from(sysroot).join("bin")
+    } else {
+        PathBuf::from(sysroot).join("lib")
     }
 }
 
@@ -1953,30 +2142,127 @@ fn main() {
     println!("  cargo oxide run {}", name);
 }
 
-/// Locate an executable by name, first via `which` (PATH lookup), then by
-/// checking a list of common fallback absolute paths.
-fn find_executable(name: &str, fallback_paths: &[&str]) -> Option<PathBuf> {
-    if let Ok(output) = Command::new("which").arg(name).output()
-        && output.status.success()
+fn find_cuda_import_library() -> Option<PathBuf> {
+    if let Some(path) =
+        std::env::var_os("LIB").and_then(|paths| find_file_in_paths("cuda.lib", &paths))
     {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
+        return Some(path);
+    }
+
+    let mut roots = Vec::new();
+    for key in ["CUDA_PATH", "CUDA_HOME"] {
+        if let Ok(value) = std::env::var(key) {
+            roots.push(PathBuf::from(value));
         }
     }
+    for (key, value) in std::env::vars() {
+        if key.starts_with("CUDA_PATH_V") {
+            roots.push(PathBuf::from(value));
+        }
+    }
+    roots
+        .into_iter()
+        .map(|root| root.join("lib").join("x64").join("cuda.lib"))
+        .find(|candidate| candidate.is_file())
+}
+
+fn find_file_in_paths(name: &str, paths: &OsStr) -> Option<PathBuf> {
+    platform::split_env_paths(paths)
+        .into_iter()
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Locate an executable by native PATH scanning, then fallback absolute paths.
+fn find_executable(name: &str, fallback_paths: &[&str]) -> Option<PathBuf> {
+    let host_target = backend::active_host_target();
+    find_executable_for_target(name, fallback_paths, &host_target)
+}
+
+fn find_executable_for_target(
+    name: &str,
+    fallback_paths: &[&str],
+    target: &str,
+) -> Option<PathBuf> {
+    let pathext = std::env::var_os("PATHEXT");
+    if let Some(path) = std::env::var_os("PATH")
+        .and_then(|paths| find_executable_in_path(name, &paths, pathext.as_deref(), target))
+    {
+        return Some(path);
+    }
+
     for path in fallback_paths {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Some(p);
+        let p = Path::new(path);
+        if let Some(found) = find_executable_path(p, pathext.as_deref(), target) {
+            return Some(found);
         }
     }
     None
+}
+
+fn find_executable_in_path(
+    name: &str,
+    paths: &OsStr,
+    pathext: Option<&OsStr>,
+    target: &str,
+) -> Option<PathBuf> {
+    let requested = Path::new(name);
+    if requested.is_absolute() || requested.components().count() > 1 {
+        return find_executable_path(requested, pathext, target);
+    }
+
+    let candidate_names = executable_candidate_names(name, pathext, target);
+    for dir in platform::split_env_paths(paths) {
+        for candidate in &candidate_names {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn find_executable_path(path: &Path, pathext: Option<&OsStr>, target: &str) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    if !platform::is_windows_target(target) || path.extension().is_some() {
+        return None;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = path.file_name()?.to_string_lossy();
+    executable_candidate_names(&stem, pathext, target)
+        .into_iter()
+        .map(|candidate| parent.join(candidate))
+        .find(|candidate| candidate.is_file())
+}
+
+fn executable_candidate_names(name: &str, pathext: Option<&OsStr>, target: &str) -> Vec<OsString> {
+    let mut names = vec![OsString::from(name)];
+    if !platform::is_windows_target(target) || Path::new(name).extension().is_some() {
+        return names;
+    }
+
+    let pathext = pathext
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+    for ext in pathext.split(';').filter(|ext| !ext.is_empty()) {
+        let ext = if ext.starts_with('.') {
+            ext.to_string()
+        } else {
+            format!(".{ext}")
+        };
+        names.push(OsString::from(format!("{name}{ext}")));
+    }
+    names
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn command_env(cmd: &Command, key: &str) -> Option<String> {
         cmd.get_envs()
@@ -1991,30 +2277,108 @@ mod tests {
     }
 
     #[test]
-    fn build_rustflags_appends_existing_rustflags_after_required_flags() {
-        let rustflags = build_rustflags_with_existing(
-            Path::new("/tmp/librustc_codegen_cuda.so"),
+    fn build_rustflags_encodes_backend_path_with_spaces() {
+        let encoded = build_encoded_rustflags_with_existing(
+            Path::new(r"C:\Program Files\cuda oxide\rustc_codegen_cuda.dll"),
             false,
+            Some("-C\x1ftarget-cpu=native"),
             Some("-L native=/nix/store/cuda-cudart/lib"),
         );
+        let flags: Vec<_> = encoded.split(RUSTFLAGS_SEPARATOR).collect();
 
-        assert!(
-            rustflags
-                .starts_with("-Z codegen-backend=/tmp/librustc_codegen_cuda.so -C opt-level=3")
+        assert_eq!(flags[0], "-Z");
+        assert_eq!(
+            flags[1],
+            r"codegen-backend=C:\Program Files\cuda oxide\rustc_codegen_cuda.dll"
         );
-        assert!(rustflags.ends_with(" -L native=/nix/store/cuda-cudart/lib"));
+        assert!(flags.contains(&"opt-level=3"));
+
+        let encoded_user_pos = flags
+            .iter()
+            .position(|flag| *flag == "target-cpu=native")
+            .unwrap();
+        let rustflags_user_pos = flags
+            .iter()
+            .position(|flag| *flag == "native=/nix/store/cuda-cudart/lib")
+            .unwrap();
+        assert!(encoded_user_pos < rustflags_user_pos);
     }
 
     #[test]
-    fn build_rustflags_ignores_empty_existing_rustflags() {
-        let rustflags = build_rustflags_with_existing(
+    fn build_rustflags_ignores_empty_existing_flags_and_adds_debug() {
+        let encoded = build_encoded_rustflags_with_existing(
             Path::new("/tmp/librustc_codegen_cuda.so"),
             true,
             Some(""),
+            Some(""),
         );
+        let flags: Vec<_> = encoded.split(RUSTFLAGS_SEPARATOR).collect();
 
-        assert!(rustflags.contains(" -C debuginfo=2"));
-        assert!(!rustflags.ends_with(' '));
+        assert!(flags.contains(&"debuginfo=2"));
+        assert!(!encoded.ends_with(RUSTFLAGS_SEPARATOR));
+    }
+
+    #[test]
+    fn apply_codegen_rustflags_sets_encoded_and_removes_rustflags() {
+        let mut cmd = Command::new("cargo");
+        cmd.env("RUSTFLAGS", "-Awarnings");
+
+        apply_codegen_rustflags(&mut cmd, Path::new("/tmp/librustc_codegen_cuda.so"), false);
+
+        assert!(
+            command_env(&cmd, "CARGO_ENCODED_RUSTFLAGS")
+                .unwrap()
+                .contains("codegen-backend=/tmp/librustc_codegen_cuda.so")
+        );
+        assert_eq!(command_env(&cmd, "RUSTFLAGS"), None);
+    }
+
+    #[test]
+    fn find_executable_windows_scans_pathext_and_explicit_suffixes() {
+        let dir = tempdir("cargo-oxide-win-path");
+        for name in ["cuda-gdb.exe", "nvcc.exe", "llc.exe"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let path_env = std::env::join_paths([dir.as_os_str()]).unwrap();
+        let pathext = OsStr::new(".exe;.cmd");
+        let target = "x86_64-pc-windows-msvc";
+
+        assert_eq!(
+            find_executable_in_path("cuda-gdb.exe", &path_env, Some(pathext), target),
+            Some(dir.join("cuda-gdb.exe"))
+        );
+        assert_eq!(
+            find_executable_in_path("nvcc.exe", &path_env, Some(pathext), target),
+            Some(dir.join("nvcc.exe"))
+        );
+        assert_eq!(
+            find_executable_in_path("llc.exe", &path_env, Some(pathext), target),
+            Some(dir.join("llc.exe"))
+        );
+        assert_eq!(
+            find_executable_in_path("nvcc", &path_env, Some(pathext), target),
+            Some(dir.join("nvcc.exe"))
+        );
+        assert_eq!(
+            find_executable_in_path("llc", &path_env, Some(pathext), target),
+            Some(dir.join("llc.exe"))
+        );
+    }
+
+    #[test]
+    fn find_executable_linux_scans_names_without_suffix() {
+        let dir = tempdir("cargo-oxide-linux-path");
+        std::fs::write(dir.join("llc"), b"").unwrap();
+        let path_env = std::env::join_paths([dir.as_os_str()]).unwrap();
+
+        assert_eq!(
+            find_executable_in_path("llc", &path_env, None, "x86_64-unknown-linux-gnu"),
+            Some(dir.join("llc"))
+        );
+        assert_eq!(
+            find_executable_in_path("llc.exe", &path_env, None, "x86_64-unknown-linux-gnu"),
+            None
+        );
     }
 
     #[test]
@@ -2229,5 +2593,20 @@ mod tests {
             std::env::remove_var("CUDA_OXIDE_TARGET");
         }
         assert_eq!(result, None);
+    }
+
+    fn tempdir(prefix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "{}-{}-{}",
+            prefix,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 }

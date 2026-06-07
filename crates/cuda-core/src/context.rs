@@ -21,7 +21,7 @@ use crate::stream::CudaStream;
 use std::ffi::c_int;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 /// Owns a reference to a CUDA device's primary context.
 ///
@@ -46,7 +46,7 @@ pub struct CudaContext {
     pub(crate) event_tracking: AtomicBool,
     /// Sticky error state recorded by [`record_err`](CudaContext::record_err).
     /// Stores the raw `CUresult` value, or `0` if no error.
-    pub(crate) error_state: AtomicU32,
+    pub(crate) error_state: AtomicI32,
 }
 
 /// # Safety
@@ -115,7 +115,7 @@ impl CudaContext {
             ordinal,
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
-            error_state: AtomicU32::new(0),
+            error_state: AtomicI32::new(0),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -202,7 +202,7 @@ impl CudaContext {
         let cu_stream = unsafe {
             cuda_bindings::cuStreamCreate(
                 cu_stream.as_mut_ptr(),
-                cuda_bindings::CUstream_flags_enum_CU_STREAM_NON_BLOCKING,
+                cuda_bindings::CUstream_flags_enum_CU_STREAM_NON_BLOCKING as _,
             )
             .result()?;
             cu_stream.assume_init()
@@ -266,7 +266,7 @@ impl CudaContext {
         if error_state == 0 {
             Ok(())
         } else {
-            Err(DriverError(error_state))
+            Err(DriverError(curesult_from_i32(error_state)))
         }
     }
 
@@ -278,7 +278,22 @@ impl CudaContext {
     /// calls will surface it. A later store overwrites an earlier one.
     pub fn record_err<T>(&self, result: Result<T, DriverError>) {
         if let Err(err) = result {
-            self.error_state.store(err.0, Ordering::Relaxed)
+            self.error_state
+                .store(curesult_to_i32(err.0), Ordering::Relaxed)
         }
+    }
+}
+
+fn curesult_from_i32(code: i32) -> cuda_bindings::CUresult {
+    #[allow(clippy::unnecessary_cast)]
+    {
+        code as cuda_bindings::CUresult
+    }
+}
+
+fn curesult_to_i32(code: cuda_bindings::CUresult) -> i32 {
+    #[allow(clippy::unnecessary_cast)]
+    {
+        code as i32
     }
 }

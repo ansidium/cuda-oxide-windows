@@ -18,6 +18,14 @@ use cuda_bindings::CUdeviceptr;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 
+/// Returns `len * size_of::<T>()`, reporting a CUDA-style invalid-value error
+/// on arithmetic overflow.
+pub(crate) fn allocation_size<T>(len: usize) -> Result<usize, DriverError> {
+    len.checked_mul(std::mem::size_of::<T>()).ok_or(DriverError(
+        cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
+    ))
+}
+
 /// Allocates `num_bytes` of device memory on `stream` using the stream-ordered
 /// allocator (`cuMemAllocAsync`).
 ///

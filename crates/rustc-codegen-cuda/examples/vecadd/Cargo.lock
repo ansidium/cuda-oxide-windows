@@ -89,6 +89,7 @@ name = "cuda-bindings"
 version = "0.2.1"
 dependencies = [
  "bindgen",
+ "cuda-toolkit-discovery",
 ]
 
 [[package]]
@@ -129,6 +130,10 @@ dependencies = [
  "reserved-oxide-symbols",
  "syn",
 ]
+
+[[package]]
+name = "cuda-toolkit-discovery"
+version = "0.1.0"
 
 [[package]]
 name = "either"
@@ -219,6 +224,7 @@ dependencies = [
 name = "libnvvm-sys"
 version = "0.2.1"
 dependencies = [
+ "cuda-toolkit-discovery",
  "libloading",
  "thiserror",
 ]
@@ -255,6 +261,7 @@ dependencies = [
 name = "nvjitlink-sys"
 version = "0.2.1"
 dependencies = [
+ "cuda-toolkit-discovery",
  "libloading",
  "thiserror",
 ]

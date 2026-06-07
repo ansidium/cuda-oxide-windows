@@ -141,6 +141,18 @@ first two lines:
 - Dialect changes should include appropriate tests in the crate's `tests/`
   directory.
 
+### Windows Fork Patch Expectations
+
+- Windows patches must either pass the Linux checks or explain the Linux
+  regression and the follow-up needed to restore upstream-compatible behavior.
+- Run at least the Windows MSVC check relevant to the change:
+  `cargo build -p cargo-oxide`, `cargo test -p oxide-artifacts --features object`,
+  or `.\scripts\smoketest.ps1 -BuildOnly`.
+- Path handling changes should include coverage for paths with spaces, such as
+  `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\...`.
+- Do not introduce fork-only public API unless it has been discussed and the
+  divergence is documented in [FORK.md](FORK.md).
+
 ### Dependencies
 
 - New dependencies must use permissive licenses (MIT, Apache-2.0, BSD, ISC,
