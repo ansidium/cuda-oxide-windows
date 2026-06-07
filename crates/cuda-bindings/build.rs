@@ -3,16 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use cuda_toolkit_discovery::{cuda_driver_lib_candidates, include_candidates_for_target};
 use std::{env, error::Error, path::Path, path::PathBuf, process::exit};
-
-/// Returns the CUDA toolkit install root: `CUDA_TOOLKIT_PATH` or `CUDA_HOME` if set,
-/// otherwise `/usr/local/cuda`. Used for include paths, library search paths,
-/// and bindgen’s Clang configuration.
-fn cuda_toolkit_dir() -> String {
-    env::var("CUDA_TOOLKIT_PATH")
-        .or_else(|_| env::var("CUDA_HOME"))
-        .unwrap_or_else(|_| "/usr/local/cuda".to_string())
-}
 
 /// Runs [`run`]; on error, prints the message and exits with status 1.
 fn main() {
@@ -23,16 +15,26 @@ fn main() {
 }
 
 /// Configures the crate build: declares rerun triggers, adds native link search paths for `libcuda`,
-/// links `cuda`, and invokes bindgen on `wrapper.h` with `-I{toolkit}/include`, writing
-/// `bindings.rs` into `OUT_DIR`.
+/// links `cuda`, and invokes bindgen on `wrapper.h` with the discovered CUDA include directory,
+/// writing `bindings.rs` into `OUT_DIR`.
 fn run() -> Result<(), Box<dyn Error>> {
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.ends_with("windows-gnu") {
+        return Err(std::io::Error::other(
+            "cuda-oxide Windows support currently targets x86_64-pc-windows-msvc. Use the MSVC toolchain.",
+        )
+        .into());
+    }
+
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-env-changed=CUDA_TOOLKIT_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH_V13_3");
     println!("cargo::rustc-check-cfg=cfg(cuda_has_cuEventElapsedTime_v2)");
 
-    let toolkit = cuda_toolkit_dir();
-    let cuda_h = Path::new(&toolkit).join("include/cuda.h");
+    let include_dir = select_include_dir(&target);
+    let cuda_h = include_dir.join("cuda.h");
     println!("cargo:rerun-if-changed={}", cuda_h.display());
 
     match std::fs::read_to_string(&cuda_h) {
@@ -50,14 +52,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    for path in collect_lib_paths(&toolkit) {
+    for path in cuda_driver_lib_candidates(&target) {
         println!("cargo:rustc-link-search=native={}", path.display());
     }
     println!("cargo:rustc-link-lib=dylib=cuda");
 
     bindgen::builder()
         .header("wrapper.h")
-        .clang_arg(format!("-I{}/include", toolkit))
+        .clang_arg(format!("-I{}", include_dir.display()))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         // CUDA 13.2+ adds types to CUlaunchAttributeValue that bindgen/libclang
         // cannot translate, collapsing the struct to a 1-byte opaque blob while the
@@ -73,27 +75,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Candidate directories for `rustc-link-search=native` when linking against the driver library.
-///
-/// Adds `{toolkit}/lib64` and `{toolkit}/lib64/stubs` when `lib64` exists. If
-/// `{toolkit}/targets/x86_64-linux/include/cuda.h` exists (redistributable / cross-layout install),
-/// also adds `targets/x86_64-linux/lib` and `.../lib/stubs`. Order is preserved; duplicates are not
-/// filtered.
-fn collect_lib_paths(toolkit: &str) -> Vec<PathBuf> {
-    let base = PathBuf::from(toolkit);
-    let mut paths = vec![];
-
-    let lib64 = base.join("lib64");
-    if lib64.is_dir() {
-        paths.push(lib64.clone());
-        paths.push(lib64.join("stubs"));
-    }
-
-    let targets = base.join("targets/x86_64-linux");
-    if targets.join("include/cuda.h").is_file() {
-        paths.push(targets.join("lib"));
-        paths.push(targets.join("lib/stubs"));
-    }
-
-    paths
+fn select_include_dir(target: &str) -> PathBuf {
+    let candidates = include_candidates_for_target(target);
+    candidates
+        .iter()
+        .find(|candidate| candidate.join("cuda.h").is_file())
+        .cloned()
+        .or_else(|| candidates.first().cloned())
+        .unwrap_or_else(|| PathBuf::from("/usr/local/cuda").join("include"))
 }

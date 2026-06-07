@@ -16,7 +16,10 @@ This section walks through everything you need to get `cargo oxide run vecadd` w
 | **Rust**         | Nightly (pinned)    | Pinned in `rust-toolchain.toml`                               |
 
 :::{note}
-cuda-oxide currently targets **Linux only**. Windows is not supported.
+Upstream cuda-oxide is Linux-first. This Windows-support fork keeps Linux
+upstream-compatible and adds experimental Windows 10 22H2/11 support for
+`x86_64-pc-windows-msvc`. Windows GNU is not supported initially. See the
+[Windows setup doc](windows.md) for the native Windows checklist.
 :::
 
 ---
@@ -202,6 +205,13 @@ The two extra components are required by the codegen backend:
 
 - `rust-src` -- source of the Rust standard library, needed for cross-compiling to the NVPTX target.
 - `rustc-dev` -- compiler internals that the backend links against.
+
+:::{note}
+On Windows MSVC, install the same pinned nightly and components, then confirm
+the host target is `x86_64-pc-windows-msvc`. The fork's Windows environment
+variables and validation commands are listed in
+[the Windows setup doc](windows.md).
+:::
 
 ---
 

@@ -18,7 +18,8 @@
 //! On the first poll the operation is executed on its assigned stream and a
 //! host callback is registered via `cuLaunchHostFunc`. When the GPU reaches
 //! the callback, it wakes the future through an [`AtomicWaker`], avoiding
-//! busy-waits.
+//! busy-waits. If the future is dropped after submission, resources returned
+//! by the operation are kept alive until the stream callback fires.
 //!
 //! [`DeviceOperation`]: crate::device_operation::DeviceOperation
 //! [`AtomicWaker`]: futures::task::AtomicWaker
@@ -28,8 +29,8 @@ use crate::error::DeviceError;
 use futures::task::AtomicWaker;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 /// Lifecycle state of a [`DeviceFuture`].
@@ -89,8 +90,10 @@ pub struct DeviceFuture<T: Send, DO: DeviceOperation<Output = T>> {
     pub(crate) device_operation: Option<DO>,
     /// Stream and context for execution. Set by the scheduling policy.
     pub(crate) execution_context: Option<ExecutionContext>,
-    /// Holds the result between execution and final poll resolution.
-    pub(crate) result: Option<T>,
+    /// Holds the result between execution and final poll resolution. The
+    /// callback closure owns another Arc so cancellation after submission does
+    /// not drop resources still needed by in-flight GPU work.
+    pub(crate) result: Option<Arc<Mutex<Option<T>>>>,
     /// Holds an error when the future is in the `Failed` state.
     pub(crate) error: Option<DeviceError>,
     /// Current lifecycle state.
@@ -126,11 +129,13 @@ impl<T: Send, DO: DeviceOperation<Output = T>> DeviceFuture<T, DO> {
     unsafe fn register_callback(
         &self,
         waker_state: Arc<StreamCallbackState>,
+        result_state: Arc<Mutex<Option<T>>>,
     ) -> Result<(), DeviceError> {
         let ctx = self.execution_context.as_ref().ok_or_else(|| {
             DeviceError::Internal("Cannot execute future without an execution context.".to_string())
         })?;
         ctx.get_cuda_stream().launch_host_function(move || {
+            drop(result_state);
             waker_state.signal();
         })?;
         Ok(())
@@ -147,8 +152,30 @@ impl<T: Send, DO: DeviceOperation<Output = T>> DeviceFuture<T, DO> {
             .take()
             .ok_or_else(|| DeviceError::Internal("No operation has been set.".to_string()))?;
         let out = unsafe { operation.execute(ctx) }?;
-        self.result = Some(out);
+        self.result = Some(Arc::new(Mutex::new(Some(out))));
         Ok(())
+    }
+
+    /// Best-effort wait before dropping a completed operation's result after
+    /// callback registration failed. Without a callback, this is the only
+    /// point where the future can keep returned resources alive until the
+    /// stream reaches the already-submitted work.
+    fn synchronize_after_callback_registration_failure(&self) {
+        if let Some(ctx) = &self.execution_context {
+            let _ = ctx.get_cuda_stream().synchronize();
+        }
+    }
+
+    fn take_completed_result(&mut self) -> T {
+        let result = self
+            .result
+            .take()
+            .expect("Executing state must carry a result.");
+        result
+            .lock()
+            .expect("DeviceFuture result mutex poisoned")
+            .take()
+            .expect("Expected result.")
     }
 }
 
@@ -205,7 +232,16 @@ impl<T: Send, DO: DeviceOperation<Output = T>> Future for DeviceFuture<T, DO> {
                     self.state = DeviceFutureState::Complete;
                     return Poll::Ready(Err(e));
                 }
-                if let Err(e) = unsafe { self.register_callback(Arc::clone(&waker_state)) } {
+                let result_state = self
+                    .result
+                    .as_ref()
+                    .map(Arc::clone)
+                    .expect("Executing state must carry a result.");
+                if let Err(e) =
+                    unsafe { self.register_callback(Arc::clone(&waker_state), result_state) }
+                {
+                    self.synchronize_after_callback_registration_failure();
+                    self.result.take();
                     self.state = DeviceFutureState::Complete;
                     return Poll::Ready(Err(e));
                 }
@@ -215,12 +251,12 @@ impl<T: Send, DO: DeviceOperation<Output = T>> Future for DeviceFuture<T, DO> {
             DeviceFutureState::Executing => {
                 if waker_state.complete.load(Ordering::Relaxed) {
                     self.state = DeviceFutureState::Complete;
-                    return Poll::Ready(Ok(self.result.take().expect("Expected result.")));
+                    return Poll::Ready(Ok(self.take_completed_result()));
                 }
                 waker_state.waker.register(cx.waker());
                 if waker_state.complete.load(Ordering::Relaxed) {
                     self.state = DeviceFutureState::Complete;
-                    Poll::Ready(Ok(self.result.take().expect("Expected result.")))
+                    Poll::Ready(Ok(self.take_completed_result()))
                 } else {
                     Poll::Pending
                 }

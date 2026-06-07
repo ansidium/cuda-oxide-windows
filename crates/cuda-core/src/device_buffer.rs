@@ -120,6 +120,7 @@ unsafe impl DeviceCopy for half::f16 {}
 pub struct DeviceBuffer<T> {
     ptr: CUdeviceptr,
     len: usize,
+    num_bytes: usize,
     ctx: Arc<CudaContext>,
     _marker: PhantomData<T>,
 }
@@ -163,7 +164,7 @@ impl<T> DeviceBuffer<T> {
     /// Total size in bytes (`len * size_of::<T>()`).
     #[inline]
     pub fn num_bytes(&self) -> usize {
-        self.len * std::mem::size_of::<T>()
+        self.num_bytes
     }
 
     /// Returns a reference to the owning context.
@@ -181,9 +182,12 @@ impl<T> DeviceBuffer<T> {
     /// - `ptr` must belong to the same CUDA context as `ctx`.
     /// - The caller transfers ownership -- `ptr` will be freed on drop.
     pub unsafe fn from_raw_parts(ptr: CUdeviceptr, len: usize, ctx: Arc<CudaContext>) -> Self {
+        let num_bytes = crate::memory::allocation_size::<T>(len)
+            .expect("device buffer byte size overflow in from_raw_parts");
         Self {
             ptr,
             len,
+            num_bytes,
             ctx,
             _marker: PhantomData,
         }
@@ -199,6 +203,37 @@ impl<T> DeviceBuffer<T> {
     }
 }
 
+struct DeviceAllocationGuard {
+    ptr: CUdeviceptr,
+    ctx: Arc<CudaContext>,
+    armed: bool,
+}
+
+impl DeviceAllocationGuard {
+    fn new(ptr: CUdeviceptr, ctx: Arc<CudaContext>) -> Self {
+        Self {
+            ptr,
+            ctx,
+            armed: true,
+        }
+    }
+
+    fn into_ptr(mut self) -> CUdeviceptr {
+        self.armed = false;
+        self.ptr
+    }
+}
+
+impl Drop for DeviceAllocationGuard {
+    fn drop(&mut self) {
+        if self.armed && self.ptr != 0 {
+            self.ctx.record_err(self.ctx.bind_to_thread());
+            self.ctx
+                .record_err(unsafe { crate::memory::free_sync(self.ptr) });
+        }
+    }
+}
+
 impl<T: DeviceCopy> DeviceBuffer<T> {
     /// Allocates device memory and copies `data` from the host, enqueued on
     /// `stream`.
@@ -210,15 +245,28 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
     pub fn from_host(stream: &CudaStream, data: &[T]) -> Result<Self, DriverError> {
         let ctx = stream.context().clone();
         let len = data.len();
-        let num_bytes = std::mem::size_of_val(data);
+        let num_bytes = crate::memory::allocation_size::<T>(len)?;
 
-        let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
-        unsafe {
-            crate::memory::memcpy_htod_async(ptr, data.as_ptr(), num_bytes, stream.cu_stream())?;
-        }
+        let ptr = if num_bytes == 0 {
+            0
+        } else {
+            ctx.bind_to_thread()?;
+            let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
+            let guard = DeviceAllocationGuard::new(ptr, ctx.clone());
+            unsafe {
+                crate::memory::memcpy_htod_async(
+                    ptr,
+                    data.as_ptr(),
+                    num_bytes,
+                    stream.cu_stream(),
+                )?;
+            }
+            guard.into_ptr()
+        };
         Ok(Self {
             ptr,
             len,
+            num_bytes,
             ctx,
             _marker: PhantomData,
         })
@@ -267,17 +315,23 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
     /// on `stream`.
     pub fn zeroed(stream: &CudaStream, len: usize) -> Result<Self, DriverError> {
         let ctx = stream.context().clone();
-        let num_bytes = len * std::mem::size_of::<T>();
+        let num_bytes = crate::memory::allocation_size::<T>(len)?;
 
-        let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
-        if num_bytes > 0 {
+        let ptr = if num_bytes == 0 {
+            0
+        } else {
+            ctx.bind_to_thread()?;
+            let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
+            let guard = DeviceAllocationGuard::new(ptr, ctx.clone());
             unsafe {
                 crate::memory::memset_d8_async(ptr, 0, num_bytes, stream.cu_stream())?;
             }
-        }
+            guard.into_ptr()
+        };
         Ok(Self {
             ptr,
             len,
+            num_bytes,
             ctx,
             _marker: PhantomData,
         })
@@ -289,15 +343,17 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
     /// to read immediately.
     pub fn to_host_vec(&self, stream: &CudaStream) -> Result<Vec<T>, DriverError> {
         let mut host = Vec::with_capacity(self.len);
-        unsafe {
-            crate::memory::memcpy_dtoh_async(
-                host.as_mut_ptr(),
-                self.ptr,
-                self.num_bytes(),
-                stream.cu_stream(),
-            )?;
+        if self.num_bytes != 0 {
+            unsafe {
+                crate::memory::memcpy_dtoh_async(
+                    host.as_mut_ptr(),
+                    self.ptr,
+                    self.num_bytes,
+                    stream.cu_stream(),
+                )?;
+            }
+            stream.synchronize()?;
         }
-        stream.synchronize()?;
         unsafe { host.set_len(self.len) };
         Ok(host)
     }
@@ -313,15 +369,18 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             dst.len(),
             self.len
         );
-        unsafe {
-            crate::memory::memcpy_dtoh_async(
-                dst.as_mut_ptr(),
-                self.ptr,
-                self.num_bytes(),
-                stream.cu_stream(),
-            )?;
+        if self.num_bytes != 0 {
+            unsafe {
+                crate::memory::memcpy_dtoh_async(
+                    dst.as_mut_ptr(),
+                    self.ptr,
+                    self.num_bytes,
+                    stream.cu_stream(),
+                )?;
+            }
+            stream.synchronize()?;
         }
-        stream.synchronize()
+        Ok(())
     }
 
     /// Copies the buffer contents into an existing pinned host buffer and
@@ -380,13 +439,17 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             dst.len(),
             self.len
         );
-        unsafe {
-            crate::memory::memcpy_dtoh_async(
-                dst.as_mut_ptr(),
-                self.ptr,
-                self.num_bytes(),
-                stream.cu_stream(),
-            )
+        if self.num_bytes == 0 {
+            Ok(())
+        } else {
+            unsafe {
+                crate::memory::memcpy_dtoh_async(
+                    dst.as_mut_ptr(),
+                    self.ptr,
+                    self.num_bytes,
+                    stream.cu_stream(),
+                )
+            }
         }
     }
 
@@ -433,8 +496,17 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             self.len
         );
         let num_bytes = src.num_bytes();
-        unsafe {
-            crate::memory::memcpy_htod_async(self.ptr, src.as_ptr(), num_bytes, stream.cu_stream())
+        if num_bytes == 0 {
+            Ok(())
+        } else {
+            unsafe {
+                crate::memory::memcpy_htod_async(
+                    self.ptr,
+                    src.as_ptr(),
+                    num_bytes,
+                    stream.cu_stream(),
+                )
+            }
         }
     }
 }

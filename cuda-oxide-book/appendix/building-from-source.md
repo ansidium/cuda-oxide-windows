@@ -13,8 +13,16 @@ from a fresh checkout. If you just want to run an example, the
 | **Rust nightly** | `nightly-2026-04-03` (pinned) | Compiler toolchain with `rustc-dev` for the codegen backend |
 | **CUDA Toolkit** | 12.x+                         | Driver API, `nvcc`, PTX assembler                           |
 | **Clang**        | 21+ (`clang-21` pkg)          | `bindgen` in host `cuda-bindings` needs clang's headers     |
-| **Linux**        | Tested on Ubuntu 24.04        | Windows and macOS are not supported                         |
+| **Linux**        | Tested on Ubuntu 24.04        | Upstream-compatible path                                    |
+| **Windows**      | Windows 10 22H2/11, MSVC      | Experimental fork path, `x86_64-pc-windows-msvc` only       |
 | **GPU**          | sm_80, sm_90, sm_100a         | Hardware target                                             |
+
+```{note}
+The native Windows path is experimental in this fork and does not change the
+Linux build instructions below. Windows GNU is unsupported initially. See
+[the Windows setup doc](../getting-started/windows.md) for the Windows setup
+checklist and [FORK.md](../../FORK.md) for fork policy.
+```
 
 ## Clone the repository
 
@@ -168,6 +176,19 @@ libNVVM / nvJitLink / libdevice for kernels that use math intrinsics), LLVM
 installation, and codegen backend. If everything is configured correctly,
 `cargo oxide run vecadd` compiles a Rust kernel to PTX, launches it on the GPU,
 and prints a success message.
+
+On Windows MSVC, the release-readiness smoke path is:
+
+```powershell
+cargo build -p cargo-oxide
+cargo test -p oxide-artifacts --features object
+cargo oxide doctor
+cargo oxide build vecadd
+cargo oxide run vecadd
+.\scripts\smoketest.ps1
+```
+
+Use `.\scripts\smoketest.ps1 -BuildOnly` on machines without an NVIDIA GPU.
 
 ## Common commands
 

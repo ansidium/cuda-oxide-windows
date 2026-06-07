@@ -233,3 +233,32 @@ pub fn allocation_granularity(device: cuda_bindings::CUdevice) -> Result<usize, 
 pub fn align_size(size: usize, granularity: usize) -> usize {
     (size + granularity - 1) & !(granularity - 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::TryInto;
+
+    #[test]
+    fn mem_location_device_id_offset_matches_manual_write() {
+        let size = std::mem::size_of::<cuda_bindings::CUmemLocation_st>();
+        assert!(size >= 8);
+
+        let mut loc: cuda_bindings::CUmemLocation_st = unsafe { std::mem::zeroed() };
+        unsafe { set_mem_location_device(&mut loc, 7) };
+
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&loc as *const cuda_bindings::CUmemLocation_st).cast::<u8>(),
+                size,
+            )
+        };
+        let device = i32::from_ne_bytes(bytes[4..8].try_into().unwrap());
+
+        assert_eq!(
+            loc.type_,
+            cuda_bindings::CUmemLocationType_enum_CU_MEM_LOCATION_TYPE_DEVICE
+        );
+        assert_eq!(device, 7);
+    }
+}

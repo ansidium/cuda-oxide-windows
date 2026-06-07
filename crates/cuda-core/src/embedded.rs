@@ -210,18 +210,40 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn artifact_bundles_from_binary_path_reads_linked_executable() {
+        artifact_bundles_from_linked_executable("x86_64-unknown-linux-gnu", "artifact.o", "host");
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"))]
+    #[test]
+    fn artifact_bundles_from_binary_path_reads_linked_windows_executable() {
+        artifact_bundles_from_linked_executable(
+            "x86_64-pc-windows-msvc",
+            "artifact.obj",
+            "host.exe",
+        );
+    }
+
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")
+    ))]
+    fn artifact_bundles_from_linked_executable(
+        host_target: &str,
+        object_file_name: &str,
+        exe_file_name: &str,
+    ) {
         let temp_dir = unique_temp_dir("cuda-core-embedded-artifacts");
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let source_path = temp_dir.join("main.rs");
-        let object_path = temp_dir.join("artifact.o");
-        let exe_path = temp_dir.join("host");
+        let object_path = temp_dir.join(object_file_name);
+        let exe_path = temp_dir.join(exe_file_name);
 
         let blob = build_artifact_blob(&ArtifactBundleSpec::new("linked", "sm_90").with_payload(
             ArtifactPayloadSpec::new(ArtifactPayloadKind::Ptx, "linked.ptx", b"ptx"),
         ))
         .unwrap();
-        let object = build_host_object_for_target(&blob, "x86_64-unknown-linux-gnu").unwrap();
+        let object = build_host_object_for_target(&blob, host_target).unwrap();
         std::fs::write(&source_path, "fn main() {}\n").unwrap();
         std::fs::write(&object_path, object).unwrap();
 
@@ -254,7 +276,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")
+    ))]
     fn unique_temp_dir(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

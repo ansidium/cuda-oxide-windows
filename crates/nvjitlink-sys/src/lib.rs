@@ -7,16 +7,29 @@
 //!
 //! nvJitLink links one or more LTOIR modules (and other input forms) into
 //! a final cubin or PTX. It is part of the CUDA Toolkit and ships at
-//! `<cuda>/lib64/libnvJitLink.so`.
+//! `<cuda>/lib64/libnvJitLink.so` on Linux and as `nvJitLink_*.dll` under
+//! `<cuda>/bin/` or `<cuda>/bin/x64/` on Windows.
+//!
+//! # Library discovery
+//!
+//! [`LibNvJitLink::load`] tries (in order):
+//! 1. `LIBNVJITLINK_PATH` env var, if set.
+//! 2. Platform loader names (`libnvJitLink.so.13`, `libnvJitLink.so.12`,
+//!    `libnvJitLink.so` on Linux; discovered `nvJitLink_*.dll` files on
+//!    Windows).
+//! 3. CUDA Toolkit roots from `cuda-toolkit-discovery`, including
+//!    `<root>/lib64/libnvJitLink.so` on Linux and
+//!    `<root>/bin/x64/nvJitLink_*.dll` / `<root>/bin/nvJitLink_*.dll` on
+//!    Windows.
 //!
 //! # Symbol naming
 //!
 //! `nvJitLink.h` `#define`s every public function to a versioned mangled
-//! name, e.g. `nvJitLinkCreate -> __nvJitLinkCreate_13_0`, but the library
-//! also exports the unversioned name with default ELF symbol versioning.
-//! That means `dlsym(handle, "nvJitLinkCreate")` resolves to the right
-//! function on every CUDA Toolkit version, so this binding does not need
-//! to probe per-CUDA-version symbol suffixes.
+//! name, e.g. `nvJitLinkCreate -> __nvJitLinkCreate_13_0`, but the runtime
+//! library also exports the unversioned public names. That means
+//! `dlsym` / `GetProcAddress` for `nvJitLinkCreate` resolves to the right
+//! function on every CUDA Toolkit version, so this binding does not need to
+//! probe per-CUDA-version symbol suffixes.
 //!
 //! # Example
 //!
@@ -31,8 +44,9 @@
 //! ```
 
 use libloading::{Library, Symbol};
-use std::ffi::{CString, c_char, c_void};
-use std::path::PathBuf;
+use std::ffi::{CString, c_char, c_int, c_void};
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use thiserror::Error;
 
@@ -45,30 +59,84 @@ use thiserror::Error;
 #[derive(Copy, Clone)]
 struct NvJitLinkHandle(*mut c_void);
 
-/// nvJitLink result codes (`nvJitLinkResult`). Mirrors `nvJitLink.h`.
+type NvJitLinkResultRaw = c_int;
+
+/// Known nvJitLink result codes (`nvJitLinkResult`). Mirrors `nvJitLink.h`.
 #[allow(dead_code)]
-#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum NvJitLinkResult {
-    Success = 0,
-    UnrecognizedOption = 1,
-    MissingArch = 2,
-    InvalidInput = 3,
-    PtxCompile = 4,
-    NvvmCompile = 5,
-    Internal = 6,
-    Threadpool = 7,
-    UnrecognizedInput = 8,
-    Finalize = 9,
-    NullInput = 10,
-    IncompatibleOptions = 11,
-    IncorrectInputType = 12,
-    ArchMismatch = 13,
-    OutdatedLibrary = 14,
-    MissingFatbin = 15,
-    UnrecognizedArch = 16,
-    UnsupportedArch = 17,
-    LtoNotEnabled = 18,
+pub enum NvJitLinkResultCode {
+    Success,
+    UnrecognizedOption,
+    MissingArch,
+    InvalidInput,
+    PtxCompile,
+    NvvmCompile,
+    Internal,
+    Threadpool,
+    UnrecognizedInput,
+    Finalize,
+    NullInput,
+    IncompatibleOptions,
+    IncorrectInputType,
+    ArchMismatch,
+    OutdatedLibrary,
+    MissingFatbin,
+    UnrecognizedArch,
+    UnsupportedArch,
+    LtoNotEnabled,
+}
+
+impl NvJitLinkResultCode {
+    fn from_raw(raw: NvJitLinkResultRaw) -> Option<Self> {
+        Some(match raw {
+            0 => Self::Success,
+            1 => Self::UnrecognizedOption,
+            2 => Self::MissingArch,
+            3 => Self::InvalidInput,
+            4 => Self::PtxCompile,
+            5 => Self::NvvmCompile,
+            6 => Self::Internal,
+            7 => Self::Threadpool,
+            8 => Self::UnrecognizedInput,
+            9 => Self::Finalize,
+            10 => Self::NullInput,
+            11 => Self::IncompatibleOptions,
+            12 => Self::IncorrectInputType,
+            13 => Self::ArchMismatch,
+            14 => Self::OutdatedLibrary,
+            15 => Self::MissingFatbin,
+            16 => Self::UnrecognizedArch,
+            17 => Self::UnsupportedArch,
+            18 => Self::LtoNotEnabled,
+            _ => return None,
+        })
+    }
+}
+
+impl fmt::Display for NvJitLinkResultCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Success => f.write_str("Success"),
+            Self::UnrecognizedOption => f.write_str("UnrecognizedOption"),
+            Self::MissingArch => f.write_str("MissingArch"),
+            Self::InvalidInput => f.write_str("InvalidInput"),
+            Self::PtxCompile => f.write_str("PtxCompile"),
+            Self::NvvmCompile => f.write_str("NvvmCompile"),
+            Self::Internal => f.write_str("Internal"),
+            Self::Threadpool => f.write_str("Threadpool"),
+            Self::UnrecognizedInput => f.write_str("UnrecognizedInput"),
+            Self::Finalize => f.write_str("Finalize"),
+            Self::NullInput => f.write_str("NullInput"),
+            Self::IncompatibleOptions => f.write_str("IncompatibleOptions"),
+            Self::IncorrectInputType => f.write_str("IncorrectInputType"),
+            Self::ArchMismatch => f.write_str("ArchMismatch"),
+            Self::OutdatedLibrary => f.write_str("OutdatedLibrary"),
+            Self::MissingFatbin => f.write_str("MissingFatbin"),
+            Self::UnrecognizedArch => f.write_str("UnrecognizedArch"),
+            Self::UnsupportedArch => f.write_str("UnsupportedArch"),
+            Self::LtoNotEnabled => f.write_str("LtoNotEnabled"),
+        }
+    }
 }
 
 /// nvJitLink input kinds (`nvJitLinkInputType`). Mirrors `nvJitLink.h`.
@@ -106,20 +174,21 @@ pub enum InputType {
 /// All errors surfaced by this crate.
 #[derive(Debug, Error)]
 pub enum NvJitLinkError {
-    /// `libnvJitLink.so` could not be located on this system. `tried` lists
-    /// every path or SONAME that was probed, in order, joined by newlines.
+    /// nvJitLink could not be located on this system. `tried` lists every
+    /// path, loader name, or search pattern that was probed, in order, joined
+    /// by newlines.
     #[error(
-        "libnvJitLink.so could not be located. Set LIBNVJITLINK_PATH or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
+        "nvJitLink could not be located. Set LIBNVJITLINK_PATH or a CUDA Toolkit root, or install the CUDA Toolkit. Tried:\n  {tried}"
     )]
     LibraryNotFound {
-        /// Newline-joined list of paths and SONAMEs that were probed.
+        /// Newline-joined list of paths, loader names, and search patterns.
         tried: String,
     },
 
-    /// `libnvJitLink.so` was loaded, but `dlsym` failed to resolve a function
+    /// nvJitLink was loaded, but `dlsym` failed to resolve a function
     /// this crate requires. Indicates an old or broken nvJitLink that does
     /// not export the standard linker API.
-    #[error("libnvJitLink.so was found but a required symbol is missing: {symbol}: {source}")]
+    #[error("nvJitLink was found but a required symbol is missing: {symbol}: {source}")]
     SymbolNotFound {
         /// Name of the missing nvJitLink function (e.g. `nvJitLinkCreate`).
         symbol: &'static str,
@@ -128,16 +197,28 @@ pub enum NvJitLinkError {
         source: libloading::Error,
     },
 
-    /// An nvJitLink call returned a non-`Success` `nvJitLinkResult`. `log`
-    /// carries the nvJitLink error log when one was produced by the call.
-    #[error("nvJitLink error in {operation}: {code:?}{}", .log.as_ref().map(|l| format!("\n--- nvJitLink error log ---\n{l}")).unwrap_or_default())]
+    /// An nvJitLink call returned a known non-`Success` `nvJitLinkResult`.
+    /// `log` carries the nvJitLink error log when one was produced by the
+    /// call.
+    #[error("nvJitLink error in {operation}: {code}{}", .log.as_ref().map(|l| format!("\n--- nvJitLink error log ---\n{l}")).unwrap_or_default())]
     Call {
         /// Name of the nvJitLink function that failed.
         operation: &'static str,
-        /// Raw `nvJitLinkResult` integer.
-        code: i32,
+        /// Known `nvJitLinkResult` value.
+        code: NvJitLinkResultCode,
         /// nvJitLink error log, if available.
         log: Option<String>,
+    },
+
+    /// An nvJitLink call returned an integer that does not map to any known
+    /// `nvJitLinkResult` value. The raw value is preserved without
+    /// constructing an invalid Rust enum.
+    #[error("nvJitLink returned unknown nvJitLinkResult in {operation}: {code}")]
+    UnknownResult {
+        /// Name of the nvJitLink function that returned the unknown result.
+        operation: &'static str,
+        /// Raw result integer returned by nvJitLink.
+        code: c_int,
     },
 }
 
@@ -157,23 +238,23 @@ pub enum NvJitLinkError {
 pub struct LibNvJitLink {
     _lib: Library,
     create:
-        unsafe extern "C" fn(*mut NvJitLinkHandle, u32, *const *const c_char) -> NvJitLinkResult,
-    destroy: unsafe extern "C" fn(*mut NvJitLinkHandle) -> NvJitLinkResult,
+        unsafe extern "C" fn(*mut NvJitLinkHandle, u32, *const *const c_char) -> NvJitLinkResultRaw,
+    destroy: unsafe extern "C" fn(*mut NvJitLinkHandle) -> NvJitLinkResultRaw,
     add_data: unsafe extern "C" fn(
         NvJitLinkHandle,
         InputType,
         *const c_void,
         usize,
         *const c_char,
-    ) -> NvJitLinkResult,
-    complete: unsafe extern "C" fn(NvJitLinkHandle) -> NvJitLinkResult,
-    get_linked_cubin_size: unsafe extern "C" fn(NvJitLinkHandle, *mut usize) -> NvJitLinkResult,
-    get_linked_cubin: unsafe extern "C" fn(NvJitLinkHandle, *mut c_void) -> NvJitLinkResult,
-    get_error_log_size: unsafe extern "C" fn(NvJitLinkHandle, *mut usize) -> NvJitLinkResult,
-    get_error_log: unsafe extern "C" fn(NvJitLinkHandle, *mut c_char) -> NvJitLinkResult,
-    get_info_log_size: unsafe extern "C" fn(NvJitLinkHandle, *mut usize) -> NvJitLinkResult,
-    get_info_log: unsafe extern "C" fn(NvJitLinkHandle, *mut c_char) -> NvJitLinkResult,
-    version: Option<unsafe extern "C" fn(*mut u32, *mut u32) -> NvJitLinkResult>,
+    ) -> NvJitLinkResultRaw,
+    complete: unsafe extern "C" fn(NvJitLinkHandle) -> NvJitLinkResultRaw,
+    get_linked_cubin_size: unsafe extern "C" fn(NvJitLinkHandle, *mut usize) -> NvJitLinkResultRaw,
+    get_linked_cubin: unsafe extern "C" fn(NvJitLinkHandle, *mut c_void) -> NvJitLinkResultRaw,
+    get_error_log_size: unsafe extern "C" fn(NvJitLinkHandle, *mut usize) -> NvJitLinkResultRaw,
+    get_error_log: unsafe extern "C" fn(NvJitLinkHandle, *mut c_char) -> NvJitLinkResultRaw,
+    get_info_log_size: unsafe extern "C" fn(NvJitLinkHandle, *mut usize) -> NvJitLinkResultRaw,
+    get_info_log: unsafe extern "C" fn(NvJitLinkHandle, *mut c_char) -> NvJitLinkResultRaw,
+    version: Option<unsafe extern "C" fn(*mut u32, *mut u32) -> NvJitLinkResultRaw>,
 }
 
 // SAFETY: Same reasoning as `libnvvm-sys::LibNvvm`. The struct holds an
@@ -256,7 +337,7 @@ impl LibNvJitLink {
         let mut major = 0;
         let mut minor = 0;
         let r = unsafe { f(&mut major, &mut minor) };
-        if r == NvJitLinkResult::Success {
+        if NvJitLinkResultCode::from_raw(r) == Some(NvJitLinkResultCode::Success) {
             Some((major, minor))
         } else {
             None
@@ -410,15 +491,19 @@ impl Drop for Linker<'_> {
 fn check(
     _nvj: &LibNvJitLink,
     linker: &Linker<'_>,
-    r: NvJitLinkResult,
+    r: NvJitLinkResultRaw,
     op: &'static str,
 ) -> Result<(), NvJitLinkError> {
-    if r == NvJitLinkResult::Success {
+    let code = NvJitLinkResultCode::from_raw(r).ok_or(NvJitLinkError::UnknownResult {
+        operation: op,
+        code: r,
+    })?;
+    if code == NvJitLinkResultCode::Success {
         return Ok(());
     }
     Err(NvJitLinkError::Call {
         operation: op,
-        code: r as i32,
+        code,
         log: linker.try_error_log(),
     })
 }
@@ -426,20 +511,20 @@ fn check(
 fn try_log(
     _nvj: &LibNvJitLink,
     handle: NvJitLinkHandle,
-    size_fn: unsafe extern "C" fn(NvJitLinkHandle, *mut usize) -> NvJitLinkResult,
-    get_fn: unsafe extern "C" fn(NvJitLinkHandle, *mut c_char) -> NvJitLinkResult,
+    size_fn: unsafe extern "C" fn(NvJitLinkHandle, *mut usize) -> NvJitLinkResultRaw,
+    get_fn: unsafe extern "C" fn(NvJitLinkHandle, *mut c_char) -> NvJitLinkResultRaw,
 ) -> Option<String> {
     if handle.0.is_null() {
         return None;
     }
     let mut size: usize = 0;
     let r = unsafe { size_fn(handle, &mut size) };
-    if r != NvJitLinkResult::Success || size <= 1 {
+    if NvJitLinkResultCode::from_raw(r) != Some(NvJitLinkResultCode::Success) || size <= 1 {
         return None;
     }
     let mut buf = vec![0u8; size];
     let r = unsafe { get_fn(handle, buf.as_mut_ptr() as *mut c_char) };
-    if r != NvJitLinkResult::Success {
+    if NvJitLinkResultCode::from_raw(r) != Some(NvJitLinkResultCode::Success) {
         return None;
     }
     if let Some(&0) = buf.last() {
@@ -448,45 +533,329 @@ fn try_log(
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LibraryCandidate {
+    Path(PathBuf),
+    LoaderName(&'static str),
+    SearchPattern {
+        dir: Option<PathBuf>,
+        pattern: &'static str,
+    },
+}
+
+impl LibraryCandidate {
+    fn description(&self) -> String {
+        match self {
+            Self::Path(path) => path.display().to_string(),
+            Self::LoaderName(name) => (*name).to_string(),
+            Self::SearchPattern {
+                dir: Some(dir),
+                pattern,
+            } => dir.join(pattern).display().to_string(),
+            Self::SearchPattern { dir: None, pattern } => (*pattern).to_string(),
+        }
+    }
+}
+
 fn open_library(tried: &mut Vec<String>) -> Option<Library> {
-    if let Ok(p) = std::env::var("LIBNVJITLINK_PATH") {
-        let path = PathBuf::from(&p);
-        tried.push(path.display().to_string());
-        if let Ok(lib) = unsafe { Library::new(&path) } {
-            return Some(lib);
-        }
-    }
+    let override_path = std::env::var_os("LIBNVJITLINK_PATH").map(PathBuf::from);
+    let discovered = cuda_toolkit_discovery::nvjitlink_dll_candidates(target_triple_hint());
+    let candidates = library_candidates(override_path, &discovered);
+    open_library_from_candidates(&candidates, tried)
+}
 
-    for soname in [
-        "libnvJitLink.so.13",
-        "libnvJitLink.so.12",
-        "libnvJitLink.so",
-    ] {
-        tried.push(soname.to_string());
-        if let Ok(lib) = unsafe { Library::new(soname) } {
-            return Some(lib);
-        }
-    }
-
-    for root in cuda_roots() {
-        let path = root.join("lib64/libnvJitLink.so");
-        tried.push(path.display().to_string());
-        if let Ok(lib) = unsafe { Library::new(&path) } {
-            return Some(lib);
+fn open_library_from_candidates(
+    candidates: &[LibraryCandidate],
+    tried: &mut Vec<String>,
+) -> Option<Library> {
+    for candidate in candidates {
+        match candidate {
+            LibraryCandidate::Path(path) => {
+                if let Some(lib) = try_open_path(path, tried) {
+                    return Some(lib);
+                }
+            }
+            LibraryCandidate::LoaderName(name) => {
+                tried.push((*name).to_string());
+                if let Ok(lib) = unsafe { Library::new(*name) } {
+                    return Some(lib);
+                }
+            }
+            LibraryCandidate::SearchPattern { dir, pattern } => {
+                tried.push(candidate.description());
+                for path in matching_files(dir.as_deref(), pattern) {
+                    if let Some(lib) = try_open_path(&path, tried) {
+                        return Some(lib);
+                    }
+                }
+            }
         }
     }
 
     None
 }
 
-fn cuda_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    for var in ["CUDA_HOME", "CUDA_PATH"] {
-        if let Ok(r) = std::env::var(var) {
-            roots.push(PathBuf::from(r));
+fn try_open_path(path: &Path, tried: &mut Vec<String>) -> Option<Library> {
+    tried.push(path.display().to_string());
+    unsafe { Library::new(path) }.ok()
+}
+
+fn library_candidates(
+    override_path: Option<PathBuf>,
+    discovered_paths: &[PathBuf],
+) -> Vec<LibraryCandidate> {
+    let mut candidates = Vec::new();
+    if let Some(path) = override_path {
+        candidates.push(LibraryCandidate::Path(path));
+    }
+
+    platform_library_candidates(&mut candidates, discovered_paths);
+    candidates
+}
+
+#[cfg(windows)]
+fn platform_library_candidates(
+    candidates: &mut Vec<LibraryCandidate>,
+    discovered_paths: &[PathBuf],
+) {
+    candidates.push(LibraryCandidate::SearchPattern {
+        dir: None,
+        pattern: "nvJitLink_*.dll",
+    });
+
+    for path in discovered_paths {
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        push_candidate_once(
+            candidates,
+            LibraryCandidate::SearchPattern {
+                dir: Some(parent.to_path_buf()),
+                pattern: "nvJitLink_*.dll",
+            },
+        );
+
+        if parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("x64"))
+            && let Some(bin_dir) = parent.parent()
+        {
+            push_candidate_once(
+                candidates,
+                LibraryCandidate::SearchPattern {
+                    dir: Some(bin_dir.to_path_buf()),
+                    pattern: "nvJitLink_*.dll",
+                },
+            );
         }
     }
-    roots.push(PathBuf::from("/usr/local/cuda"));
-    roots.push(PathBuf::from("/opt/cuda"));
-    roots
+
+    for path in discovered_paths {
+        push_candidate_once(candidates, LibraryCandidate::Path(path.clone()));
+    }
+}
+
+#[cfg(not(windows))]
+fn platform_library_candidates(
+    candidates: &mut Vec<LibraryCandidate>,
+    discovered_paths: &[PathBuf],
+) {
+    for soname in [
+        "libnvJitLink.so.13",
+        "libnvJitLink.so.12",
+        "libnvJitLink.so",
+    ] {
+        candidates.push(LibraryCandidate::LoaderName(soname));
+    }
+
+    for path in discovered_paths {
+        push_candidate_once(candidates, LibraryCandidate::Path(path.clone()));
+    }
+}
+
+fn push_candidate_once(candidates: &mut Vec<LibraryCandidate>, candidate: LibraryCandidate) {
+    if !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn matching_files(dir: Option<&Path>, pattern: &str) -> Vec<PathBuf> {
+    let mut matches = Vec::new();
+    let Some((prefix, suffix)) = pattern.split_once('*') else {
+        return matches;
+    };
+
+    for dir in search_dirs(dir) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if wildcard_match(file_name, prefix, suffix) {
+                matches.push(path);
+            }
+        }
+    }
+
+    matches.sort_by(|a, b| b.file_name().cmp(&a.file_name()).then_with(|| b.cmp(a)));
+    matches.dedup();
+    matches
+}
+
+fn wildcard_match(file_name: &str, prefix: &str, suffix: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let file_name = file_name.to_ascii_lowercase();
+        let prefix = prefix.to_ascii_lowercase();
+        let suffix = suffix.to_ascii_lowercase();
+        file_name.starts_with(&prefix) && file_name.ends_with(&suffix)
+    }
+
+    #[cfg(not(windows))]
+    {
+        file_name.starts_with(prefix) && file_name.ends_with(suffix)
+    }
+}
+
+fn search_dirs(dir: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(dir) = dir {
+        return vec![dir.to_path_buf()];
+    }
+
+    let mut dirs = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs
+}
+
+fn target_triple_hint() -> &'static str {
+    if cfg!(windows) {
+        "x86_64-pc-windows-msvc"
+    } else {
+        "x86_64-unknown-linux-gnu"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn candidate_descriptions(override_path: Option<PathBuf>, roots: &[PathBuf]) -> Vec<String> {
+        library_candidates(override_path, roots)
+            .iter()
+            .map(LibraryCandidate::description)
+            .collect()
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{now}", std::process::id()))
+    }
+
+    #[test]
+    fn direct_override_is_first_candidate() {
+        let override_path = PathBuf::from(r"C:\custom\nvJitLink_130_0.dll");
+        let descriptions =
+            candidate_descriptions(Some(override_path.clone()), &[PathBuf::from(r"C:\CUDA")]);
+
+        assert_eq!(descriptions[0], override_path.display().to_string());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_candidates_include_loader_and_toolkit_patterns() {
+        let root = PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0");
+        let discovered = vec![root.join("bin").join("x64").join("nvJitLink_130_0.dll")];
+        let descriptions = candidate_descriptions(None, &discovered);
+
+        assert!(descriptions.contains(&"nvJitLink_*.dll".to_string()));
+        assert!(
+            descriptions.contains(
+                &root
+                    .join("bin")
+                    .join("x64")
+                    .join("nvJitLink_*.dll")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(
+            descriptions.contains(
+                &root
+                    .join("bin")
+                    .join("nvJitLink_*.dll")
+                    .display()
+                    .to_string()
+            )
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_candidates_preserve_loader_names_and_toolkit_path() {
+        let root = PathBuf::from("/usr/local/cuda");
+        let discovered = vec![root.join("lib64/libnvJitLink.so")];
+        let descriptions = candidate_descriptions(None, &discovered);
+
+        assert_eq!(descriptions[0], "libnvJitLink.so.13");
+        assert_eq!(descriptions[1], "libnvJitLink.so.12");
+        assert_eq!(descriptions[2], "libnvJitLink.so");
+        assert!(descriptions.contains(&root.join("lib64/libnvJitLink.so").display().to_string()));
+    }
+
+    #[test]
+    fn wildcard_scan_finds_versioned_dlls_without_glob_dependency() {
+        let dir = unique_temp_dir("nvjitlink-sys-dll-scan");
+        fs::create_dir_all(&dir).expect("create temp dll scan dir");
+        fs::write(dir.join("nvJitLink_120_0.dll"), []).expect("write old dll");
+        fs::write(dir.join("nvJitLink_130_0.dll"), []).expect("write new dll");
+        fs::write(dir.join("not-nvJitLink_130_0.dll"), []).expect("write nonmatch");
+
+        let matches = matching_files(Some(&dir), "nvJitLink_*.dll");
+        let names: Vec<_> = matches
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(names, ["nvJitLink_130_0.dll", "nvJitLink_120_0.dll"]);
+
+        fs::remove_dir_all(dir).expect("remove temp dll scan dir");
+    }
+
+    #[test]
+    fn unknown_result_code_is_not_mapped_to_known_enum() {
+        assert_eq!(NvJitLinkResultCode::from_raw(10_000), None);
+    }
+
+    #[test]
+    fn known_result_code_displays_symbolic_name() {
+        assert_eq!(
+            NvJitLinkResultCode::from_raw(18).unwrap().to_string(),
+            "LtoNotEnabled"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA Toolkit nvJitLink library available to the loader"]
+    fn smoke_load_nvjitlink_version() {
+        let nvj = LibNvJitLink::load().expect("load nvJitLink");
+        let _version = nvj.version().expect("query nvJitLink version");
+    }
 }

@@ -123,7 +123,7 @@ impl<T: DeviceCopy> PinnedHostBuffer<T> {
     }
 
     fn allocate(ctx: &Arc<CudaContext>, len: usize) -> Result<Self, DriverError> {
-        let num_bytes = allocation_size::<T>(len)?;
+        let num_bytes = crate::memory::allocation_size::<T>(len)?;
         let ptr = if num_bytes == 0 {
             NonNull::dangling()
         } else {
@@ -189,10 +189,4 @@ impl<T: DeviceCopy> DerefMut for PinnedHostBuffer<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
     }
-}
-
-fn allocation_size<T>(len: usize) -> Result<usize, DriverError> {
-    len.checked_mul(std::mem::size_of::<T>()).ok_or(DriverError(
-        cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
-    ))
 }

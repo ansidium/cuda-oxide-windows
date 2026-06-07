@@ -1,13 +1,26 @@
 <p align="center">
-  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/clippy.yml"><img alt="clippy" src="https://github.com/NVlabs/cuda-oxide/actions/workflows/clippy.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/unit-tests.yml"><img alt="unit-tests" src="https://github.com/NVlabs/cuda-oxide/actions/workflows/unit-tests.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/cargo-deny.yml"><img alt="cargo-deny" src="https://github.com/NVlabs/cuda-oxide/actions/workflows/cargo-deny.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://github.com/NVlabs/cuda-oxide/actions/workflows/codeql.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/ansidium/cuda-oxide-windows/actions/workflows/clippy.yml"><img alt="clippy" src="https://github.com/ansidium/cuda-oxide-windows/actions/workflows/clippy.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/ansidium/cuda-oxide-windows/actions/workflows/unit-tests.yml"><img alt="unit-tests" src="https://github.com/ansidium/cuda-oxide-windows/actions/workflows/unit-tests.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/ansidium/cuda-oxide-windows/actions/workflows/cargo-deny.yml"><img alt="cargo-deny" src="https://github.com/ansidium/cuda-oxide-windows/actions/workflows/cargo-deny.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/ansidium/cuda-oxide-windows/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://github.com/ansidium/cuda-oxide-windows/actions/workflows/codeql.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/ansidium/cuda-oxide-windows/actions/workflows/windows.yml"><img alt="windows" src="https://github.com/ansidium/cuda-oxide-windows/actions/workflows/windows.yml/badge.svg?branch=main"></a>
   <br>
-  <img src="assets/logo.png" alt="cuda-oxide logo" width="100%">
+  <br>
+  <img src="assets/windows-fork-logo.png" alt="cuda-oxide Windows-support fork logo" width="100%">
 </p>
 
 # cuda-oxide
+
+> **Fork notice:** This repository is an unofficial Windows-support fork of
+> cuda-oxide. It tracks [NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-oxide),
+> is not an official NVIDIA Labs release, and keeps Linux upstream-compatible
+> while adding experimental Windows support. The project name, crate names, and
+> `cargo oxide` command remain `cuda-oxide`.
+
+| Platform | Support level | Notes |
+|----------|---------------|-------|
+| Linux | Upstream-compatible | Kept aligned with NVlabs/cuda-oxide behavior unless an intentional divergence is documented in [FORK.md](FORK.md). |
+| Windows 10/11 x86_64 | Experimental | Native Windows target is `x86_64-pc-windows-msvc`; see [cuda-oxide-book/getting-started/windows.md](cuda-oxide-book/getting-started/windows.md). |
 
 cuda-oxide is a custom rustc backend for compiling GPU kernels in pure Rust.
 The workspace combines:

@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      deploy_pages:
+        description: "Deploy the built book to GitHub Pages"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -38,6 +44,7 @@ jobs:
 
   deploy:
     needs: build
+    if: vars.DEPLOY_CUDA_OXIDE_BOOK == 'true' || (github.event_name == 'workflow_dispatch' && inputs.deploy_pages)
     runs-on: ubuntu-latest
     environment:
       name: github-pages

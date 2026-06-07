@@ -8,5 +8,6 @@ repository.workspace = true
 description = "Runtime (dlopen) bindings to NVIDIA nvJitLink (ships with the CUDA Toolkit)"
 
 [dependencies]
+cuda-toolkit-discovery = { workspace = true }
 libloading = { workspace = true }
 thiserror = { workspace = true }
