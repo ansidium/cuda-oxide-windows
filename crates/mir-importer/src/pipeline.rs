@@ -527,8 +527,11 @@ fn lower_to_llvm(ctx: &mut Context, module_op_ptr: Ptr<Operation>) -> Result<(),
     dialect_llvm::register(ctx);
     mir_lower::register(ctx);
 
-    mir_lower::lower_mir_to_llvm(ctx, module_op_ptr)
-        .map_err(|e| PipelineError::Lowering(e.to_string()))
+    match mir_lower::lower_mir_to_llvm(ctx, module_op_ptr) {
+        Ok(()) => Ok(()),
+        // Format with `ctx` so the failing op's location/span survives.
+        Err(e) => Err(PipelineError::Lowering(e.disp(ctx).to_string())),
+    }
 }
 
 /// Adds device extern function declarations to the `dialect-llvm` module.
