@@ -17,8 +17,6 @@ auto-fetch discovery.
 
 `x86_64-pc-windows-msvc`
 
-The GNU Windows target is not part of this release surface.
-
 ## Requirements
 
 - Windows 10/11 x86_64.

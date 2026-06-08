@@ -3,6 +3,7 @@
 This page documents the native Windows path for the cuda-oxide Windows-support
 fork. The fork still tracks NVlabs/cuda-oxide and keeps Linux behavior
 upstream-compatible. Windows support is experimental and targets MSVC only.
+The supported Rust target is `x86_64-pc-windows-msvc`.
 
 ## Support Matrix
 
