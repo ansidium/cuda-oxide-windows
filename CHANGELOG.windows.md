@@ -2,11 +2,19 @@
 
 ## Unreleased
 
+### Upstream Baseline and Versioning
+
+- Current upstream baseline:
+  `upstream/main@26d3951f6bf5d562f37eea63832722e5f9a2a0ba`.
+- Project version remains CUDA-Oxide 0.2.0.
+- Publish `windows-vX.Y.Z` only when upstream has released `vX.Y.Z`;
+  sync-only rebuilds do not invent new project versions.
+
 ### Supported Target
 
-- `x86_64-pc-windows-msvc` on Windows 10 22H2 and Windows 11 is experimental.
+- Windows support is scoped to `x86_64-pc-windows-msvc` on Windows 10 22H2
+  and Windows 11.
 - Linux remains upstream-compatible with NVlabs/cuda-oxide.
-- `x86_64-pc-windows-gnu` is unsupported initially.
 
 ### Requirements
 
@@ -26,7 +34,6 @@
 
 ### Unsupported Items
 
-- Windows GNU target.
 - CUDA examples that require Linux-only tooling such as `cuda-gdb`.
 - Full GPU smoke on GitHub-hosted `windows-latest` runners, because they do not
   provide NVIDIA GPU hardware.

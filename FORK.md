@@ -10,14 +10,17 @@ helpers needed for `x86_64-pc-windows-msvc`.
 ## Upstream Repository
 
 - Upstream: https://github.com/NVlabs/cuda-oxide
-- Upstream baseline: CUDA-Oxide 0.2.0
-- Primary local branch: `main`
+- Upstream branch: `NVlabs/cuda-oxide` `upstream/main`
+- Upstream release baseline: CUDA-Oxide 0.2.0
+- Primary local branch: `main` Windows release fork branch tracking
+  `upstream/main`
 - Windows branches: `custom/windows-*`
 
 ## Branch Rules
 
-- `main` tracks upstream-facing behavior and should stay suitable for Linux
-  users following NVlabs/cuda-oxide documentation.
+- `main` remains the Windows release fork branch. It tracks
+  `NVlabs/cuda-oxide` `upstream/main` and should stay suitable for Linux users
+  following NVlabs/cuda-oxide documentation.
 - `custom/windows-*` branches are used for Windows enablement work, experiments,
   CI fixes, and short-lived compatibility patches.
 - Keep Windows patches narrow and reviewable. Prefer build-system, path,
@@ -45,6 +48,9 @@ git checkout main
 git status --short
 ```
 
+Regular sync should use this fetch-plus-rebase flow on `main` so upstream
+history remains easy to inspect and Windows fork patches stay reviewable.
+
 The working tree must be clean before rebasing. If you have unfinished Windows
 work, move it to a `custom/windows-*` branch before syncing.
 
@@ -59,8 +65,8 @@ conflict policy and record the reason in the integration notes.
 
 Conflict policy:
 
-- Preserve upstream first. Prefer the upstream file when behavior is unrelated
-  to Windows support.
+- Preserve upstream behavior first. Prefer the upstream file when behavior is
+  unrelated to Windows support.
 - Re-apply Windows helpers after the upstream version is understood.
 - Keep compatibility patches narrow: paths, environment discovery, CI, docs,
   and smoke support before public API changes.
@@ -68,25 +74,26 @@ Conflict policy:
 - Update this file only when the resolved result intentionally diverges from
   upstream behavior.
 
-Linux checks after sync:
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace -- -D warnings
-cargo test -p oxide-artifacts --features object
-cargo test -p cargo-oxide
-```
-
-Windows MSVC checks after sync:
+No-GPU sync checks after rebase:
 
 ```powershell
 cargo fmt --all --check
-cargo build -p cargo-oxide
+cargo test -p cargo-oxide
+cargo test -p cuda-core --lib
+cargo test -p cuda-async
+cargo test -p cuda-host
 cargo test -p oxide-artifacts --features object
-.\scripts\smoketest.ps1 -BuildOnly
+cargo clippy --workspace -- -D warnings
+cargo doc --no-deps --workspace
 ```
 
-On a Windows GPU host, also run:
+Run the canonical no-GPU sequence with:
+
+```powershell
+.\scripts\sync-upstream.ps1 -RunChecks
+```
+
+On a Windows GPU host, also run the full Windows smoke path:
 
 ```powershell
 cargo oxide doctor
@@ -119,6 +126,27 @@ from upstream:
 
 ## Current Divergence Log
 
-No intentional code-level divergence is recorded in this document yet. The
-current fork-specific surface is documentation, CI, release notes, and smoke
-script support.
+## 2026-06-08 - Windows support layer
+
+- Branch: `main` Windows release fork branch tracking `upstream/main`.
+- Upstream baseline: `upstream/main@26d3951f6bf5d562f37eea63832722e5f9a2a0ba`,
+  CUDA-Oxide 0.2.0.
+- Files/area: CUDA Toolkit discovery, Windows/MSVC path handling, platform
+  artifact naming, loader environment handling, import-library checks,
+  bindgen/CUDA compatibility, Windows CI, and smoke scripts.
+- Intentional divergence: add native Windows support infrastructure for
+  `x86_64-pc-windows-msvc` while keeping upstream Linux behavior first. The
+  Windows layer covers CUDA Toolkit discovery, Windows and MSVC paths,
+  `.exe`/`.dll`/`.obj` platform naming, `PATH` loader behavior, `cuda.lib` and
+  `ffi.lib` checks, bindgen/CUDA type compatibility, Windows CI, and
+  PowerShell smoke scripts.
+- Linux impact: intended to be none. If a Windows helper conflicts with
+  upstream Linux behavior, preserve upstream behavior first and re-apply only
+  the Windows-specific compatibility needed for MSVC support.
+- Windows validation: `cargo build -p cargo-oxide`,
+  `cargo test -p oxide-artifacts --features object`,
+  `cargo oxide doctor`, `cargo oxide build vecadd`, GPU-host
+  `cargo oxide run vecadd`, and `.\scripts\smoketest.ps1` as applicable.
+- Follow-up: during each upstream sync, check whether upstream has added native
+  equivalents and remove fork-only helpers when upstream behavior covers the
+  Windows case.
