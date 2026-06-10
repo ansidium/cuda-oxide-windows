@@ -552,18 +552,10 @@ pub(crate) fn convert_construct_enum(
         (result_ty, operands, variant_index)
     };
 
-    let (discriminant_ty, variant_field_counts, all_field_types): (
-        Ptr<TypeObj>,
-        Vec<u32>,
-        Vec<Ptr<TypeObj>>,
-    ) = {
+    let variant_field_counts: Vec<u32> = {
         let ty_ref = result_ty.deref(ctx);
         match ty_ref.downcast_ref::<MirEnumType>() {
-            Some(e) => (
-                e.discriminant_ty,
-                e.variant_field_counts.clone(),
-                e.all_field_types.clone(),
-            ),
+            Some(e) => e.variant_field_counts.clone(),
             None => {
                 return pliron::input_err_noloc!(
                     "MirConstructEnumOp result type must be MirEnumType"
@@ -572,17 +564,25 @@ pub(crate) fn convert_construct_enum(
         }
     };
 
-    let llvm_discriminant_ty = convert_type(ctx, discriminant_ty).map_err(anyhow_to_pliron)?;
-    let mut llvm_payload_types = Vec::new();
-    for field_ty in &all_field_types {
-        llvm_payload_types.push(convert_type(ctx, *field_ty).map_err(anyhow_to_pliron)?);
-    }
+    // Build the value with the CONVERTED enum type (the same one the type
+    // converter produces for block args, loads, allocas, ...), so constructed
+    // values and the converted type cannot diverge. The converter returns
+    // `{tag, fields..., [pad]?}`; any trailing pad field is simply never
+    // written. Field 0 is always the discriminant.
+    let llvm_struct_ty = convert_type(ctx, result_ty).map_err(anyhow_to_pliron)?;
+    let llvm_discriminant_ty = {
+        let ty_ref = llvm_struct_ty.deref(ctx);
+        let struct_ty = ty_ref
+            .downcast_ref::<llvm_export::types::StructType>()
+            .ok_or_else(|| {
+                pliron::input_error_noloc!("converted MirEnumType must be an LLVM struct")
+            })?;
+        struct_ty.fields().next().ok_or_else(|| {
+            pliron::input_error_noloc!("converted MirEnumType struct must have a tag field")
+        })?
+    };
 
-    let mut llvm_field_types = vec![llvm_discriminant_ty];
-    llvm_field_types.extend(llvm_payload_types);
-    let llvm_struct_ty = llvm_export::types::StructType::get_unnamed(ctx, llvm_field_types);
-
-    let undef_op = llvm::UndefOp::new(ctx, llvm_struct_ty.into());
+    let undef_op = llvm::UndefOp::new(ctx, llvm_struct_ty);
     rewriter.insert_operation(ctx, undef_op.get_operation());
     let mut current_struct = undef_op.get_operation().deref(ctx).get_result(0);
 

@@ -86,7 +86,7 @@
 //!
 //! This matches the C ABI for GPU kernels.
 
-use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType};
+use dialect_mir::types::{MirDisjointSliceType, MirEnumType, MirSliceType, MirStructType};
 use llvm_export::types as llvm_types;
 use llvm_export::types::PointerTypeExt;
 use pliron::builtin::type_interfaces::FunctionTypeInterface;
@@ -447,6 +447,165 @@ pub(crate) fn build_struct_with_explicit_padding(
 fn make_padding_type(ctx: &mut Context, size: u64) -> Ptr<TypeObj> {
     let i8_ty = IntegerType::get(ctx, 8, Signedness::Signless);
     llvm_types::ArrayType::get(ctx, i8_ty.into(), size).into()
+}
+
+/// LLVM natural-layout `(size, align)` of an exported LLVM type, in bytes.
+///
+/// Mirrors LLVM's default data layout for nvptx64 (scalars align to their
+/// size, arrays to their element, non-packed structs to their widest field).
+/// Unlike [`get_type_size`], which sums struct fields without alignment,
+/// this computes the real allocation size, which is what GEP striding and
+/// the enum size check below need.
+pub(crate) fn llvm_type_size_align(ctx: &Context, ty: Ptr<TypeObj>) -> (u64, u64) {
+    let ty_ref = ty.deref(ctx);
+
+    if let Some(int_ty) = ty_ref.downcast_ref::<IntegerType>() {
+        let size = (int_ty.width() as u64).div_ceil(8);
+        // i8 → 1, i16 → 2, i32 → 4, i64 → 8, i128 → 16.
+        return (size, size.next_power_of_two().min(16));
+    }
+    if ty_ref.is::<llvm_types::HalfType>() {
+        return (2, 2);
+    }
+    if ty_ref.is::<FP32Type>() {
+        return (4, 4);
+    }
+    if ty_ref.is::<FP64Type>() {
+        return (8, 8);
+    }
+    if ty_ref.is::<llvm_types::PointerType>() {
+        return (8, 8);
+    }
+    if let Some(arr_ty) = ty_ref.downcast_ref::<llvm_types::ArrayType>() {
+        let (elem_size, elem_align) = llvm_type_size_align(ctx, arr_ty.elem_type());
+        return (elem_size * arr_ty.size(), elem_align.max(1));
+    }
+    if let Some(struct_ty) = ty_ref.downcast_ref::<llvm_types::StructType>() {
+        let fields: Vec<_> = struct_ty.fields().collect();
+        let (_end, size, align) = natural_struct_layout(ctx, &fields);
+        return (size, align);
+    }
+
+    // Vector types and anything unrecognised: conservative 8-byte fallback,
+    // matching get_type_size.
+    (8, 8)
+}
+
+/// Natural (non-packed) LLVM struct layout over `fields`.
+///
+/// Returns `(end, size, align)` where `end` is the unrounded offset just past
+/// the last field, `size` is `end` rounded up to the struct alignment (the
+/// allocation size LLVM uses for GEP striding), and `align` is the widest
+/// field alignment.
+pub(crate) fn natural_struct_layout(ctx: &Context, fields: &[Ptr<TypeObj>]) -> (u64, u64, u64) {
+    let mut end = 0u64;
+    let mut align = 1u64;
+    for field in fields {
+        let (field_size, field_align) = llvm_type_size_align(ctx, *field);
+        let field_align = field_align.max(1);
+        end = end.div_ceil(field_align) * field_align;
+        end += field_size;
+        align = align.max(field_align);
+    }
+    let size = end.div_ceil(align) * align;
+    (end, size, align)
+}
+
+/// Convert a `MirEnumType` to its LLVM struct representation.
+///
+/// The base model is the concatenated struct `{tag, variant fields...}`
+/// (field 0 is the discriminant; every variant's payload fields follow in
+/// declaration order). When rustc's total size is known (`total_size > 0`,
+/// i.e. Direct-tag enums) the structural size is compared against it:
+///
+/// - equal: the concatenated struct already matches; return it unchanged.
+/// - structural < total (trailing shortfall: `repr(align(N))` raises, unit
+///   variants alongside sized payloads elsewhere): append a trailing
+///   `[N x i8]` pad so the LLVM allocation size equals rustc's. Appending at
+///   the END keeps every existing insertvalue/extractvalue index valid; the
+///   pad is simply never written.
+/// - structural > total (multi-payload enums whose variants overlap in Rust
+///   but concatenate in this model, e.g. `#[repr(u32)] enum E { A(u32),
+///   B(u32) }` is 8 bytes in Rust vs 12 structural): padding is impossible,
+///   so the concatenated struct is returned as-is. It stays self-consistent
+///   for in-kernel SSA construct + match, but payload field OFFSETS remain
+///   the concatenated model, NOT Rust's overlapped layout. Memory traversal
+///   of such enums is rejected loudly instead of mis-striding; see
+///   [`enum_memory_divergence`].
+pub(crate) fn convert_enum_to_llvm(
+    ctx: &mut Context,
+    ty: Ptr<TypeObj>,
+) -> Result<Ptr<TypeObj>, anyhow::Error> {
+    let (discriminant_ty, all_field_types, total_size) = {
+        let ty_ref = ty.deref(ctx);
+        let enum_ty = ty_ref
+            .downcast_ref::<MirEnumType>()
+            .ok_or_else(|| anyhow::anyhow!("convert_enum_to_llvm: expected MirEnumType"))?;
+        (
+            enum_ty.discriminant_ty,
+            enum_ty.all_field_types.clone(),
+            enum_ty.total_size(),
+        )
+    };
+
+    let llvm_discr_ty = convert_type(ctx, discriminant_ty)?;
+    let mut llvm_fields = vec![llvm_discr_ty];
+    for field_ty in all_field_types {
+        llvm_fields.push(convert_type(ctx, field_ty)?);
+    }
+
+    if total_size > 0 {
+        let (end, size, _align) = natural_struct_layout(ctx, &llvm_fields);
+        if size < total_size {
+            let padding_ty = make_padding_type(ctx, total_size - end);
+            llvm_fields.push(padding_ty);
+        }
+    }
+
+    Ok(llvm_types::StructType::get_unnamed(ctx, llvm_fields).into())
+}
+
+/// Detect Direct-tag enums whose concatenated `{tag, fields...}` model cannot
+/// match rustc's memory layout: the structural size exceeds rustc's total
+/// size because several variants carry payloads that overlap in Rust but are
+/// concatenated in our model. Such an enum cannot be padded into shape, and
+/// traversing memory with it (GEP stride, load/store width) would silently
+/// read or write the wrong bytes, so callers reject it loudly instead.
+///
+/// Returns `Some(enum_name)` for a divergent enum, `None` when `ty` is not a
+/// `MirEnumType` or its layout is memory-faithful (possibly after padding).
+pub(crate) fn enum_memory_divergence(
+    ctx: &mut Context,
+    ty: Ptr<TypeObj>,
+) -> Result<Option<String>, anyhow::Error> {
+    let info = {
+        let ty_ref = ty.deref(ctx);
+        ty_ref.downcast_ref::<MirEnumType>().map(|enum_ty| {
+            (
+                enum_ty.name().to_string(),
+                enum_ty.discriminant_ty,
+                enum_ty.all_field_types.clone(),
+                enum_ty.total_size(),
+            )
+        })
+    };
+    let Some((name, discriminant_ty, all_field_types, total_size)) = info else {
+        return Ok(None);
+    };
+    if total_size == 0 {
+        // Size unknown (niched / single-variant model): the un-niched model
+        // is deliberately self-consistent; nothing to check against.
+        return Ok(None);
+    }
+
+    let llvm_discr_ty = convert_type(ctx, discriminant_ty)?;
+    let mut llvm_fields = vec![llvm_discr_ty];
+    for field_ty in all_field_types {
+        llvm_fields.push(convert_type(ctx, field_ty)?);
+    }
+    let (_end, size, _align) = natural_struct_layout(ctx, &llvm_fields);
+
+    Ok((size > total_size).then_some(name))
 }
 
 /// Get the size of an LLVM type in bytes (approximate).

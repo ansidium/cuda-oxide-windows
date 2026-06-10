@@ -575,7 +575,7 @@ impl EnumVariant {
 /// * Discriminant type must be an integer type.
 #[pliron_type(
     name = "mir.enum",
-    format = "`<` $name `,` $discriminant_ty `,` `[` vec($variant_names, CharSpace(`,`)) `]` `,` `[` vec($variant_field_counts, CharSpace(`,`)) `]` `,` `[` vec($all_field_types, CharSpace(`,`)) `]` `>`"
+    format = "`<` $name `,` $discriminant_ty `,` `[` vec($variant_names, CharSpace(`,`)) `]` `,` `[` vec($variant_field_counts, CharSpace(`,`)) `]` `,` `[` vec($all_field_types, CharSpace(`,`)) `]` `,` $total_size `,` $abi_align `>`"
 )]
 #[derive(Hash, PartialEq, Eq, Debug, Clone)]
 pub struct MirEnumType {
@@ -589,15 +589,42 @@ pub struct MirEnumType {
     pub variant_field_counts: Vec<u32>,
     /// All field types concatenated (use variant_field_counts to split)
     pub all_field_types: Vec<Ptr<TypeObj>>,
+    /// Total enum size in bytes from rustc layout (including padding).
+    /// 0 means unknown / not memory-faithful; mir-lower then keeps the
+    /// plain concatenated `{tag, fields...}` struct as-is.
+    ///
+    /// Populated only for `TagEncoding::Direct` enums: niched and
+    /// single-variant shapes use an un-niched model whose size has
+    /// nothing to do with rustc's layout, so they stay 0.
+    pub total_size: u64,
+    /// ABI alignment in bytes, from rustc layout. 0 means unknown.
+    pub abi_align: u64,
 }
 
 impl MirEnumType {
-    /// Create a new enum type from EnumVariant definitions.
+    /// Create a new enum type from EnumVariant definitions, without
+    /// rustc layout information (size/align unknown).
     pub fn get(
         ctx: &mut Context,
         name: String,
         discriminant_ty: Ptr<TypeObj>,
         variants: Vec<EnumVariant>,
+    ) -> TypePtr<Self> {
+        Self::get_with_layout(ctx, name, discriminant_ty, variants, 0, 0)
+    }
+
+    /// Create a new enum type with rustc layout information.
+    ///
+    /// # Arguments
+    /// * `total_size` - Total enum size in bytes from rustc layout (0 = unknown)
+    /// * `abi_align` - ABI alignment in bytes (0 = unknown)
+    pub fn get_with_layout(
+        ctx: &mut Context,
+        name: String,
+        discriminant_ty: Ptr<TypeObj>,
+        variants: Vec<EnumVariant>,
+        total_size: u64,
+        abi_align: u64,
     ) -> TypePtr<Self> {
         // Flatten variants into parallel vectors
         let mut variant_names = Vec::with_capacity(variants.len());
@@ -617,6 +644,8 @@ impl MirEnumType {
                 variant_names,
                 variant_field_counts,
                 all_field_types,
+                total_size,
+                abi_align,
             },
             ctx,
         )
@@ -630,6 +659,18 @@ impl MirEnumType {
     /// Get the discriminant type.
     pub fn discriminant_type(&self) -> Ptr<TypeObj> {
         self.discriminant_ty
+    }
+
+    /// Get total enum size in bytes from rustc layout.
+    /// Returns 0 if size is not known.
+    pub fn total_size(&self) -> u64 {
+        self.total_size
+    }
+
+    /// Get the ABI alignment in bytes from rustc layout.
+    /// Returns 0 if alignment is not known.
+    pub fn abi_align(&self) -> u64 {
+        self.abi_align
     }
 
     /// Get the number of variants.

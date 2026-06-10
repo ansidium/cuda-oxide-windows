@@ -74,6 +74,36 @@ fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
     )
 }
 
+/// Reject memory traversal of a layout-divergent enum, loudly.
+///
+/// `ty` is a pre-conversion (MIR) type that is about to size a memory
+/// access: a GEP element type, a load result, or a stored value. If it is a
+/// Direct-tag `MirEnumType` whose concatenated `{tag, fields...}` model is
+/// LARGER than rustc's real enum size (multi-payload enums whose variants
+/// overlap in Rust but concatenate in our model), every byte offset computed
+/// from it would be wrong, so fail with a clear diagnostic instead of
+/// emitting a silent mis-stride. In-kernel SSA construct + match of the same
+/// enum is unaffected (those never traverse memory).
+fn reject_divergent_enum_memory_access(
+    ctx: &mut Context,
+    ty: Ptr<TypeObj>,
+    access: &str,
+) -> Result<()> {
+    if let Some(enum_name) =
+        crate::convert::types::enum_memory_divergence(ctx, ty).map_err(anyhow_to_pliron)?
+    {
+        return pliron::input_err_noloc!(
+            "{} of enum `{}` is not supported: its multi-payload memory layout is not yet \
+             field-faithful (variants overlap in Rust but are concatenated in the lowering \
+             model), so the access would read/write the wrong bytes. In-kernel construct and \
+             match of this enum still work; only memory traversal is rejected.",
+            access,
+            enum_name
+        );
+    }
+    Ok(())
+}
+
 /// Convert `mir.store` to `llvm.store`.
 ///
 /// Operand order: `[ptr, value]` - stores `value` to address `ptr`.
@@ -82,7 +112,7 @@ pub(crate) fn convert_store(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
-    _operands_info: &OperandsInfo,
+    operands_info: &OperandsInfo,
 ) -> Result<()> {
     let operands: Vec<_> = op.deref(ctx).operands().collect();
 
@@ -92,6 +122,25 @@ pub(crate) fn convert_store(
             return pliron::input_err_noloc!("Store operation requires exactly 2 operands");
         }
     };
+
+    // The store width comes from the value type. The operand may already be
+    // type-converted when this runs, so recover the pre-conversion MIR type:
+    // current type first, then the operand's conversion history.
+    let stored_mir_ty = {
+        let current_ty = val.get_type(ctx);
+        if current_ty.deref(ctx).is::<dialect_mir::types::MirEnumType>() {
+            Some(current_ty)
+        } else {
+            operands_info
+                .lookup_operand_history(val)
+                .into_iter()
+                .rev()
+                .find(|ty| ty.deref(ctx).is::<dialect_mir::types::MirEnumType>())
+        }
+    };
+    if let Some(mir_ty) = stored_mir_ty {
+        reject_divergent_enum_memory_access(ctx, mir_ty, "Store")?;
+    }
 
     let llvm_store = llvm::StoreOp::new(ctx, val, ptr);
     copy_alignment(ctx, op, llvm_store.get_operation());
@@ -123,6 +172,9 @@ pub(crate) fn convert_load(
 ) -> Result<()> {
     let ptr = op.deref(ctx).get_operand(0);
     let result_ty = op.deref(ctx).get_result(0).get_type(ctx);
+    // The load width comes from the result type; a layout-divergent enum
+    // would read more bytes than the Rust object occupies.
+    reject_divergent_enum_memory_access(ctx, result_ty, "Load")?;
     let llvm_ty = convert_type(ctx, result_ty).map_err(anyhow_to_pliron)?;
 
     let llvm_load = llvm::LoadOp::new(ctx, ptr, llvm_ty);
@@ -240,6 +292,9 @@ pub(crate) fn convert_ptr_offset(
         .map(|mir_ptr| mir_ptr.pointee);
 
     let elem_ty = if let Some(pointee) = pointee_ty_opt {
+        // GEP strides by the pointee's allocation size; a layout-divergent
+        // enum pointee would stride wrong for every element after the first.
+        reject_divergent_enum_memory_access(ctx, pointee, "Pointer arithmetic over")?;
         convert_type(ctx, pointee).map_err(anyhow_to_pliron)?
     } else {
         IntegerType::get(ctx, 8, Signedness::Signless).into()

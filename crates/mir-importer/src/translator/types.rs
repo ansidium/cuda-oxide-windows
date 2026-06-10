@@ -549,86 +549,101 @@ pub fn translate_type(
                         32
                     };
 
-                    let discriminant_ty: Ptr<TypeObj> = match &layout_shape.variants {
-                        rustc_public::abi::VariantsShape::Multiple {
-                            tag,
-                            tag_encoding: rustc_public::abi::TagEncoding::Direct,
-                            ..
-                        } => {
-                            let primitive = match tag {
-                                rustc_public::abi::Scalar::Initialized { value, .. }
-                                | rustc_public::abi::Scalar::Union { value } => *value,
-                            };
-                            let rustc_public::abi::Primitive::Int { length, signed } = primitive
-                            else {
-                                return input_err_noloc!(TranslationErr::unsupported(format!(
-                                    "Direct enum tag for {} is not an integer: {:?}",
-                                    enum_name, primitive
-                                )));
-                            };
-                            pliron::builtin::types::IntegerType::get(
-                                ctx,
-                                length.bits() as u32,
-                                if signed {
-                                    pliron::builtin::types::Signedness::Signed
-                                } else {
-                                    pliron::builtin::types::Signedness::Unsigned
-                                },
-                            )
-                            .into()
-                        }
-                        rustc_public::abi::VariantsShape::Multiple {
-                            tag_encoding: rustc_public::abi::TagEncoding::Niche { .. },
-                            ..
-                        } => {
-                            // Niched enums are deliberately modelled un-niched:
-                            // `MirEnumType` keeps an explicit variant-count tag
-                            // and mir-lower rebuilds the un-niched aggregate
-                            // from `NicheEncodingAttr`
-                            // (`emit_scalar_to_niched_enum`). Reading rustc's
-                            // niche tag (which is the payload scalar itself)
-                            // here would break that contract.
-                            pliron::builtin::types::IntegerType::get(
-                                ctx,
-                                variant_count_bits,
-                                pliron::builtin::types::Signedness::Unsigned,
-                            )
-                            .into()
-                        }
-                        rustc_public::abi::VariantsShape::Single { .. } => {
-                            // NOT an error: rustc reports `Single` for
-                            // multi-syntactic-variant enums where all but one
-                            // variant is uninhabited (e.g.
-                            // `Result<T, Infallible>` from `TryFrom`). There
-                            // is no tag in memory; keep the variant-count tag
-                            // so in-kernel construct + discriminant reads stay
-                            // self-consistent.
-                            pliron::builtin::types::IntegerType::get(
-                                ctx,
-                                variant_count_bits,
-                                pliron::builtin::types::Signedness::Unsigned,
-                            )
-                            .into()
-                        }
-                        rustc_public::abi::VariantsShape::Empty => {
-                            // Fully uninhabited enums (e.g. `Infallible`)
-                            // appear in statically-dead paths of core library
-                            // code (`Result<T, Infallible>` match arms,
-                            // iterator adapters). The TYPE must translate so
-                            // those dead arms lower; rustc gives it a
-                            // zero-sized layout with no tag. Keep the
-                            // variant-count tag for shape consistency.
-                            // Materializing a VALUE of an uninhabited enum
-                            // still fails loudly ("Cannot materialize a
-                            // constant for an uninhabited enum", rvalue.rs).
-                            pliron::builtin::types::IntegerType::get(
-                                ctx,
-                                variant_count_bits,
-                                pliron::builtin::types::Signedness::Unsigned,
-                            )
-                            .into()
-                        }
-                    };
+                    // (discriminant type, total size in bytes, ABI alignment).
+                    // Size/align are 0 ("unknown") except for Direct-tag
+                    // enums, where mir-lower uses them to pad (or loudly
+                    // reject) the concatenated struct model at memory
+                    // boundaries.
+                    let (discriminant_ty, total_size, abi_align): (Ptr<TypeObj>, u64, u64) =
+                        match &layout_shape.variants {
+                            rustc_public::abi::VariantsShape::Multiple {
+                                tag,
+                                tag_encoding: rustc_public::abi::TagEncoding::Direct,
+                                ..
+                            } => {
+                                let primitive = match tag {
+                                    rustc_public::abi::Scalar::Initialized { value, .. }
+                                    | rustc_public::abi::Scalar::Union { value } => *value,
+                                };
+                                let rustc_public::abi::Primitive::Int { length, signed } =
+                                    primitive
+                                else {
+                                    return input_err_noloc!(TranslationErr::unsupported(format!(
+                                        "Direct enum tag for {} is not an integer: {:?}",
+                                        enum_name, primitive
+                                    )));
+                                };
+                                let tag_ty = pliron::builtin::types::IntegerType::get(
+                                    ctx,
+                                    length.bits() as u32,
+                                    if signed {
+                                        pliron::builtin::types::Signedness::Signed
+                                    } else {
+                                        pliron::builtin::types::Signedness::Unsigned
+                                    },
+                                );
+                                (
+                                    tag_ty.into(),
+                                    layout_shape.size.bytes() as u64,
+                                    layout_shape.abi_align,
+                                )
+                            }
+                            rustc_public::abi::VariantsShape::Multiple {
+                                tag_encoding: rustc_public::abi::TagEncoding::Niche { .. },
+                                ..
+                            } => {
+                                // Niched enums are deliberately modelled
+                                // un-niched: `MirEnumType` keeps an explicit
+                                // variant-count tag and mir-lower rebuilds the
+                                // un-niched aggregate from `NicheEncodingAttr`
+                                // (`emit_scalar_to_niched_enum`). Reading
+                                // rustc's niche tag (which is the payload
+                                // scalar itself) here would break that
+                                // contract. Size/align stay 0: the un-niched
+                                // aggregate's size has nothing to do with
+                                // rustc's niched size.
+                                let tag_ty = pliron::builtin::types::IntegerType::get(
+                                    ctx,
+                                    variant_count_bits,
+                                    pliron::builtin::types::Signedness::Unsigned,
+                                );
+                                (tag_ty.into(), 0u64, 0u64)
+                            }
+                            rustc_public::abi::VariantsShape::Single { .. } => {
+                                // NOT an error: rustc reports `Single` for
+                                // multi-syntactic-variant enums where all but
+                                // one variant is uninhabited (e.g.
+                                // `Result<T, Infallible>` from `TryFrom`).
+                                // There is no tag in memory; keep the
+                                // variant-count tag so in-kernel construct +
+                                // discriminant reads stay self-consistent.
+                                let tag_ty = pliron::builtin::types::IntegerType::get(
+                                    ctx,
+                                    variant_count_bits,
+                                    pliron::builtin::types::Signedness::Unsigned,
+                                );
+                                (tag_ty.into(), 0u64, 0u64)
+                            }
+                            rustc_public::abi::VariantsShape::Empty => {
+                                // Fully uninhabited enums (e.g. `Infallible`)
+                                // appear in statically-dead paths of core
+                                // library code (`Result<T, Infallible>` match
+                                // arms, iterator adapters). The TYPE must
+                                // translate so those dead arms lower; rustc
+                                // gives it a zero-sized layout with no tag.
+                                // Keep the variant-count tag for shape
+                                // consistency. Materializing a VALUE of an
+                                // uninhabited enum still fails loudly
+                                // ("Cannot materialize a constant for an
+                                // uninhabited enum", rvalue.rs).
+                                let tag_ty = pliron::builtin::types::IntegerType::get(
+                                    ctx,
+                                    variant_count_bits,
+                                    pliron::builtin::types::Signedness::Unsigned,
+                                );
+                                (tag_ty.into(), 0u64, 0u64)
+                            }
+                        };
 
                     // Translate each variant
                     let mut enum_variants = Vec::with_capacity(variants.len());
@@ -645,7 +660,15 @@ pub fn translate_type(
                     }
 
                     // Create the enum type
-                    Ok(MirEnumType::get(ctx, enum_name, discriminant_ty, enum_variants).into())
+                    Ok(MirEnumType::get_with_layout(
+                        ctx,
+                        enum_name,
+                        discriminant_ty,
+                        enum_variants,
+                        total_size,
+                        abi_align,
+                    )
+                    .into())
                 }
             }
         }

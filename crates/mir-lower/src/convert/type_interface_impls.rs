@@ -23,7 +23,8 @@ use pliron::derive::type_interface_impl;
 use crate::type_conversion_interface::{ConvertMirTypeFn, MirConvertibleType, MirTypeConversion};
 
 use super::types::{
-    build_struct_with_explicit_padding, convert_type, is_zero_sized_type, make_slice_struct,
+    build_struct_with_explicit_padding, convert_enum_to_llvm, convert_type, is_zero_sized_type,
+    make_slice_struct,
 };
 
 // =============================================================================
@@ -152,19 +153,10 @@ impl MirConvertibleType for MirEnumType {}
 #[type_interface_impl]
 impl MirTypeConversion for MirEnumType {
     fn converter(&self) -> ConvertMirTypeFn {
-        |ty, ctx| {
-            let (discriminant_ty, all_field_types) = {
-                let r = ty.deref(ctx);
-                let e = r.downcast_ref::<MirEnumType>().unwrap();
-                (e.discriminant_ty, e.all_field_types.clone())
-            };
-            let llvm_discr_ty = convert_type(ctx, discriminant_ty)?;
-            let mut llvm_fields = vec![llvm_discr_ty];
-            for field_ty in all_field_types {
-                llvm_fields.push(convert_type(ctx, field_ty)?);
-            }
-            Ok(llvm_types::StructType::get_unnamed(ctx, llvm_fields).into())
-        }
+        // `{tag, variant fields...}`, plus a trailing `[N x i8]` pad when
+        // rustc's total size is known and larger than the structural size.
+        // See `convert_enum_to_llvm` for the full layout contract.
+        |ty, ctx| convert_enum_to_llvm(ctx, ty)
     }
 }
 
