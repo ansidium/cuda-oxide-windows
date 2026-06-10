@@ -1,0 +1,19 @@
+[package]
+name = "issue136_repro"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Mark as standalone crate (not part of parent workspace)
+[workspace]
+
+# Repro for issue #136: "Unsupported construct: BinaryOp Cmp not yet implemented"
+# A custom Ord impl whose body calls integer Ord::cmp produces MIR BinOp::Cmp,
+# which the mir-importer translator does not handle.
+# Build with:
+#   cargo oxide build issue136_repro --arch sm_90 -v
+
+[dependencies]
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
+cuda-core = { path = "../../../cuda-core" }

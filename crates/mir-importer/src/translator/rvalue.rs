@@ -1922,10 +1922,19 @@ pub fn translate_operand(
                 .is::<dialect_mir::types::MirPtrType>()
             {
                 // Pointer type constant - could be:
-                // 1. A raw pointer constant (like core::ptr::null()) - just bytes
-                // 2. A reference to a constant struct (like &(8..16)) - need struct + mir.ref
+                // 1. A raw pointer constant (like core::ptr::null()) - just bytes,
+                //    no provenance
+                // 2. A reference to a constant struct (like &(8..16)) - need
+                //    struct + mir.ref
+                // 3. A reference to any other promoted constant (like the `&77`
+                //    that -O const-folds out of `Option<&u32>::unwrap_or(&77)`,
+                //    issue #132) - follow the allocation provenance, materialize
+                //    the pointee constant, then mir.ref
                 //
-                // Distinguish by checking if the pointee is a struct and has non-null data
+                // Only constants WITHOUT provenance may take the raw-pointer
+                // path; a provenance entry always names a real allocation, and
+                // ignoring it would lower the reference to `inttoptr 0` (a null
+                // pointer).
 
                 // Extract pointer type info before further borrows
                 let (pointee_ty, is_mutable, pointee_is_struct) = {
@@ -2017,9 +2026,153 @@ pub fn translate_operand(
                     return Ok((ptr_val, Some(mir_ref.get_operation())));
                 }
 
-                // Raw pointer constant (like core::ptr::null())
-                // Create an integer constant with the pointer value (0 for null),
-                // then convert it to a pointer type using MirCastOp
+                // Reference to a non-struct promoted constant (issue #132).
+                //
+                // Under -O, MIR const-folds e.g. the `None` arm of
+                // `Option<&u32>::unwrap_or(&77)` into a constant of type `&u32`
+                // whose data bytes are a pointer placeholder and whose
+                // provenance entry names the allocation holding the literal
+                // `77`. Struct pointees were already handled above; follow the
+                // provenance for every other pointee type too, materialize the
+                // pointee through the shared constant-from-bytes path, and take
+                // its address with mir.ref (mem2reg/lowering turn that into an
+                // alloca + store + address; sound because promoted constants
+                // are immutable).
+                let backing_alloc: Option<&rustc_public::ty::Allocation> =
+                    match constant.const_.kind() {
+                        ConstantKind::Allocated(alloc) => Some(alloc),
+                        ConstantKind::Ty(ty_const) => match ty_const.kind() {
+                            rustc_public::ty::TyConstKind::Value(_, alloc) => Some(alloc),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+
+                if let Some(alloc) = backing_alloc
+                    && let Some(&(prov_pos, prov)) = alloc.provenance.ptrs.first()
+                {
+                    use rustc_public::mir::alloc::GlobalAlloc;
+                    let alloc_id = prov.0;
+
+                    // The pointer's own data bytes encode the byte offset into
+                    // the target allocation (zero for plain promoted literals
+                    // like `&77`). The struct/array provenance branches assume
+                    // offset zero; here the slice below honors a non-zero
+                    // offset, and an unreadable offset is a hard error rather
+                    // than a silently wrong address.
+                    let ptr_width =
+                        rustc_public::target::MachineInfo::target_pointer_width().bytes();
+                    let target_offset = alloc
+                        .read_partial_uint(prov_pos..prov_pos + ptr_width)
+                        .map_err(|e| {
+                            input_error_noloc!(TranslationErr::unsupported(format!(
+                                "Failed to read pointer constant provenance offset: {:?}",
+                                e
+                            )))
+                        })? as usize;
+
+                    let target_bytes: Vec<u8> = match GlobalAlloc::from(alloc_id) {
+                        GlobalAlloc::Memory(target_alloc) => {
+                            target_alloc.raw_bytes().ok().unwrap_or_else(|| {
+                                target_alloc
+                                    .bytes
+                                    .iter()
+                                    .map(|opt: &Option<u8>| opt.unwrap_or(0))
+                                    .collect::<Vec<u8>>()
+                            })
+                        }
+                        GlobalAlloc::Static(static_def) => {
+                            let target_alloc = static_def.eval_initializer().map_err(|e| {
+                                input_error_noloc!(TranslationErr::unsupported(format!(
+                                    "Failed to evaluate static initializer for pointer constant: {:?}",
+                                    e
+                                )))
+                            })?;
+                            target_alloc.raw_bytes().ok().unwrap_or_else(|| {
+                                target_alloc
+                                    .bytes
+                                    .iter()
+                                    .map(|opt: &Option<u8>| opt.unwrap_or(0))
+                                    .collect::<Vec<u8>>()
+                            })
+                        }
+                        other => {
+                            return input_err!(
+                                loc,
+                                TranslationErr::unsupported(format!(
+                                    "Pointer constant provenance points to non-memory allocation: {:?}",
+                                    other
+                                ))
+                            );
+                        }
+                    };
+
+                    if target_offset > target_bytes.len() {
+                        return input_err!(
+                            loc,
+                            TranslationErr::unsupported(format!(
+                                "Pointer constant provenance offset {} exceeds target allocation size {}",
+                                target_offset,
+                                target_bytes.len()
+                            ))
+                        );
+                    }
+
+                    // The shared materializer needs the pointee's Rust type for
+                    // enum-layout queries and ZST detection.
+                    let Some((pointee_rust_ty, _)) = get_static_pointer_info(&rust_ty) else {
+                        return input_err!(
+                            loc,
+                            TranslationErr::unsupported(format!(
+                                "Pointer constant with provenance has unsupported Rust type: {:?}",
+                                rust_ty
+                            ))
+                        );
+                    };
+
+                    let (pointee_val, last_op) = translate_constant_value_from_bytes(
+                        ctx,
+                        &pointee_rust_ty,
+                        pointee_ty,
+                        &target_bytes[target_offset..],
+                        block_ptr,
+                        prev_op,
+                        loc.clone(),
+                    )?;
+
+                    // Take the address of the materialized value, exactly like
+                    // the struct branch above.
+                    let ref_op = Operation::new(
+                        ctx,
+                        MirRefOp::get_concrete_op_info(),
+                        vec![const_ty_ptr], // Result is pointer to the pointee
+                        vec![pointee_val],  // Operand is the materialized value
+                        vec![],
+                        0,
+                    );
+                    ref_op.deref_mut(ctx).set_loc(loc);
+
+                    let mir_ref = MirRefOp::new(ref_op);
+                    mir_ref
+                        .set_attr_mutable(ctx, dialect_mir::attributes::MutabilityAttr(is_mutable));
+
+                    if let Some(prev) = last_op {
+                        mir_ref.get_operation().insert_after(ctx, prev);
+                    } else {
+                        mir_ref.get_operation().insert_at_front(block_ptr, ctx);
+                    }
+
+                    let ptr_val = mir_ref.get_operation().deref(ctx).get_result(0);
+                    return Ok((ptr_val, Some(mir_ref.get_operation())));
+                }
+
+                // Raw pointer constant (like core::ptr::null()).
+                //
+                // Only reachable for constants WITHOUT provenance (true null or
+                // int-to-ptr values); provenance-carrying constants returned
+                // above. Create an integer constant with the pointer value
+                // (0 for null), then convert it to a pointer type using
+                // MirCastOp
                 use dialect_mir::ops::MirCastOp;
 
                 // Parse the pointer value from the constant bytes (typically all zeros for null)
@@ -3361,7 +3514,21 @@ pub fn translate_place_iterative(
             }
         };
 
-    // Track the current Rust type for enum projections
+    // Track the Rust type of `current_value` alongside the pliron value.
+    // Each iteration below advances it through rustc_public's own projection
+    // typing (`ProjectionElem::ty`) AFTER the arm has processed the element,
+    // so every arm observes the type *before* its own projection applies and
+    // the next iteration sees the narrowed type. `Downcast` deliberately
+    // leaves the type unchanged (still the enum ADT), which is exactly what
+    // `apply_enum_field_projection` expects when the following `Field` fires.
+    //
+    // This single fold is the only place `current_rust_ty` is updated;
+    // individual arms must not update it themselves. Per-arm updates were
+    // the cause of issue #131: only `Field` advanced the type, so chains
+    // like `[Index, Downcast, Field]` (from `match xs[i]` over an array of
+    // enums) handed the stale Array type to the Downcast/Field handler,
+    // which bailed with "Downcast on non-ADT type: Array". The same
+    // staleness affected `Deref` and `ConstantIndex`.
     let mut current_rust_ty = body.locals()[local].ty;
 
     // Track pending downcast (Downcast is a no-op, but we need variant info for Field on enums)
@@ -3409,7 +3576,6 @@ pub fn translate_place_iterative(
                         loc.clone(),
                     )?;
                 }
-                current_rust_ty = *field_ty;
             }
 
             ProjectionElem::Downcast(variant_idx) => {
@@ -3720,6 +3886,21 @@ pub fn translate_place_iterative(
                 );
             }
         }
+
+        // Advance the running Rust type with rustc_public's own projection
+        // typing (single source of truth; see the comment on
+        // `current_rust_ty` above). For well-formed MIR this never fails;
+        // if it does, surface the projection element and the type it was
+        // applied to so the bail-out is actionable.
+        current_rust_ty = projection.ty(current_rust_ty).map_err(|e| {
+            input_error!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "Failed to type projection {:?} applied to {:?}: {:?}",
+                    projection, current_rust_ty, e
+                ))
+            )
+        })?;
     }
 
     Ok((current_value, current_prev_op))

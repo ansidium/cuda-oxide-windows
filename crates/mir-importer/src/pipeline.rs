@@ -110,6 +110,7 @@ impl llvm_export::export::AsDeviceExtern for DeviceExternDecl {
         }
     }
 }
+use crate::llvm_tools::LlvmToolchain;
 use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface, SymbolOpInterface};
 use pliron::context::{Context, Ptr};
 use pliron::identifier::Legaliser;
@@ -117,7 +118,7 @@ use pliron::linked_list::ContainsLinkedList;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::printable::Printable;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Device artifact format produced by a successful pipeline run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -826,72 +827,52 @@ fn arch_major(arch: &str) -> Option<u32> {
 /// pointers to `.global` (LDG/STG). Gated on alignment — fusion only fires
 /// when loads/stores carry matching `align N` hints.
 ///
-/// Set `CUDA_OXIDE_NO_OPT=1` to skip and feed the unoptimised IR straight to
-/// `llc`. Returns the optimised `.ll` path, or `None` if opt is disabled or
-/// unavailable (caller falls back to the original `ll_path`).
-fn optimize_ll(ll_path: &Path, verbose: bool) -> Option<std::path::PathBuf> {
-    if std::env::var("CUDA_OXIDE_NO_OPT").is_ok() {
-        return None;
-    }
-
-    let mut candidates: Vec<String> = Vec::new();
-    if let Ok(p) = std::env::var("CUDA_OXIDE_OPT") {
-        candidates.push(p);
-    }
-    if let Some(p) = std::process::Command::new("rustc")
-        .args(["--print", "sysroot", "--print", "host-tuple"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .split('\n')
-                .zip([["lib", "rustlib"], ["bin", "opt"]])
-                .flat_map(|(a, b)| [a].into_iter().chain(b))
-                .collect::<std::path::PathBuf>()
-                .to_str()
-                .map(str::to_string)
-        })
-    {
-        candidates.push(p);
-    }
-    for name in ["opt-22", "opt-21", "opt"] {
-        candidates.push(name.to_string());
-    }
+/// The `opt` binary comes from the resolved [`LlvmToolchain`], which
+/// guarantees it shares the LLVM major of the `llc` that will consume its
+/// output (issue #150: an LLVM 22 `opt` emits sizeless
+/// `llvm.lifetime.start/end` intrinsics that an LLVM 21 `llc` rejects).
+///
+/// Returns the optimised `.ll` path, or `None` when the middle-end is off
+/// (`CUDA_OXIDE_NO_OPT=1`), no same-major `opt` exists, or the chosen `opt`
+/// fails at runtime; the caller then feeds the unoptimised `ll_path` to
+/// `llc`, which is always safe.
+fn optimize_ll(ll_path: &Path, toolchain: &LlvmToolchain, verbose: bool) -> Option<PathBuf> {
+    let opt = toolchain.opt.as_ref()?;
 
     let opt_ll = ll_path.with_extension("opt.ll");
-    for opt_cmd in candidates {
-        match std::process::Command::new(&opt_cmd)
-            .arg("-O2")
-            .arg(ll_path)
-            .arg("-S")
-            .arg("-o")
-            .arg(&opt_ll)
-            .output()
-        {
-            Ok(o) if o.status.success() => {
-                if verbose {
-                    eprintln!("opt -O2 via {opt_cmd}: {}", opt_ll.display());
-                }
-                return Some(opt_ll);
+    match std::process::Command::new(&opt.path)
+        .arg("-O2")
+        .arg(ll_path)
+        .arg("-S")
+        .arg("-o")
+        .arg(&opt_ll)
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            if verbose {
+                eprintln!("opt -O2 via {}: {}", opt.path, opt_ll.display());
             }
-            Ok(o) => {
-                if verbose {
-                    eprintln!(
-                        "opt ({opt_cmd}) failed: {}",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    );
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                if verbose {
-                    eprintln!("opt ({opt_cmd}): {e}");
-                }
-            }
+            Some(opt_ll)
+        }
+        Ok(o) => {
+            // The matched opt exists but rejected the input. Warn loudly
+            // (there is no second candidate any more) and fall back to
+            // unoptimised IR rather than to a different LLVM major.
+            eprintln!(
+                "warning: opt ({}) failed; continuing with unoptimised IR:\n{}",
+                opt.path,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: opt ({}): {e}; continuing with unoptimised IR",
+                opt.path
+            );
+            None
         }
     }
-    None
 }
 
 /// Generates PTX from LLVM IR using `llc`.
@@ -903,6 +884,10 @@ fn optimize_ll(ll_path: &Path, verbose: bool) -> Option<std::path::PathBuf> {
 /// group parameter requires LLVM 21). If `CUDA_OXIDE_LLC` is set, it is used
 /// exclusively — power users can point this at an older `llc` at their own
 /// risk (most examples will still compile but modern intrinsics will not).
+///
+/// `opt` and `llc` are resolved together via [`LlvmToolchain`] so the
+/// middle-end never runs under a different LLVM major than the backend
+/// (issue #150).
 ///
 /// Target arch resolves (highest priority first) to: an explicit
 /// `CUDA_OXIDE_TARGET` override, else the detected-GPU hint
@@ -965,123 +950,70 @@ fn generate_ptx(ll_path: &Path, ptx_path: &Path) -> Result<String, PipelineError
 
     let verbose = std::env::var("CUDA_OXIDE_VERBOSE").is_ok();
 
-    // Run the middle-end (opt -O2) before llc. Feature detection above
-    // intentionally reads the original (pre-opt) IR so the target is
-    // determined by what the source actually needs, not what opt elides.
-    let optimized = optimize_ll(ll_path, verbose);
-    let llc_input: &Path = optimized.as_deref().unwrap_or(ll_path);
-
-    // Check for user-specified llc path override
-    if let Ok(llc_path) = std::env::var("CUDA_OXIDE_LLC") {
-        if verbose {
-            eprintln!("Using llc: {} (from CUDA_OXIDE_LLC)", llc_path);
-        }
-        let result = std::process::Command::new(&llc_path)
-            .arg("-march=nvptx64")
-            .arg(format!("-mcpu={}", target))
-            .arg(llc_input)
-            .arg("-o")
-            .arg(ptx_path)
-            .output();
-
-        return match result {
-            Ok(output) if output.status.success() => Ok(target.to_string()),
-            Ok(output) => Err(PipelineError::PtxGeneration(format!(
-                "CUDA_OXIDE_LLC={} failed:\n{}",
-                llc_path,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))),
-            Err(e) => Err(PipelineError::PtxGeneration(format!(
-                "CUDA_OXIDE_LLC={}: {}",
-                llc_path, e
-            ))),
-        };
-    }
-
-    let llc_path = std::process::Command::new("rustc")
-        .arg("--print")
-        .arg("sysroot")
-        .arg("--print")
-        .arg("host-tuple")
-        .output()
-        .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                String::from_utf8_lossy(&output.stdout)
-                    .split('\n')
-                    .zip([["lib", "rustlib"], ["bin", "llc"]])
-                    .flat_map(|(a, b)| [a].into_iter().chain(b))
-                    .collect::<std::path::PathBuf>()
-                    .to_str()
-                    .map(|i| i.to_string())
-            } else {
-                None
-            }
-        });
-
-    // Try different llc versions (newest first for best atomics/scope support).
-    //
-    // LLVM 21 is the floor: older releases reject modern TMA / tcgen05 /
-    // WGMMA intrinsic signatures that cuda-oxide emits. Users on older
-    // distros can opt in to a specific `llc` via `CUDA_OXIDE_LLC`.
-    //
-    // Target reference:
-    //   - sm_100a: Blackwell datacenter (tcgen05/TMEM)
-    //   - sm_90a:  Hopper only (WGMMA + TMA) - NOT forward-compatible
-    //   - sm_120:  Blackwell consumer (TMA with PTX 8.7)
-    //   - sm_80:   Ampere+ (maximum compatibility)
-    let llc_candidates = [("llc-22", target.as_str()), ("llc-21", target.as_str())];
-
-    let mut last_error = String::new();
-
-    for (llc_cmd, llc_target) in llc_path
-        .as_deref()
-        .map(|s| (s, target.as_str()))
-        .into_iter()
-        .chain(llc_candidates)
-    {
-        let result = std::process::Command::new(llc_cmd)
-            .arg("-march=nvptx64")
-            .arg(format!("-mcpu={}", llc_target))
-            .arg(llc_input)
-            .arg("-o")
-            .arg(ptx_path)
-            .output();
-
-        match result {
-            Ok(output) if output.status.success() => {
-                if verbose {
-                    eprintln!("Using llc: {} (auto-detected)", llc_cmd);
-                }
-                return Ok(llc_target.to_string());
-            }
-            Ok(output) => {
-                // llc ran but failed - capture the error
-                last_error = String::from_utf8_lossy(&output.stderr).to_string();
-            }
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::NotFound => continue,
-                _ => last_error = format!("{}: {}", llc_cmd, e),
-            },
-        }
-    }
-
-    match last_error.is_empty() {
-        true => Err(PipelineError::PtxGeneration(
+    // Resolve `opt` and `llc` as a matched pair (issue #150): llc first
+    // (CUDA_OXIDE_LLC, then the Rust toolchain's llvm-tools llc, then
+    // llc-22 / llc-21 on PATH — newest first for best atomics/scope
+    // support), then an opt of the same LLVM major. LLVM 21 is the floor:
+    // older releases reject modern TMA / tcgen05 / WGMMA intrinsic
+    // signatures that cuda-oxide emits. Users on older distros can opt in
+    // to a specific `llc` via `CUDA_OXIDE_LLC`.
+    let Some(toolchain) = LlvmToolchain::resolve(verbose) else {
+        return Err(PipelineError::PtxGeneration(
             "No working llc found.\n\
              cuda-oxide tries (in order): CUDA_OXIDE_LLC, the Rust toolchain's \
-             llvm-tools llc, then llc-22 / llc-21 / llc on PATH. \
+             llvm-tools llc, then llc-22 / llc-21 on PATH. \
              LLVM 21+ is required (earlier versions reject the TMA / tcgen05 / \
              WGMMA intrinsic signatures we emit).\n\
              Easiest fix: `rustup component add llvm-tools` (auto-picked up).\n\
              Alternative: `sudo apt install llvm-21` (or `llvm-22`).\n\
              Or set CUDA_OXIDE_LLC=/path/to/llc to use a specific binary."
                 .to_string(),
-        )),
-        false => Err(PipelineError::PtxGeneration(format!(
-            "llc failed:\n{}",
-            last_error.trim()
+        ));
+    };
+
+    // Run the middle-end (opt -O2) before llc. Feature detection above
+    // intentionally reads the original (pre-opt) IR so the target is
+    // determined by what the source actually needs, not what opt elides.
+    let optimized = optimize_ll(ll_path, &toolchain, verbose);
+    let llc_input: &Path = optimized.as_deref().unwrap_or(ll_path);
+
+    // Target reference:
+    //   - sm_100a: Blackwell datacenter (tcgen05/TMEM)
+    //   - sm_90a:  Hopper only (WGMMA + TMA) - NOT forward-compatible
+    //   - sm_120:  Blackwell consumer (TMA with PTX 8.7)
+    //   - sm_80:   Ampere+ (maximum compatibility)
+    if verbose {
+        let source = if toolchain.llc_from_env {
+            "from CUDA_OXIDE_LLC"
+        } else {
+            "auto-detected"
+        };
+        eprintln!("Using llc: {} ({source})", toolchain.llc_description());
+    }
+    // How to name the llc in errors: keep the env var visible when it was
+    // the source so users connect the failure to their own pin.
+    let llc_desc = if toolchain.llc_from_env {
+        format!("CUDA_OXIDE_LLC={}", toolchain.llc_path)
+    } else {
+        format!("llc ({})", toolchain.llc_path)
+    };
+
+    let result = std::process::Command::new(&toolchain.llc_path)
+        .arg("-march=nvptx64")
+        .arg(format!("-mcpu={}", target))
+        .arg(llc_input)
+        .arg("-o")
+        .arg(ptx_path)
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => Ok(target.to_string()),
+        Ok(output) => Err(PipelineError::PtxGeneration(format!(
+            "{} failed:\n{}",
+            llc_desc,
+            String::from_utf8_lossy(&output.stderr).trim()
         ))),
+        Err(e) => Err(PipelineError::PtxGeneration(format!("{llc_desc}: {e}"))),
     }
 }
 

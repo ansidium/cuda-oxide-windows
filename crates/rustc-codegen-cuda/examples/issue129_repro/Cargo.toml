@@ -1,0 +1,19 @@
+[package]
+name = "issue129_repro"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Mark as standalone crate (not part of parent workspace)
+[workspace]
+
+# Repro for issue #129: auto-detected libdevice path emits NVVM-mode IR
+# (FULL datalayout, kernel marked via !nvvm.annotations instead of the
+# ptx_kernel calling convention). Compile-only:
+#   cargo oxide build issue129_repro --arch sm_90 -v
+# then inspect issue129_repro.ll.
+
+[dependencies]
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
+cuda-core = { path = "../../../cuda-core" }

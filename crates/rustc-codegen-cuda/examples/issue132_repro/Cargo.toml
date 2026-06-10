@@ -1,0 +1,22 @@
+[package]
+name = "issue132_repro"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Mark as standalone crate (not part of parent workspace)
+[workspace]
+
+# Repro for issue #132: `Option<&u32>::unwrap_or(&77)` const-folds (under -O)
+# into a reference-to-scalar constant. The importer only follows allocation
+# provenance for struct pointees, so the scalar case falls through to the
+# raw-pointer path and lowers to a null pointer; the subsequent dereference
+# is `load i32, ptr null` -> CUDA 700 at runtime.
+# Build compile-only:
+#   cargo oxide build issue132_repro --arch sm_90 -v
+# Then inspect issue132_repro.ll for `inttoptr i64 0` / `load i32, ptr null`.
+
+[dependencies]
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
+cuda-core = { path = "../../../cuda-core" }

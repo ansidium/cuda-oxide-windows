@@ -1,0 +1,20 @@
+[package]
+name = "issue129_repro2"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Mark as standalone crate (not part of parent workspace)
+[workspace]
+
+# Independent repro #2 for issue #129: a kernel calling libdevice float
+# math (sqrt / floor / mul_add -> __nv_sqrtf / __nv_floorf / __nv_fmaf)
+# triggers the auto-detected NVVM-IR path. Compile-only:
+#   cargo oxide build issue129_repro2 --arch sm_90 -v
+# then inspect issue129_repro2.ll for the datalayout string and whether
+# the kernel entry carries the ptx_kernel calling convention.
+
+[dependencies]
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
+cuda-core = { path = "../../../cuda-core" }

@@ -74,6 +74,36 @@ fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
     )
 }
 
+/// Reject memory traversal of a layout-divergent enum, loudly.
+///
+/// `ty` is a pre-conversion (MIR) type that is about to size a memory
+/// access: a GEP element type, a load result, or a stored value. If it is a
+/// Direct-tag `MirEnumType` whose concatenated `{tag, fields...}` model is
+/// LARGER than rustc's real enum size (multi-payload enums whose variants
+/// overlap in Rust but concatenate in our model), every byte offset computed
+/// from it would be wrong, so fail with a clear diagnostic instead of
+/// emitting a silent mis-stride. In-kernel SSA construct + match of the same
+/// enum is unaffected (those never traverse memory).
+fn reject_divergent_enum_memory_access(
+    ctx: &mut Context,
+    ty: Ptr<TypeObj>,
+    access: &str,
+) -> Result<()> {
+    if let Some(enum_name) =
+        crate::convert::types::enum_memory_divergence(ctx, ty).map_err(anyhow_to_pliron)?
+    {
+        return pliron::input_err_noloc!(
+            "{} of enum `{}` is not supported: its multi-payload memory layout is not yet \
+             field-faithful (variants overlap in Rust but are concatenated in the lowering \
+             model), so the access would read/write the wrong bytes. In-kernel construct and \
+             match of this enum still work; only memory traversal is rejected.",
+            access,
+            enum_name
+        );
+    }
+    Ok(())
+}
+
 /// Convert `mir.store` to `llvm.store`.
 ///
 /// Operand order: `[ptr, value]` - stores `value` to address `ptr`.
@@ -82,7 +112,7 @@ pub(crate) fn convert_store(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
-    _operands_info: &OperandsInfo,
+    operands_info: &OperandsInfo,
 ) -> Result<()> {
     let operands: Vec<_> = op.deref(ctx).operands().collect();
 
@@ -92,6 +122,28 @@ pub(crate) fn convert_store(
             return pliron::input_err_noloc!("Store operation requires exactly 2 operands");
         }
     };
+
+    // The store width comes from the value type. The operand may already be
+    // type-converted when this runs, so recover the pre-conversion MIR type:
+    // current type first, then the operand's conversion history.
+    let stored_mir_ty = {
+        let current_ty = val.get_type(ctx);
+        if current_ty
+            .deref(ctx)
+            .is::<dialect_mir::types::MirEnumType>()
+        {
+            Some(current_ty)
+        } else {
+            operands_info
+                .lookup_operand_history(val)
+                .into_iter()
+                .rev()
+                .find(|ty| ty.deref(ctx).is::<dialect_mir::types::MirEnumType>())
+        }
+    };
+    if let Some(mir_ty) = stored_mir_ty {
+        reject_divergent_enum_memory_access(ctx, mir_ty, "Store")?;
+    }
 
     let llvm_store = llvm::StoreOp::new(ctx, val, ptr);
     copy_alignment(ctx, op, llvm_store.get_operation());
@@ -123,6 +175,9 @@ pub(crate) fn convert_load(
 ) -> Result<()> {
     let ptr = op.deref(ctx).get_operand(0);
     let result_ty = op.deref(ctx).get_result(0).get_type(ctx);
+    // The load width comes from the result type; a layout-divergent enum
+    // would read more bytes than the Rust object occupies.
+    reject_divergent_enum_memory_access(ctx, result_ty, "Load")?;
     let llvm_ty = convert_type(ctx, result_ty).map_err(anyhow_to_pliron)?;
 
     let llvm_load = llvm::LoadOp::new(ctx, ptr, llvm_ty);
@@ -240,6 +295,9 @@ pub(crate) fn convert_ptr_offset(
         .map(|mir_ptr| mir_ptr.pointee);
 
     let elem_ty = if let Some(pointee) = pointee_ty_opt {
+        // GEP strides by the pointee's allocation size; a layout-divergent
+        // enum pointee would stride wrong for every element after the first.
+        reject_divergent_enum_memory_access(ctx, pointee, "Pointer arithmetic over")?;
         convert_type(ctx, pointee).map_err(anyhow_to_pliron)?
     } else {
         IntegerType::get(ctx, 8, Signedness::Signless).into()
@@ -910,6 +968,189 @@ mod tests {
             .downcast_ref::<IntegerType>()
             .expect("gep src_elem_type should be IntegerType");
         assert_eq!(int_ty.width(), 32, "gep elem type must be i32 (pointee)");
+    }
+
+    // =========================================================================
+    // Enum layout: converted width per shape + divergent-enum rejection
+    // =========================================================================
+
+    use dialect_mir::types::{EnumVariant, MirEnumType};
+
+    /// Build a Direct-tag `MirEnumType` the way the importer does:
+    /// unsigned tag of `tag_bits`, plus rustc's `total_size`/`abi_align`.
+    fn make_enum_ty(
+        ctx: &mut Context,
+        name: &str,
+        tag_bits: u32,
+        variants: Vec<EnumVariant>,
+        total_size: u64,
+        abi_align: u64,
+    ) -> Ptr<TypeObj> {
+        let tag_ty: Ptr<TypeObj> = IntegerType::get(ctx, tag_bits, Signedness::Unsigned).into();
+        // Sequential 0..n discriminants: these layout tests only exercise
+        // size/width, not value mapping.
+        let discriminants: Vec<u64> = (0..variants.len() as u64).collect();
+        MirEnumType::get_with_layout(
+            ctx,
+            name.to_string(),
+            tag_ty,
+            discriminants,
+            variants,
+            total_size,
+            abi_align,
+        )
+        .into()
+    }
+
+    fn unit_variants(n: usize) -> Vec<EnumVariant> {
+        (0..n).map(|i| EnumVariant::unit(format!("V{i}"))).collect()
+    }
+
+    /// Converted enum allocation size must equal rustc's `total_size` for
+    /// every memory-faithful tag shape: that size is what GEP strides by.
+    #[test]
+    fn enum_conversion_strides_by_rustc_size() {
+        use crate::convert::types::llvm_type_size_align;
+
+        let mut ctx = make_ctx();
+
+        // #[repr(u32)] fieldless (issue #118 shape): {i32}, 4 bytes.
+        let repr_u32 = make_enum_ty(&mut ctx, "ReprU32", 32, unit_variants(4), 4, 4);
+        let conv = convert_type(&mut ctx, repr_u32).unwrap();
+        assert_eq!(llvm_type_size_align(&ctx, conv), (4, 4), "repr(u32) tag");
+
+        // #[repr(usize)] fieldless: {i64}, 8 bytes.
+        let repr_usize = make_enum_ty(&mut ctx, "ReprUsize", 64, unit_variants(4), 8, 8);
+        let conv = convert_type(&mut ctx, repr_usize).unwrap();
+        assert_eq!(llvm_type_size_align(&ctx, conv), (8, 8), "repr(usize) tag");
+
+        // u8 tag but 8-byte rustc size (repr(align(8)) raise): the converted
+        // struct must gain a trailing [7 x i8] pad to reach 8 bytes.
+        let padded = make_enum_ty(&mut ctx, "Padded", 8, unit_variants(2), 8, 8);
+        let conv = convert_type(&mut ctx, padded).unwrap();
+        let (size, _align) = llvm_type_size_align(&ctx, conv);
+        assert_eq!(size, 8, "trailing pad must raise the size to rustc's 8");
+        {
+            let conv_ref = conv.deref(&ctx);
+            let struct_ty = conv_ref
+                .downcast_ref::<llvm_export::types::StructType>()
+                .expect("converted enum is a struct");
+            assert_eq!(
+                struct_ty.fields().count(),
+                2,
+                "tag + one trailing pad field; pad appended at the END"
+            );
+        }
+
+        // u8 tag + i64 payload, rustc size 16: natural alignment already
+        // places the payload at offset 8, so no explicit pad is needed.
+        let i64_payload: Ptr<TypeObj> = IntegerType::get(&mut ctx, 64, Signedness::Unsigned).into();
+        let payload = make_enum_ty(
+            &mut ctx,
+            "OnePayload",
+            8,
+            vec![
+                EnumVariant::new("A".to_string(), vec![i64_payload]),
+                EnumVariant::unit("B".to_string()),
+            ],
+            16,
+            8,
+        );
+        let conv = convert_type(&mut ctx, payload).unwrap();
+        let (size, _align) = llvm_type_size_align(&ctx, conv);
+        assert_eq!(size, 16, "natural layout matches rustc size, no pad");
+        let conv_ref = conv.deref(&ctx);
+        let struct_ty = conv_ref
+            .downcast_ref::<llvm_export::types::StructType>()
+            .expect("converted enum is a struct");
+        assert_eq!(struct_ty.fields().count(), 2, "{{tag, payload}} only");
+    }
+
+    /// Multi-payload enum whose variants overlap in Rust (8 bytes) but
+    /// concatenate in our model (12 bytes structural): mimics
+    /// `#[repr(u32)] enum E { A(u32), B(u32) }`.
+    fn make_divergent_enum_ty(ctx: &mut Context) -> Ptr<TypeObj> {
+        let i32_a: Ptr<TypeObj> = IntegerType::get(ctx, 32, Signedness::Unsigned).into();
+        let i32_b: Ptr<TypeObj> = IntegerType::get(ctx, 32, Signedness::Unsigned).into();
+        make_enum_ty(
+            ctx,
+            "MultiPayload",
+            32,
+            vec![
+                EnumVariant::new("A".to_string(), vec![i32_a]),
+                EnumVariant::new("B".to_string(), vec![i32_b]),
+            ],
+            8,
+            4,
+        )
+    }
+
+    /// `mir.ptr_offset` over a layout-divergent enum pointee must fail
+    /// loudly (a GEP would stride by 12 over 8-byte elements).
+    #[test]
+    fn convert_ptr_offset_rejects_layout_divergent_enum() {
+        let mut ctx = make_ctx();
+        let enum_ty = make_divergent_enum_ty(&mut ctx);
+        let i64_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 64, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, enum_ty, true);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into(), i64_ty], vec![]);
+        let ptr_val = block.deref(&ctx).get_argument(0);
+        let off_val = block.deref(&ctx).get_argument(1);
+
+        let off_op = Operation::new(
+            &mut ctx,
+            mir::MirPtrOffsetOp::get_concrete_op_info(),
+            vec![mir_ptr_ty.into()],
+            vec![ptr_val, off_val],
+            vec![],
+            0,
+        );
+        off_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        let err = crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect_err("divergent enum GEP must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("MultiPayload"),
+            "error must name the enum, got: {msg}"
+        );
+        assert!(
+            msg.contains("not yet field-faithful"),
+            "error must state the multi-payload layout gap, got: {msg}"
+        );
+    }
+
+    /// `mir.load` of a layout-divergent enum must fail loudly (the load
+    /// width would exceed the Rust object).
+    #[test]
+    fn convert_load_rejects_layout_divergent_enum() {
+        let mut ctx = make_ctx();
+        let enum_ty = make_divergent_enum_ty(&mut ctx);
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, enum_ty, false);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into()], vec![]);
+        let ptr_val = block.deref(&ctx).get_argument(0);
+
+        let load_op = Operation::new(
+            &mut ctx,
+            mir::MirLoadOp::get_concrete_op_info(),
+            vec![enum_ty],
+            vec![ptr_val],
+            vec![],
+            0,
+        );
+        load_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        let err = crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect_err("divergent enum load must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("MultiPayload") && msg.contains("not yet field-faithful"),
+            "error must name the enum and the layout gap, got: {msg}"
+        );
     }
 
     /// Build a `mir.shared_alloc` returning `MirPtrType<i32, addrspace=3>` of

@@ -1,0 +1,373 @@
+warning: user-defined alias `oxide` is shadowing an external subcommand found at `/home/nihalp/.cargo/bin/cargo-oxide`
+  |
+  = note: this was previously accepted but will become a hard error in the future; see <https://github.com/rust-lang/cargo/issues/10049>
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running `target/debug/cargo-oxide build issue128_repro2 --arch sm_90 -v`
+Building rustc-codegen-cuda backend...
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+✓ Backend built: /home/nihalp/prod/cuda-oxide/crates/rustc-codegen-cuda/target/debug/librustc_codegen_cuda.so
+=========================================
+RUSTC-CODEGEN-CUDA BUILD: issue128_repro2
+=========================================
+
+Building issue128_repro2...
+
+   Compiling issue128_repro2 v0.1.0 (/home/nihalp/prod/cuda-oxide/crates/rustc-codegen-cuda/examples/issue128_repro2)
+[rustc_codegen_cuda] Compiling crate 'issue128_repro2': 1 CGUs, 1 kernel(s), 0 device fn(s)
+[rustc_codegen_cuda] Compiling device code via cuda-oxide...
+[collector] Found kernel: cuda_oxide_kernel_246e25db_fill -> fill
+[collector] Processing fill (4 basic blocks)
+[collector] Allowing function from external crate 'arena_core': arena_core::alloc_and_fill
+[collector] Discovered callee: arena_core::alloc_and_fill -> _RINvCshS7MNt0ifZw_10arena_core14alloc_and_fillNtCshP1yHeOtmkf_15issue128_repro211DeviceStoreEBK_
+[collector] Processing _RINvCshS7MNt0ifZw_10arena_core14alloc_and_fillNtCshP1yHeOtmkf_15issue128_repro211DeviceStoreEBK_ (17 basic blocks)
+[collector] Allowing function from external crate 'arena_core': arena_core::CellStore::bump
+[collector] Discovered callee: issue128_repro2::<DeviceStore<'a> as arena_core::CellStore>::bump -> _RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore4bump
+[collector] Allowing function from external crate 'arena_core': arena_core::CellStore::store
+[collector] Discovered callee: issue128_repro2::<DeviceStore<'a> as arena_core::CellStore>::store -> _RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore5store
+[collector] Allowing function from external crate 'arena_core': arena_core::CellStore::store
+[collector] Processing _RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore4bump (2 basic blocks)
+[collector] Skipping extern/intrinsic (no MIR): cuda_device::atomic::DeviceAtomicU32::fetch_add
+[collector] Processing _RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore5store (1 basic blocks)
+[rustc_codegen_cuda] Collected 4 device functions, 0 device externs for PTX compilation
+
+=== Device Functions MIR Info ===
+
+fill [kernel]:
+  - 4 basic blocks
+  - 16 local variables
+  - 3 args
+  - returns: ()
+
+_RINvCshS7MNt0ifZw_10arena_core14alloc_and_fillNtCshP1yHeOtmkf_15issue128_repro211DeviceStoreEBK_ [device]:
+  - 17 basic blocks
+  - 22 local variables
+  - 1 args
+  - returns: ()
+
+_RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore4bump [device]:
+  - 2 basic blocks
+  - 4 local variables
+  - 2 args
+  - returns: u32
+
+_RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore5store [device]:
+  - 1 basic blocks
+  - 9 local variables
+  - 3 args
+  - returns: ()
+=================================
+
+[device_codegen] Compiling 4 functions, 0 device externs to PTX via cuda-oxide pipeline
+[device_codegen]   kernel fill
+[device_codegen]   device _RINvCshS7MNt0ifZw_10arena_core14alloc_and_fillNtCshP1yHeOtmkf_15issue128_repro211DeviceStoreEBK_
+[device_codegen]   device _RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore4bump
+[device_codegen]   device _RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore5store
+[device_codegen] Converted 4 functions to stable_mir format
+Translating kernel: fill
+Translating device fn: _RINvCshS7MNt0ifZw_10arena_core14alloc_and_fillNtCshP1yHeOtmkf_15issue128_repro211DeviceStoreEBK_
+Translating device fn: _RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore4bump
+Translating device fn: _RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore5store
+
+=== Verifying dialect-mir module ===
+dialect-mir verification successful ✓
+
+=== Running mem2reg ===
+mem2reg successful ✓
+
+=== Lowering dialect-mir → LLVM dialect ===
+
+=== LLVM dialect (pre-verify) ===
+builtin.module @issue128_repro2 
+{
+  ^block1v1():
+    llvm.func @fill: llvm.func <llvm.void (llvm.ptr (0), builtin.integer i64, llvm.ptr (0), builtin.integer i64, llvm.ptr (0), builtin.integer i64) variadic = false>
+      [gpu_kernel: builtin.string "true"] 
+    {
+      ^entry_block27v1(v191: llvm.ptr (0), v192: builtin.integer i64, v193: llvm.ptr (0), v194: builtin.integer i64, v195: llvm.ptr (0), v196: builtin.integer i64):
+        v197 = llvm.undef : llvm.struct <{ llvm.ptr (0), builtin.integer i64 }>;
+        v198 = llvm.insert_value v197[0], v191 : llvm.struct <{ llvm.ptr (0), builtin.integer i64 }>;
+        v199 = llvm.insert_value v198[1], v192 : llvm.struct <{ llvm.ptr (0), builtin.integer i64 }>;
+        v200 = llvm.undef : llvm.struct <{ llvm.ptr (0), builtin.integer i64 }>;
+        v201 = llvm.insert_value v200[0], v193 : llvm.struct <{ llvm.ptr (0), builtin.integer i64 }>;
+        v202 = llvm.insert_value v201[1], v194 : llvm.struct <{ llvm.ptr (0), builtin.integer i64 }>;
+        v203 = llvm.undef : llvm.struct <{ llvm.ptr (0), builtin.integer i64 }>;
+        v204 = llvm.insert_value v203[0], v195 : llvm.struct <{ llvm.ptr (0), builtin.integer i64 }>;
+        v205 = llvm.insert_value v204[1], v196 : llvm.struct <{ llvm.ptr (0), builtin.integer i64 }>;
+        llvm.br ^block2v1(v199, v202, v205)
+
+      ^block2v1(v0: llvm.struct <{ llvm.ptr (0), builtin.integer i64 }>, v1: llvm.struct <{ llvm.ptr (0), builtin.integer i64 }>, v2: llvm.struct <{ llvm.ptr (0), builtin.integer i64 }>):
+        v206 = builtin.constant <builtin.integer <1: i32>> : builtin.integer i32;
+        v207 = llvm.alloca [llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }> x v206]  : llvm.ptr (0);
+        v208 = llvm.extract_value v0[0] : llvm.ptr (0) !0;
+        v209 = llvm.undef : llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>;
+        v210 = llvm.insert_value v209[0], v208 : llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>;
+        v211 = llvm.insert_value v210[1], v1 : llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }> !1;
+        v212 = llvm.extract_value v2[1] : builtin.integer i64 !2;
+        v213 = builtin.constant <builtin.integer <0: i64>> : builtin.integer i64 !3;
+        v214 = llvm.icmp v213 <ULT> v212 : builtin.integer i1 !4;
+        llvm.cond_br if v214 ^block3v1() else ^block28v1()
+
+      ^block3v1():
+        v215 = llvm.extract_value v2[0] : llvm.ptr (0) !5;
+        v216 = builtin.constant <builtin.integer <0: i32>> : builtin.integer i32 !6;
+        v217 = llvm.gep <builtin.integer i32> (v215, v216)[OperandIdx(1)] : llvm.ptr (0) !7;
+        v218 = llvm.load v217  : builtin.integer i32 !8;
+        v219 = builtin.constant <builtin.integer <1: i64>> : builtin.integer i64 !9;
+        v220 = llvm.icmp v219 <ULT> v212 : builtin.integer i1 !10;
+        llvm.cond_br if v220 ^block4v1() else ^block29v1()
+
+      ^block4v1():
+        v221 = llvm.extract_value v2[0] : llvm.ptr (0) !11;
+        v222 = builtin.constant <builtin.integer <1: i32>> : builtin.integer i32 !12;
+        v223 = llvm.gep <builtin.integer i32> (v221, v222)[OperandIdx(1)] : llvm.ptr (0) !13;
+        v224 = llvm.load v223  : builtin.integer i32 !14;
+        v225 = llvm.undef : llvm.struct <{ builtin.integer i8, builtin.integer i32 }>;
+        v226 = builtin.constant <builtin.integer <1: i8>> : builtin.integer i8;
+        v227 = llvm.insert_value v225[0], v226 : llvm.struct <{ builtin.integer i8, builtin.integer i32 }> !15;
+        v228 = llvm.undef : llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }>;
+        v229 = llvm.insert_value v228[0], v227 : llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }>;
+        v230 = llvm.insert_value v229[1], v211 : llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }>;
+        v231 = llvm.insert_value v230[2], v218 : llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }>;
+        v232 = llvm.insert_value v231[3], v224 : llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }> !16;
+        llvm.store *v207 <- v232 ;
+        v233 = llvm.bitcast v207 to llvm.ptr (0);
+        v234 = llvm.call @_RINvCshS7MNt0ifZw_10arena_core14alloc_and_fillNtCshP1yHeOtmkf_15issue128_repro211DeviceStoreEBK_ (v233) : llvm.func <llvm.void (llvm.ptr (0)) variadic = false>;
+        llvm.br ^block5v1()
+
+      ^block5v1():
+        llvm.return 
+
+      ^block28v1():
+        llvm.unreachable () [] []: <() -> ()>
+
+      ^block29v1():
+        llvm.unreachable () [] []: <() -> ()>
+    } !17;
+    llvm.func @_RINvCshS7MNt0ifZw_10arena_core14alloc_and_fillNtCshP1yHeOtmkf_15issue128_repro211DeviceStoreEBK_: llvm.func <llvm.void (llvm.ptr (0)) variadic = false>
+      [] 
+    {
+      ^entry_block30v1(v235: llvm.ptr (0)):
+        llvm.br ^block6v1(v235)
+
+      ^block6v1(v52: llvm.ptr (0)):
+        v236 = llvm.gep <llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }>> (v52)[Constant(0), Constant(1)] : llvm.ptr (0) !18;
+        v237 = builtin.constant <builtin.integer <1: i32>> : builtin.integer i32 !19;
+        v238 = llvm.call @_RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore4bump (v236, v237) : llvm.func <builtin.integer i32(llvm.ptr (0), builtin.integer i32) variadic = false> !20;
+        llvm.br ^block10v1()
+
+      ^block7v1():
+        v239 = llvm.extract_value v188[1] : builtin.integer i32 !21;
+        v240 = llvm.load v52  : llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }> !22;
+        v241 = llvm.extract_value v240[0] : llvm.struct <{ builtin.integer i8, builtin.integer i32 }> !23;
+        v242 = llvm.extract_value v241[0] : builtin.integer i8 !24;
+        v243 = llvm.zext <nneg=false> v242 to builtin.integer i64 !25;
+        v244 = builtin.constant <builtin.integer <1: i64>> : builtin.integer i64 !26;
+        v245 = llvm.icmp v243 <EQ> v244 : builtin.integer i1 !27;
+        llvm.cond_br if v245 ^block15v1() else ^block14v1()
+
+      ^block8v1():
+        llvm.br ^block9v1()
+
+      ^block9v1():
+        llvm.return 
+
+      ^block10v1():
+        v246 = llvm.load v52  : llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }> !28;
+        v247 = llvm.extract_value v246[2] : llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }> !29;
+        v248 = llvm.icmp v238 <UGE> v247 : builtin.integer i1 !30;
+        v249 = builtin.constant <builtin.integer <1: i1>> : builtin.integer i1;
+        v250 = llvm.xor v248, v249 : builtin.integer i1 !31;
+        llvm.cond_br if v250 ^block12v1() else ^block11v1()
+
+      ^block11v1():
+        v251 = llvm.undef : llvm.struct <{ builtin.integer i8, builtin.integer i32 }>;
+        v252 = builtin.constant <builtin.integer <0: i8>> : builtin.integer i8;
+        v253 = llvm.insert_value v251[0], v252 : llvm.struct <{ builtin.integer i8, builtin.integer i32 }> !32;
+        llvm.br ^block13v1(v253)
+
+      ^block12v1():
+        v254 = llvm.undef : llvm.struct <{ builtin.integer i8, builtin.integer i32 }>;
+        v255 = builtin.constant <builtin.integer <1: i8>> : builtin.integer i8;
+        v256 = llvm.insert_value v254[0], v255 : llvm.struct <{ builtin.integer i8, builtin.integer i32 }>;
+        v257 = llvm.insert_value v256[1], v238 : llvm.struct <{ builtin.integer i8, builtin.integer i32 }> !33;
+        llvm.br ^block13v1(v257)
+
+      ^block13v1(v188: llvm.struct <{ builtin.integer i8, builtin.integer i32 }>):
+        v258 = llvm.extract_value v188[0] : builtin.integer i8 !34;
+        v259 = llvm.zext <nneg=false> v258 to builtin.integer i64 !35;
+        v260 = builtin.constant <builtin.integer <1: i64>> : builtin.integer i64 !36;
+        v261 = llvm.icmp v259 <EQ> v260 : builtin.integer i1 !37;
+        llvm.cond_br if v261 ^block7v1() else ^block23v1()
+
+      ^block23v1():
+        v262 = builtin.constant <builtin.integer <0: i64>> : builtin.integer i64 !38;
+        v263 = llvm.icmp v259 <EQ> v262 : builtin.integer i1 !39;
+        llvm.cond_br if v263 ^block8v1() else ^block22v1()
+
+      ^block14v1():
+        v264 = llvm.load v52  : llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }> !40;
+        v265 = llvm.extract_value v264[3] : builtin.integer i32 !41;
+        v266 = llvm.mul v239, v265 <{nsw=false,nuw=false}>: builtin.integer i32 !42;
+        llvm.br ^block16v1(v266)
+
+      ^block15v1():
+        llvm.br ^block16v1(v239)
+
+      ^block16v1(v189: builtin.integer i32):
+        v267 = llvm.gep <llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }>> (v52)[Constant(0), Constant(1)] : llvm.ptr (0) !43;
+        v268 = llvm.call @_RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore5store (v267, v189, v239) : llvm.func <llvm.void (llvm.ptr (0), builtin.integer i32, builtin.integer i32) variadic = false>;
+        llvm.br ^block17v1()
+
+      ^block17v1():
+        v269 = builtin.constant <builtin.integer <10: i32>> : builtin.integer i32 !44;
+        v270 = llvm.mul v239, v269 <{nsw=false,nuw=false}>: builtin.integer i32 !45;
+        v271 = llvm.load v52  : llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }> !46;
+        v272 = llvm.extract_value v271[0] : llvm.struct <{ builtin.integer i8, builtin.integer i32 }> !47;
+        v273 = llvm.extract_value v272[0] : builtin.integer i8 !48;
+        v274 = llvm.zext <nneg=false> v273 to builtin.integer i64 !49;
+        v275 = builtin.constant <builtin.integer <1: i64>> : builtin.integer i64 !50;
+        v276 = llvm.icmp v274 <EQ> v275 : builtin.integer i1 !51;
+        llvm.cond_br if v276 ^block19v1() else ^block18v1()
+
+      ^block18v1():
+        v277 = llvm.load v52  : llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }> !52;
+        v278 = llvm.extract_value v277[3] : builtin.integer i32 !53;
+        v279 = llvm.mul v239, v278 <{nsw=false,nuw=false}>: builtin.integer i32 !54;
+        v280 = builtin.constant <builtin.integer <1: i32>> : builtin.integer i32 !55;
+        v281 = llvm.add v279, v280 <{nsw=false,nuw=false}>: builtin.integer i32 !56;
+        llvm.br ^block20v1(v281)
+
+      ^block19v1():
+        v282 = llvm.load v52  : llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }> !57;
+        v283 = llvm.extract_value v282[2] : llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }> !58;
+        v284 = llvm.add v283, v239 <{nsw=false,nuw=false}>: llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }> !59;
+        llvm.br ^block20v1(v284)
+
+      ^block20v1(v190: builtin.integer i32):
+        v285 = llvm.gep <llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }>> (v52)[Constant(0), Constant(1)] : llvm.ptr (0) !60;
+        v286 = llvm.call @_RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore5store (v285, v190, v270) : llvm.func <llvm.void (llvm.ptr (0), builtin.integer i32, builtin.integer i32) variadic = false>;
+        llvm.br ^block21v1()
+
+      ^block21v1():
+        llvm.br ^block9v1()
+
+      ^block22v1():
+        llvm.unreachable () [] []: <() -> ()>
+    } !61;
+    llvm.func @_RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore4bump: llvm.func <builtin.integer i32(llvm.ptr (0), builtin.integer i32) variadic = false>
+      [] 
+    {
+      ^entry_block31v1(v287: llvm.ptr (0), v288: builtin.integer i32):
+        llvm.br ^block24v1(v287, v288)
+
+      ^block24v1(v151: llvm.ptr (0), v152: builtin.integer i32):
+        v289 = llvm.load v151  : llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }> !62;
+        v290 = llvm.extract_value v289[0] : llvm.ptr (0) !63;
+        v291 = llvm.atomicrmw Add v290, v152 syncscope : "device"Monotonic : builtin.integer i32 !64;
+        llvm.br ^block25v1()
+
+      ^block25v1():
+        llvm.return v291
+    } !65;
+    llvm.func @_RNvXCshP1yHeOtmkf_15issue128_repro2NtB2_11DeviceStoreNtCshS7MNt0ifZw_10arena_core9CellStore5store: llvm.func <llvm.void (llvm.ptr (0), builtin.integer i32, builtin.integer i32) variadic = false>
+      [] 
+    {
+      ^entry_block32v1(v292: llvm.ptr (0), v293: builtin.integer i32, v294: builtin.integer i32):
+        llvm.br ^block26v1(v292, v293, v294)
+
+      ^block26v1(v164: llvm.ptr (0), v165: builtin.integer i32, v166: builtin.integer i32):
+        v295 = llvm.load v164  : llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }> !66;
+        v296 = llvm.extract_value v295[1] : llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> !67;
+        v297 = llvm.extract_value v296[0] : llvm.ptr (0) !68;
+        v298 = llvm.zext <nneg=false> v165 to builtin.integer i64 !69;
+        v299 = llvm.gep <builtin.integer i32> (v297, v298)[OperandIdx(1)] : llvm.ptr (0) !70;
+        llvm.store *v299 <- v166 ;
+        llvm.return 
+    } !71
+}
+
+outlined_attributes:
+!0 = @[name: "Span { id: 2, repr: "src/main.rs:39:26: 39:69" }", loc: (?)], []
+!1 = @[name: "Span { id: 5, repr: "src/main.rs:40:17: 40:50" }", loc: (?)], []
+!2 = @[name: "Span { id: 1, repr: "src/main.rs:41:42: 41:51" }", loc: (?)], []
+!3 = @[name: "Span { id: 1, repr: "src/main.rs:41:42: 41:51" }", loc: (?)], []
+!4 = @[name: "Span { id: 1, repr: "src/main.rs:41:42: 41:51" }", loc: (?)], []
+!5 = @[name: "Span { id: 1, repr: "src/main.rs:41:42: 41:51" }", loc: (?)], []
+!6 = @[name: "Span { id: 1, repr: "src/main.rs:41:42: 41:51" }", loc: (?)], []
+!7 = @[name: "Span { id: 1, repr: "src/main.rs:41:42: 41:51" }", loc: (?)], []
+!8 = @[name: "Span { id: 1, repr: "src/main.rs:41:42: 41:51" }", loc: (?)], []
+!9 = @[name: "Span { id: 7, repr: "src/main.rs:41:61: 41:70" }", loc: (?)], []
+!10 = @[name: "Span { id: 7, repr: "src/main.rs:41:61: 41:70" }", loc: (?)], []
+!11 = @[name: "Span { id: 7, repr: "src/main.rs:41:61: 41:70" }", loc: (?)], []
+!12 = @[name: "Span { id: 7, repr: "src/main.rs:41:61: 41:70" }", loc: (?)], []
+!13 = @[name: "Span { id: 7, repr: "src/main.rs:41:61: 41:70" }", loc: (?)], []
+!14 = @[name: "Span { id: 7, repr: "src/main.rs:41:61: 41:70" }", loc: (?)], []
+!15 = @[name: "Span { id: 9, repr: "arena_core/src/lib.rs:28:9: 33:10" }", loc: (?)], []
+!16 = @[name: "Span { id: 9, repr: "arena_core/src/lib.rs:28:9: 33:10" }", loc: (?)], []
+!17 = @[name: "Span { id: 21, repr: "src/main.rs:38:1: 43:2" }", loc: (?)], []
+!18 = @[name: "Span { id: 25, repr: "arena_core/src/lib.rs:36:17: 36:27" }", loc: (?)], []
+!19 = @[name: "Span { id: 22, repr: "arena_core/src/lib.rs:36:17: 36:35" }", loc: (?)], []
+!20 = @[name: "Span { id: 22, repr: "arena_core/src/lib.rs:36:17: 36:35" }", loc: (?)], []
+!21 = @[name: "Span { id: 27, repr: "arena_core/src/lib.rs:51:17: 51:21" }", loc: (?)], []
+!22 = @[name: "Span { id: 29, repr: "arena_core/src/lib.rs:40:23: 40:34" }", loc: (?)], []
+!23 = @[name: "Span { id: 29, repr: "arena_core/src/lib.rs:40:23: 40:34" }", loc: (?)], []
+!24 = @[name: "Span { id: 29, repr: "arena_core/src/lib.rs:40:23: 40:34" }", loc: (?)], []
+!25 = @[name: "Span { id: 29, repr: "arena_core/src/lib.rs:40:23: 40:34" }", loc: (?)], []
+!26 = @[name: "Span { id: 26, repr: "arena_core/src/lib.rs:40:17: 40:34" }", loc: (?)], []
+!27 = @[name: "Span { id: 26, repr: "arena_core/src/lib.rs:40:17: 40:34" }", loc: (?)], []
+!28 = @[name: "Span { id: 35, repr: "arena_core/src/lib.rs:37:17: 37:25" }", loc: (?)], []
+!29 = @[name: "Span { id: 35, repr: "arena_core/src/lib.rs:37:17: 37:25" }", loc: (?)], []
+!30 = @[name: "Span { id: 33, repr: "arena_core/src/lib.rs:37:12: 37:25" }", loc: (?)], []
+!31 = @[name: "Span { id: 33, repr: "arena_core/src/lib.rs:37:12: 37:25" }", loc: (?)], []
+!32 = @[name: "Span { id: 38, repr: "arena_core/src/lib.rs:37:28: 37:32" }", loc: (?)], []
+!33 = @[name: "Span { id: 39, repr: "arena_core/src/lib.rs:37:42: 37:49" }", loc: (?)], []
+!34 = @[name: "Span { id: 23, repr: "arena_core/src/lib.rs:51:25: 51:34" }", loc: (?)], []
+!35 = @[name: "Span { id: 23, repr: "arena_core/src/lib.rs:51:25: 51:34" }", loc: (?)], []
+!36 = @[name: "Span { id: 40, repr: "arena_core/src/lib.rs:51:12: 51:22" }", loc: (?)], []
+!37 = @[name: "Span { id: 40, repr: "arena_core/src/lib.rs:51:12: 51:22" }", loc: (?)], []
+!38 = @[name: "Span { id: 40, repr: "arena_core/src/lib.rs:51:12: 51:22" }", loc: (?)], []
+!39 = @[name: "Span { id: 40, repr: "arena_core/src/lib.rs:51:12: 51:22" }", loc: (?)], []
+!40 = @[name: "Span { id: 43, repr: "arena_core/src/lib.rs:43:36: 43:47" }", loc: (?)], []
+!41 = @[name: "Span { id: 43, repr: "arena_core/src/lib.rs:43:36: 43:47" }", loc: (?)], []
+!42 = @[name: "Span { id: 44, repr: "/home/nihalp/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/num/uint_macros.rs:2587:13: 2587:48" }", loc: (?)], []
+!43 = @[name: "Span { id: 49, repr: "arena_core/src/lib.rs:45:9: 45:19" }", loc: (?)], []
+!44 = @[name: "Span { id: 44, repr: "/home/nihalp/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/num/uint_macros.rs:2587:13: 2587:48" }", loc: (?)], []
+!45 = @[name: "Span { id: 44, repr: "/home/nihalp/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/num/uint_macros.rs:2587:13: 2587:48" }", loc: (?)], []
+!46 = @[name: "Span { id: 29, repr: "arena_core/src/lib.rs:40:23: 40:34" }", loc: (?)], []
+!47 = @[name: "Span { id: 29, repr: "arena_core/src/lib.rs:40:23: 40:34" }", loc: (?)], []
+!48 = @[name: "Span { id: 29, repr: "arena_core/src/lib.rs:40:23: 40:34" }", loc: (?)], []
+!49 = @[name: "Span { id: 29, repr: "arena_core/src/lib.rs:40:23: 40:34" }", loc: (?)], []
+!50 = @[name: "Span { id: 26, repr: "arena_core/src/lib.rs:40:17: 40:34" }", loc: (?)], []
+!51 = @[name: "Span { id: 26, repr: "arena_core/src/lib.rs:40:17: 40:34" }", loc: (?)], []
+!52 = @[name: "Span { id: 43, repr: "arena_core/src/lib.rs:43:36: 43:47" }", loc: (?)], []
+!53 = @[name: "Span { id: 43, repr: "arena_core/src/lib.rs:43:36: 43:47" }", loc: (?)], []
+!54 = @[name: "Span { id: 44, repr: "/home/nihalp/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/num/uint_macros.rs:2587:13: 2587:48" }", loc: (?)], []
+!55 = @[name: "Span { id: 47, repr: "/home/nihalp/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/num/uint_macros.rs:2511:13: 2511:48" }", loc: (?)], []
+!56 = @[name: "Span { id: 47, repr: "/home/nihalp/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/num/uint_macros.rs:2511:13: 2511:48" }", loc: (?)], []
+!57 = @[name: "Span { id: 54, repr: "arena_core/src/lib.rs:42:47: 42:55" }", loc: (?)], []
+!58 = @[name: "Span { id: 54, repr: "arena_core/src/lib.rs:42:47: 42:55" }", loc: (?)], []
+!59 = @[name: "Span { id: 47, repr: "/home/nihalp/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/num/uint_macros.rs:2511:13: 2511:48" }", loc: (?)], []
+!60 = @[name: "Span { id: 49, repr: "arena_core/src/lib.rs:45:9: 45:19" }", loc: (?)], []
+!61 = @[name: "Span { id: 56, repr: "arena_core/src/lib.rs:50:1: 55:2" }", loc: (?)], []
+!62 = @[name: "Span { id: 63, repr: "src/main.rs:27:9: 27:20" }", loc: (?)], []
+!63 = @[name: "Span { id: 63, repr: "src/main.rs:27:9: 27:20" }", loc: (?)], []
+!64 = @[name: "Span { id: 62, repr: "src/main.rs:27:9: 27:58" }", loc: (?)], []
+!65 = @[name: "Span { id: 68, repr: "src/main.rs:26:5: 28:6" }", loc: (?)], []
+!66 = @[name: "Span { id: 70, repr: "src/main.rs:31:21: 31:30" }", loc: (?)], []
+!67 = @[name: "Span { id: 70, repr: "src/main.rs:31:21: 31:30" }", loc: (?)], []
+!68 = @[name: "Span { id: 71, repr: "src/main.rs:31:21: 31:51" }", loc: (?)], []
+!69 = @[name: "Span { id: 73, repr: "src/main.rs:32:19: 32:31" }", loc: (?)], []
+!70 = @[name: "Span { id: 74, repr: "/home/nihalp/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ptr/mut_ptr.rs:961:18: 961:49" }", loc: (?)], []
+!71 = @[name: "Span { id: 83, repr: "src/main.rs:29:5: 34:6" }", loc: (?)], []
+
+=== Verifying LLVM dialect module ===
+error: [rustc_codegen_cuda] Device codegen failed: PTX generation failed: Verification failed for 'llvm module':
+         Compilation error: verification failed.
+       Value being inserted / extracted does not match the type of the indexed aggregate
+         Failed operation:
+       v230 = llvm.insert_value v229[1], v211 : llvm.struct <{ llvm.struct <{ builtin.integer i8, builtin.integer i32 }>, llvm.array [3 x builtin.integer i8], llvm.struct <{ llvm.ptr (0), llvm.struct <{ llvm.ptr (0), builtin.integer i64 }> }>, builtin.integer i32, builtin.integer i32 }>
+       
+
+error: could not compile `issue128_repro2` (bin "issue128_repro2") due to 1 previous error
+
+Build failed with exit code: Some(101)

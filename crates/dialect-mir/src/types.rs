@@ -563,12 +563,16 @@ impl EnumVariant {
 ///
 /// Represents Rust enums like `Option<T>`, `Result<T,E>`, and custom enums.
 ///
-/// Memory layout follows Rust's enum representation:
-/// - Discriminant tag (rustc's layout-truth integer type for Direct-tag
-///   enums; a synthetic unsigned variant-count tag otherwise). The tag
-///   holds the variant's DECLARED discriminant value, never its variant
-///   index.
-/// - Payload (union of all variant payloads, sized to largest)
+/// Lowered as a `{tag, variant fields...}` struct:
+/// - Discriminant tag sourced from rustc's layout (width AND signedness of
+///   the tag scalar for Direct-tag enums; a variant-count fallback for the
+///   niched / single-variant models, which are deliberately un-niched).
+///   The tag holds the variant's DECLARED discriminant value, never its
+///   variant index.
+/// - All variants' payload fields concatenated in declaration order (NOT
+///   overlapped like Rust's real layout). mir-lower uses `total_size` to pad
+///   the struct to rustc's size, or to reject memory traversal loudly when
+///   concatenation makes the struct larger than the Rust object.
 ///
 /// Note: For simplicity, we store variant info in flattened vectors
 /// since the `#[format_type]` macro has trouble with nested structs.
@@ -584,10 +588,10 @@ impl EnumVariant {
 pub struct MirEnumType {
     /// The enum name (e.g., "Option", "Result")
     pub name: String,
-    /// The discriminant ("tag") type. For Direct-tag enums this is rustc's
-    /// layout-truth tag type (width AND signedness); for niched,
-    /// single-variant and uninhabited enums it is a synthetic unsigned
-    /// variant-count tag.
+    /// The discriminant type, sourced from rustc's layout: the tag scalar's
+    /// width and signedness for Direct-tag enums (so `#[repr(uN/iN)]`,
+    /// `#[repr(C)]`, sparse and negative discriminants are all honoured); a
+    /// variant-count fallback for the niched / single-variant models.
     pub discriminant_ty: Ptr<TypeObj>,
     /// Variant names in order
     pub variant_names: Vec<String>,
@@ -599,11 +603,15 @@ pub struct MirEnumType {
     pub variant_field_counts: Vec<u32>,
     /// All field types concatenated (use variant_field_counts to split)
     pub all_field_types: Vec<Ptr<TypeObj>>,
-    /// Total enum size in bytes from rustc's layout (0 = unknown; only
-    /// populated for Direct-tag enums).
+    /// Total enum size in bytes from rustc layout (including padding).
+    /// 0 means unknown / not memory-faithful; mir-lower then keeps the
+    /// plain concatenated `{tag, fields...}` struct as-is.
+    ///
+    /// Populated only for `TagEncoding::Direct` enums: niched and
+    /// single-variant shapes use an un-niched model whose size has
+    /// nothing to do with rustc's layout, so they stay 0.
     pub total_size: u64,
-    /// ABI alignment in bytes from rustc's layout (0 = unknown; only
-    /// populated for Direct-tag enums).
+    /// ABI alignment in bytes, from rustc layout. 0 means unknown.
     pub abi_align: u64,
 }
 
@@ -675,6 +683,18 @@ impl MirEnumType {
     /// Get the discriminant type.
     pub fn discriminant_type(&self) -> Ptr<TypeObj> {
         self.discriminant_ty
+    }
+
+    /// Get total enum size in bytes from rustc layout.
+    /// Returns 0 if size is not known.
+    pub fn total_size(&self) -> u64 {
+        self.total_size
+    }
+
+    /// Get the ABI alignment in bytes from rustc layout.
+    /// Returns 0 if alignment is not known.
+    pub fn abi_align(&self) -> u64 {
+        self.abi_align
     }
 
     /// Get the number of variants.

@@ -78,6 +78,7 @@ extern crate rustc_public_bridge;
 extern crate rustc_span;
 
 pub mod error;
+mod llvm_tools;
 pub mod pipeline;
 pub mod translator;
 

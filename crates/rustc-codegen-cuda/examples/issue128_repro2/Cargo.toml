@@ -1,0 +1,22 @@
+[package]
+name = "issue128_repro2"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Independent repro for issue #128 (second, verification copy; do not merge
+# with issue128_repro). Mirrors the reporter's cross-crate setup: the
+# reordered/padded repr(Rust) generic struct lives in the sibling
+# `arena_core` crate, and the kernel drives it through &self methods.
+# Build compile-only with:
+#   cargo oxide build issue128_repro2 --arch sm_90 -v
+
+# Standalone workspace to allow the nested arena_core crate
+[workspace]
+members = ["arena_core"]
+
+[dependencies]
+arena_core = { path = "arena_core" }
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
+cuda-core = { path = "../../../cuda-core" }
