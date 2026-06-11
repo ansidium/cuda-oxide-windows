@@ -111,6 +111,7 @@ The `examples/` directory contains standalone kernel crates that exercise differ
 | `abi_hmm`                    | HMM pointers, struct layout, closures                      |
 | `device_closures`            | Move and non-move closures passed to kernels               |
 | `ref_index_projections`      | Borrow / raw-pointer address projections (issue #120)      |
+| `ref_operand_mul`            | `Mul` impl on `&Foo` with `Output = Foo` (issue #133)      |
 | `cross_crate_kernel`         | Kernels defined in a library crate                         |
 | `async_vecadd`               | Async CUDA streams with `cuda-async`                       |
 | `async_mlp`                  | Multi-layer perceptron using async streams                 |

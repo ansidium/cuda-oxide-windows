@@ -837,7 +837,7 @@ fn translate_call(
     let target_usize = target.map(|t| t);
 
     // Extract function info
-    let (pattern_name, call_name, substs_str, func_ret_ty) = extract_func_info(func);
+    let (pattern_name, call_name, substs_str) = extract_func_info(func);
 
     // Helper to check if substitutions contain a type
     let substs_contains =
@@ -900,7 +900,6 @@ fn translate_call(
             ctx,
             body,
             &call_name,
-            &func_ret_ty,
             args,
             destination,
             &target_usize,
@@ -1099,11 +1098,19 @@ fn translate_call(
     // Not an intrinsic - emit regular function call
     let raw_name = call_name.unwrap_or_else(|| "unknown_function".to_string());
     let legal_name = legaliser.legalise(&raw_name);
-    let return_type = if let Some(ret_ty) = func_ret_ty {
-        types::translate_type(ctx, &ret_ty)?
-    } else {
-        dialect_mir::types::MirTupleType::get(ctx, vec![]).into()
-    };
+
+    // Type the call result from the caller's destination place, not from the
+    // callee's declared signature. The declared signature of a trait method
+    // is written against the trait, so its return type can be an unresolved
+    // associated-type projection such as `<&Foo as Mul>::Output` (issue #133),
+    // which the type translator cannot turn into a concrete layout. The
+    // destination local in the caller's monomorphized MIR already has that
+    // projection resolved (`Foo`), and it is by construction the exact type
+    // the call result is stored into, so the `mir.call` result type and the
+    // destination slot always agree. The callee `mir.func` return type is
+    // independently derived from the callee body's return place, which is
+    // normalized the same way, so caller and callee stay consistent.
+    let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
 
     helpers::emit_function_call(
         ctx,
@@ -1141,7 +1148,6 @@ fn translate_closure_call(
     ctx: &mut Context,
     body: &mir::Body,
     call_name: &Option<String>,
-    func_ret_ty: &Option<rustc_public::ty::Ty>,
     args: &[mir::Operand],
     destination: &mir::Place,
     target: &Option<usize>,
@@ -1159,11 +1165,11 @@ fn translate_closure_call(
     use pliron::utils::apint::APInt;
     use std::num::NonZeroUsize;
 
-    let return_type = if let Some(ret_ty) = func_ret_ty {
-        types::translate_type(ctx, ret_ty)?
-    } else {
-        dialect_mir::types::MirTupleType::get(ctx, vec![]).into()
-    };
+    // Same reasoning as the regular-call path: the trait-level signature of
+    // `FnOnce::call_once` types its result as the projection
+    // `<{closure} as FnOnce<Args>>::Output`. The caller's destination local
+    // carries the already-resolved concrete type, so use that.
+    let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
 
     // Extract the closure body's name from the closure type in args[0].
     // This is critical for unified compilation where Instance::resolve returns
@@ -1422,7 +1428,15 @@ fn extract_closure_body_name(closure_arg: &mir::Operand, body: &mir::Body) -> Op
 /// - `pattern_name`: The function's simple name (e.g., `"cuda_device::index_1d"`)
 /// - `call_name`: The name used for the call target in generated code
 /// - `substs_str`: Debug string of generic substitutions (for pattern matching)
-/// - `func_ret_ty`: The function's return type
+///
+/// Deliberately NOT returned: the callee's declared return type. The
+/// declared `fn_sig` of a trait method is written against the trait, so its
+/// output can be an unresolved associated-type projection such as
+/// `<&Foo as Mul>::Output` (issue #133). Call results are instead typed from
+/// the caller's destination place, which rustc has already monomorphized and
+/// normalized. If a callee-signature type is ever genuinely needed here,
+/// resolve the instance first (`Instance::resolve`) and query the signature
+/// on the resolved instance so associated types arrive normalized.
 ///
 /// This information is used to:
 /// 1. Match intrinsic patterns by `pattern_name` (full FQDN, e.g. `cuda_device::thread::threadIdx_x`)
@@ -1440,14 +1454,7 @@ fn extract_closure_body_name(closure_arg: &mir::Operand, body: &mir::Body) -> Op
 /// For generic calls, `Instance::resolve` + `mangled_name` is used instead, which
 /// the collector also matches via `compute_export_name`.
 ///
-fn extract_func_info(
-    func: &mir::Operand,
-) -> (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<rustc_public::ty::Ty>,
-) {
+fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Option<String>) {
     match func {
         mir::Operand::Constant(const_op) => match const_op.const_.kind() {
             ConstantKind::ZeroSized => {
@@ -1472,24 +1479,14 @@ fn extract_func_info(
                         };
 
                         let substs_debug = format!("{:?}", substs);
-                        let sig = ty_kind
-                            .fn_sig()
-                            .expect("FnDef should have fn_sig")
-                            .skip_binder();
-                        let ret_ty = sig.output();
-                        (
-                            Some(pattern_name),
-                            Some(call_name),
-                            Some(substs_debug),
-                            Some(ret_ty),
-                        )
+                        (Some(pattern_name), Some(call_name), Some(substs_debug))
                     }
-                    _ => (None, None, None, None),
+                    _ => (None, None, None),
                 }
             }
-            _ => (None, None, None, None),
+            _ => (None, None, None),
         },
-        _ => (None, None, None, None),
+        _ => (None, None, None),
     }
 }
 

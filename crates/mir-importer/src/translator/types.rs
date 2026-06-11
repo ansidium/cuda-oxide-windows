@@ -233,6 +233,37 @@ fn shared_array_element_type(
     )))
 }
 
+/// Translates the type of a call's destination place to its `dialect-mir`
+/// equivalent.
+///
+/// Call results are typed from the destination in the caller's monomorphized
+/// MIR, not from the callee's declared signature. A trait method's declared
+/// signature types its result against the trait, so it can contain an
+/// associated-type projection that is not yet resolved to a concrete type,
+/// for example `<&Foo as Mul>::Output` (issue #133). The destination local
+/// already carries the concrete type rustc resolved during monomorphization,
+/// and it is by construction the slot the call result is stored into, so the
+/// call result type and the destination slot always agree.
+pub fn translate_destination_type(
+    ctx: &mut Context,
+    body: &rustc_public::mir::Body,
+    destination: &rustc_public::mir::Place,
+    loc: &pliron::location::Location,
+) -> TranslationResult<Ptr<TypeObj>> {
+    let dest_rust_ty = match destination.ty(body.locals()) {
+        Ok(t) => t,
+        Err(e) => {
+            return pliron::input_err!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "failed to resolve destination type for call result: {e:?}"
+                ))
+            );
+        }
+    };
+    translate_type(ctx, &dest_rust_ty)
+}
+
 /// Translates a Rust type to its `dialect-mir` equivalent.
 ///
 /// See module documentation for the type mapping table.
@@ -865,53 +896,24 @@ pub fn translate_type(
                 }
             }
 
-            // For arithmetic trait outputs (Mul::Output, Add::Output, Sub::Output, etc.)
-            // The standard impls resolve Output to the self type. E.g.
-            // <f32 as Mul>::Output = f32, <Complex<f32> as Mul>::Output = Complex<f32>.
+            // No guessing for other associated-type projections. An earlier
+            // version of this code assumed that arithmetic-trait outputs
+            // (`Mul::Output`, `Add::Output`, ...) always equal the self type.
+            // That assumption is wrong in general: `impl Mul for &Foo` with
+            // `type Output = Foo` (issue #133) has Output != Self, and so
+            // does any `impl Mul for Meters { type Output = SquareMeters }`.
+            // Guessing the self type there silently mistypes the value (a
+            // miscompile), so we fail loudly instead.
             //
-            // This handles: Mul, Add, Sub, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, Neg, Not
-            // The def_name format can be either:
-            //   - "std::ops::Mul::Output" (from std re-export)
-            //   - "core::ops::Mul::Output" (from core directly)
-            let is_arith_output = (def_name.contains("std::ops::")
-                || def_name.contains("core::ops::"))
-                && (def_name.contains("Mul::Output")
-                    || def_name.contains("Add::Output")
-                    || def_name.contains("Sub::Output")
-                    || def_name.contains("Div::Output")
-                    || def_name.contains("Rem::Output")
-                    || def_name.contains("BitAnd::Output")
-                    || def_name.contains("BitOr::Output")
-                    || def_name.contains("BitXor::Output")
-                    || def_name.contains("Shl::Output")
-                    || def_name.contains("Shr::Output")
-                    || def_name.contains("Neg::Output")
-                    || def_name.contains("Not::Output"));
-
-            if is_arith_output {
-                // The self type is the first generic argument
-                let args = &alias_ty.args.0;
-                if let Some(rustc_public::ty::GenericArgKind::Type(self_ty)) = args.first() {
-                    // For operands whose arithmetic-trait impl sets Output = Self.
-                    // This holds for primitives (`<f32 as Mul>::Output = f32`) and
-                    // for aggregates that follow the same convention, e.g.
-                    // num_complex's `<Complex<f32> as Mul>::Output = Complex<f32>`
-                    // (issue #35) or a user struct implementing `Mul`. Translating
-                    // the self type directly recurses to lay out the aggregate.
-                    if let rustc_public::ty::TyKind::RigidTy(
-                        rustc_public::ty::RigidTy::Int(_)
-                        | rustc_public::ty::RigidTy::Uint(_)
-                        | rustc_public::ty::RigidTy::Float(_)
-                        | rustc_public::ty::RigidTy::Bool
-                        | rustc_public::ty::RigidTy::Char
-                        | rustc_public::ty::RigidTy::Adt(..),
-                    ) = self_ty.kind()
-                    {
-                        return translate_type(ctx, self_ty);
-                    }
-                }
-            }
-
+            // Projections should not normally reach this point at all: call
+            // results are typed from the caller's destination place (see
+            // `translate_destination_type`), which rustc has already
+            // normalized to a concrete type. Hitting this error means some
+            // code path handed the type translator an unnormalized type
+            // taken from a declared trait signature. Fix that path to use
+            // the normalized type (destination place, or the signature of
+            // the resolved `Instance`) rather than teaching this function
+            // to guess what the projection resolves to.
             input_err_noloc!(TranslationErr::unsupported(format!(
                 "Alias type not yet supported: {:?}",
                 alias_ty.def_id
