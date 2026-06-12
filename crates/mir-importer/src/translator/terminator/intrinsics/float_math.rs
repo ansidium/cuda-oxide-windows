@@ -253,6 +253,8 @@ impl RustFloatMathIntrinsic {
             "atan2" => Some(Self::Atan2F64),
             "atanf" => Some(Self::AtanF32),
             "atan" => Some(Self::AtanF64),
+            "cbrtf" => Some(Self::CbrtF32),
+            "cbrt" => Some(Self::CbrtF64),
             _ => None,
         }
     }
@@ -584,6 +586,8 @@ mod tests {
                 "core::num::imp::libm::cbrt",
                 RustFloatMathIntrinsic::CbrtF64,
             ),
+            ("libm::cbrtf", RustFloatMathIntrinsic::CbrtF32),
+            ("libm::math::cbrt::cbrt", RustFloatMathIntrinsic::CbrtF64),
         ] {
             assert_eq!(
                 RustFloatMathIntrinsic::from_core_path(path),
