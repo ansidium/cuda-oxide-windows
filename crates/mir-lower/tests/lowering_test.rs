@@ -832,7 +832,7 @@ fn test_cvt_f16x2_f32_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
 
     let mut ctx = make_test_ctx();
-    let f32_ty = FP32Type::get(&mut ctx);
+    let f32_ty = FP32Type::get(&ctx);
     let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
     let (module_ptr, entry) = build_test_kernel(&mut ctx, vec![f32_ty.into(), f32_ty.into()]);
 
