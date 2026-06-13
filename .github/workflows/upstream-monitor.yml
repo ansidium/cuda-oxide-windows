@@ -4,7 +4,7 @@ name: upstream-monitor
 on:
   schedule:
     # Daily monitor, Tuesday through Sunday.
-    - cron: "17 4 * * 2-7"
+    - cron: "17 4 * * 0,2-6"
     # Weekly maintenance monitor, Monday.
     - cron: "47 4 * * 1"
   workflow_dispatch:
