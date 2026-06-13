@@ -6,6 +6,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Weekly hosted no-GPU Windows canary.
+    - cron: "23 3 * * 1"
   workflow_dispatch:
     inputs:
       run_cuda_compile:

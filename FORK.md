@@ -11,7 +11,7 @@ helpers needed for `x86_64-pc-windows-msvc`.
 
 - Upstream: https://github.com/NVlabs/cuda-oxide
 - Upstream branch: `NVlabs/cuda-oxide` `upstream/main`
-- Upstream release baseline: CUDA-Oxide 0.2.0
+- Upstream release baseline: CUDA-Oxide 0.2.1
 - Primary local branch: `main` Windows release fork branch tracking
   `upstream/main`
 - Windows branches: `custom/windows-*`
@@ -93,6 +93,16 @@ Run the canonical no-GPU sequence with:
 .\scripts\sync-upstream.ps1 -RunChecks
 ```
 
+Push a completed sync only after the checks pass:
+
+```powershell
+.\scripts\sync-upstream.ps1 -RunChecks -Push
+```
+
+The helper rebases `main` onto `upstream/main` and, when `-Push` is passed,
+uses `git push --force-with-lease`. It does not create releases, move tags, or
+change versions.
+
 On a Windows GPU host, also run the full Windows smoke path:
 
 ```powershell
@@ -106,6 +116,20 @@ When a sync changes Windows readiness, update
 [CHANGELOG.windows.md](CHANGELOG.windows.md). Keep the changelog focused on
 validated targets, requirements, examples, unsupported items, and known
 release-readiness gaps.
+
+## Maintenance Cycle
+
+- Daily upstream monitor: `.github/workflows/upstream-monitor.yml` compares this
+  fork with `NVlabs/cuda-oxide/main` and opens or updates one maintenance issue
+  when upstream has new commits.
+- Weekly upstream monitor: the same workflow runs a weekly cadence for a
+  slower, human-friendly sync checkpoint.
+- Weekly hosted Windows canary: `.github/workflows/windows.yml` runs the
+  no-GPU MSVC lane on GitHub-hosted `windows-latest`.
+- Manual sync: run `.\scripts\sync-upstream.ps1 -RunChecks`; add `-Push` only
+  after the local result is clean.
+- Release rule: publish `windows-vX.Y.Z` only when upstream has released
+  `vX.Y.Z`. Sync-only rebuilds do not invent new project versions.
 
 ## Divergence Log Format
 
@@ -126,11 +150,11 @@ from upstream:
 
 ## Current Divergence Log
 
-## 2026-06-08 - Windows support layer
+## 2026-06-14 - Windows support layer
 
 - Branch: `main` Windows release fork branch tracking `upstream/main`.
-- Upstream baseline: `upstream/main@26d3951f6bf5d562f37eea63832722e5f9a2a0ba`,
-  CUDA-Oxide 0.2.0.
+- Upstream baseline: `upstream/main@cb318ad4e4e37f5e1913ed0a13478af990e857f7`,
+  CUDA-Oxide 0.2.1.
 - Files/area: CUDA Toolkit discovery, Windows/MSVC path handling, platform
   artifact naming, loader environment handling, import-library checks,
   bindgen/CUDA compatibility, Windows CI, and smoke scripts.

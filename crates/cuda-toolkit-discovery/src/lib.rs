@@ -40,7 +40,10 @@ pub fn cuda_roots() -> Vec<PathBuf> {
 
 /// Candidate native library search directories for the CUDA driver library.
 pub fn cuda_driver_lib_candidates(target: &str) -> Vec<PathBuf> {
-    let roots = root_candidates(DefaultRoots::for_target(target));
+    cuda_driver_lib_candidates_from_roots(root_candidates(DefaultRoots::for_target(target)), target)
+}
+
+fn cuda_driver_lib_candidates_from_roots(roots: Vec<PathBuf>, target: &str) -> Vec<PathBuf> {
     if is_windows_target(target) {
         dedup(
             roots
@@ -49,6 +52,7 @@ pub fn cuda_driver_lib_candidates(target: &str) -> Vec<PathBuf> {
                 .collect(),
         )
     } else {
+        let target_dir = cuda_redistributable_target_dir(target);
         dedup(
             roots
                 .into_iter()
@@ -56,15 +60,23 @@ pub fn cuda_driver_lib_candidates(target: &str) -> Vec<PathBuf> {
                     [
                         root.join("lib64"),
                         root.join("lib64").join("stubs"),
-                        root.join("targets").join("x86_64-linux").join("lib"),
+                        root.join("targets").join(target_dir).join("lib"),
                         root.join("targets")
-                            .join("x86_64-linux")
+                            .join(target_dir)
                             .join("lib")
                             .join("stubs"),
                     ]
                 })
                 .collect(),
         )
+    }
+}
+
+fn cuda_redistributable_target_dir(target: &str) -> &'static str {
+    if target.starts_with("aarch64") {
+        "sbsa-linux"
+    } else {
+        "x86_64-linux"
     }
 }
 
@@ -352,6 +364,7 @@ mod tests {
 
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
     const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
+    const AARCH64_LINUX_TARGET: &str = "aarch64-unknown-linux-gnu";
 
     #[test]
     fn windows_default_v13_3_candidates_are_present() {
@@ -413,6 +426,27 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_linux_driver_candidates_use_sbsa_redistributable_layout() {
+        let root = PathBuf::from("/opt/cuda");
+        let candidates =
+            cuda_driver_lib_candidates_from_roots(vec![root.clone()], AARCH64_LINUX_TARGET);
+
+        assert!(candidates.contains(&root.join("lib64")));
+        assert!(candidates.contains(&root.join("lib64").join("stubs")));
+        assert!(candidates.contains(&root.join("targets").join("sbsa-linux").join("lib")));
+        assert!(
+            candidates.contains(
+                &root
+                    .join("targets")
+                    .join("sbsa-linux")
+                    .join("lib")
+                    .join("stubs")
+            )
+        );
+        assert!(!candidates.contains(&root.join("targets").join("x86_64-linux").join("lib")));
+    }
+
+    #[test]
     fn cuda_path_only_is_first_root() {
         let cuda_path = OsString::from(r"D:\NVIDIA\CUDA\v13.3");
         let roots = root_candidates_from_env(
@@ -470,34 +504,6 @@ mod tests {
             libdevice_candidates_from_roots(roots)
                 .contains(&root.join("nvvm").join("libdevice").join("libdevice.10.bc"))
         );
-    }
-
-    fn cuda_driver_lib_candidates_from_roots(roots: Vec<PathBuf>, target: &str) -> Vec<PathBuf> {
-        if is_windows_target(target) {
-            dedup(
-                roots
-                    .into_iter()
-                    .map(|root| root.join("lib").join("x64"))
-                    .collect(),
-            )
-        } else {
-            dedup(
-                roots
-                    .into_iter()
-                    .flat_map(|root| {
-                        [
-                            root.join("lib64"),
-                            root.join("lib64").join("stubs"),
-                            root.join("targets").join("x86_64-linux").join("lib"),
-                            root.join("targets")
-                                .join("x86_64-linux")
-                                .join("lib")
-                                .join("stubs"),
-                        ]
-                    })
-                    .collect(),
-            )
-        }
     }
 
     fn libnvvm_dll_candidates_from_roots(roots: Vec<PathBuf>, target: &str) -> Vec<PathBuf> {

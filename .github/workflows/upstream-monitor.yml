@@ -1,0 +1,207 @@
+---
+name: upstream-monitor
+
+on:
+  schedule:
+    # Daily monitor, Tuesday through Sunday.
+    - cron: "17 4 * * 2-7"
+    # Weekly maintenance monitor, Monday.
+    - cron: "47 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      upstream_repository:
+        description: "Repository to monitor"
+        required: false
+        default: "NVlabs/cuda-oxide"
+        type: string
+      upstream_branch:
+        description: "Branch to compare against"
+        required: false
+        default: "main"
+        type: string
+      create_issue:
+        description: "Create or update a maintenance issue when upstream is ahead"
+        required: false
+        default: true
+        type: boolean
+      max_commits:
+        description: "Maximum upstream commits to include in the summary"
+        required: false
+        default: "30"
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  monitor:
+    name: Monitor upstream main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare upstream
+        id: compare
+        shell: bash
+        env:
+          INPUT_UPSTREAM_REPOSITORY: ${{ inputs.upstream_repository || 'NVlabs/cuda-oxide' }}
+          INPUT_UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'main' }}
+          INPUT_MAX_COMMITS: ${{ inputs.max_commits || '30' }}
+        run: |
+          set -euo pipefail
+
+          upstream_repository="${INPUT_UPSTREAM_REPOSITORY}"
+          upstream_branch="${INPUT_UPSTREAM_BRANCH}"
+          max_commits="${INPUT_MAX_COMMITS}"
+          cadence="manual"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "${{ github.event.schedule }}" = "47 4 * * 1" ]; then
+              cadence="weekly"
+            else
+              cadence="daily"
+            fi
+          fi
+
+          git remote remove upstream-monitor >/dev/null 2>&1 || true
+          git remote add upstream-monitor "https://github.com/${upstream_repository}.git"
+          git fetch --tags upstream-monitor "+refs/heads/${upstream_branch}:refs/remotes/upstream-monitor/${upstream_branch}"
+
+          upstream_ref="refs/remotes/upstream-monitor/${upstream_branch}"
+          local_head="$(git rev-parse HEAD)"
+          upstream_head="$(git rev-parse "${upstream_ref}")"
+          ahead_count="$(git rev-list --count "${upstream_ref}..HEAD")"
+          behind_count="$(git rev-list --count "HEAD..${upstream_ref}")"
+          latest_tag="$(git tag --merged "${upstream_ref}" --sort=-v:refname | head -n 1 || true)"
+          commit_log="$(git log --oneline --decorate -n "${max_commits}" "HEAD..${upstream_ref}" || true)"
+
+          {
+            echo "upstream_repository=${upstream_repository}"
+            echo "upstream_branch=${upstream_branch}"
+            echo "cadence=${cadence}"
+            echo "local_head=${local_head}"
+            echo "upstream_head=${upstream_head}"
+            echo "ahead_count=${ahead_count}"
+            echo "behind_count=${behind_count}"
+            echo "latest_tag=${latest_tag}"
+            echo "commit_log<<EOF"
+            printf '%s\n' "${commit_log}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Write monitor summary
+        shell: bash
+        env:
+          COMMIT_LOG: ${{ steps.compare.outputs.commit_log }}
+        run: |
+          {
+            echo "## Upstream monitor"
+            echo
+            echo "- Cadence: ${{ steps.compare.outputs.cadence }}"
+            echo "- Upstream: ${{ steps.compare.outputs.upstream_repository }}/${{ steps.compare.outputs.upstream_branch }}"
+            echo "- Local HEAD: \`${{ steps.compare.outputs.local_head }}\`"
+            echo "- Upstream HEAD: \`${{ steps.compare.outputs.upstream_head }}\`"
+            echo "- Ahead count: ${{ steps.compare.outputs.ahead_count }}"
+            echo "- Behind count: ${{ steps.compare.outputs.behind_count }}"
+            echo "- Latest upstream tag: \`${{ steps.compare.outputs.latest_tag || 'none' }}\`"
+            echo
+            if [ "${{ steps.compare.outputs.behind_count }}" != "0" ]; then
+              echo "### Pending upstream commits"
+              echo
+              echo '```text'
+              printf '%s\n' "${COMMIT_LOG}"
+              echo '```'
+            else
+              echo "No upstream sync is pending."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Create or update upstream sync issue
+        if: steps.compare.outputs.behind_count != '0' && (github.event_name != 'workflow_dispatch' || inputs.create_issue)
+        uses: actions/github-script@v7
+        env:
+          UPSTREAM_REPOSITORY: ${{ steps.compare.outputs.upstream_repository }}
+          UPSTREAM_BRANCH: ${{ steps.compare.outputs.upstream_branch }}
+          CADENCE: ${{ steps.compare.outputs.cadence }}
+          LOCAL_HEAD: ${{ steps.compare.outputs.local_head }}
+          UPSTREAM_HEAD: ${{ steps.compare.outputs.upstream_head }}
+          AHEAD_COUNT: ${{ steps.compare.outputs.ahead_count }}
+          BEHIND_COUNT: ${{ steps.compare.outputs.behind_count }}
+          LATEST_TAG: ${{ steps.compare.outputs.latest_tag }}
+          COMMIT_LOG: ${{ steps.compare.outputs.commit_log }}
+        with:
+          script: |
+            const marker = '<!-- cuda-oxide-upstream-monitor -->';
+            const upstreamRepository = process.env.UPSTREAM_REPOSITORY;
+            const upstreamBranch = process.env.UPSTREAM_BRANCH;
+            const upstreamHead = process.env.UPSTREAM_HEAD;
+            const title = `Upstream sync available: ${upstreamRepository}/${upstreamBranch} ${upstreamHead.slice(0, 7)}`;
+            const body = [
+              marker,
+              '## Upstream sync available',
+              '',
+              `- Cadence: ${process.env.CADENCE}`,
+              `- Upstream: ${upstreamRepository}/${upstreamBranch}`,
+              `- Local HEAD: \`${process.env.LOCAL_HEAD}\``,
+              `- Upstream HEAD: \`${upstreamHead}\``,
+              `- Ahead count: ${process.env.AHEAD_COUNT}`,
+              `- Behind count: ${process.env.BEHIND_COUNT}`,
+              `- Latest upstream tag: \`${process.env.LATEST_TAG || 'none'}\``,
+              '',
+              '### Pending upstream commits',
+              '',
+              '```text',
+              process.env.COMMIT_LOG || 'No commit log was produced.',
+              '```',
+              '',
+              '### Maintainer flow',
+              '',
+              '```powershell',
+              '.\\scripts\\sync-upstream.ps1 -RunChecks',
+              '.\\scripts\\sync-upstream.ps1 -RunChecks -Push',
+              '```',
+              '',
+              'This workflow only reports drift. It does not push, move tags, publish releases, or change versions.',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const existing = issues.find((issue) =>
+              !issue.pull_request &&
+              issue.title.startsWith('Upstream sync available:') &&
+              issue.body &&
+              issue.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existing.number,
+                title,
+                body,
+              });
+              core.info(`Updated issue #${existing.number}`);
+            } else {
+              const { data: created } = await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                body,
+              });
+              core.info(`Created issue #${created.number}`);
+            }

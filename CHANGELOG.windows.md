@@ -2,13 +2,28 @@
 
 ## Unreleased
 
+- No unreleased Windows fork changes.
+
+## windows-v0.2.1 - 2026-06-14
+
 ### Upstream Baseline and Versioning
 
 - Current upstream baseline:
-  `upstream/main@26d3951f6bf5d562f37eea63832722e5f9a2a0ba`.
-- Project version remains CUDA-Oxide 0.2.0.
+  `upstream/main@cb318ad4e4e37f5e1913ed0a13478af990e857f7`.
+- Upstream release baseline: CUDA-Oxide `v0.2.1`.
+- Project version remains CUDA-Oxide 0.2.1.
 - Publish `windows-vX.Y.Z` only when upstream has released `vX.Y.Z`;
   sync-only rebuilds do not invent new project versions.
+
+### Maintenance Automation
+
+- Added a daily and weekly upstream monitor workflow for `NVlabs/cuda-oxide`
+  drift.
+- Added a weekly hosted Windows no-GPU canary for the MSVC target.
+- Kept release publishing manual so tags, artifacts, and signatures stay under
+  maintainer control.
+- Build the codegen backend in release profile on Windows to avoid MSVC debug
+  linker object-count limits.
 
 ### Supported Target
 

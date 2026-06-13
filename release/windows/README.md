@@ -7,6 +7,7 @@ subcommand and codegen backend.
 
 - `cargo-oxide.exe` - the `cargo oxide` subcommand binary.
 - `rustc_codegen_cuda.dll` - the rustc codegen backend.
+- `README.md` - this release note.
 - `smoketest.ps1` - a lightweight archive sanity check.
 
 Keep `cargo-oxide.exe` and `rustc_codegen_cuda.dll` in the same directory. The

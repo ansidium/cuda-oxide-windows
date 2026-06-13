@@ -111,7 +111,7 @@ pub fn find_or_build_backend(workspace_root: &Path) -> PathBuf {
 /// 1. `CUDA_OXIDE_BACKEND` env var, returned even when the file is missing
 ///    so the caller can report the configured-but-absent path.
 /// 2. Packaged backend next to the running `cargo-oxide` executable.
-/// 3. Local repo build path (`crates/rustc-codegen-cuda/target/debug/...`).
+/// 3. Local repo build path (`crates/rustc-codegen-cuda/target/<profile>/...`).
 /// 4. Cache path at `~/.cargo/cuda-oxide/<platform filename>`.
 ///
 /// `cargo oxide doctor` uses this so that a diagnostic run never triggers a
@@ -188,9 +188,14 @@ pub fn build_backend_from_source(codegen_crate: &Path) {
         .as_ref()
         .map(|s| rustc_sysroot_loader_dir(s, &host_target));
     let windows_libffi = is_windows.then(find_windows_libffi_paths).flatten();
+    let build_profile = backend_build_profile(&host_target);
 
     let mut cmd = Command::new("cargo");
-    cmd.args(["build"]).current_dir(codegen_crate);
+    cmd.arg("build");
+    if build_profile == "release" {
+        cmd.arg("--release");
+    }
+    cmd.current_dir(codegen_crate);
 
     if let Some(ref path) = loader_path
         && !is_windows
@@ -366,8 +371,16 @@ fn backend_filename_for_target(target: &str) -> String {
 fn backend_artifact_path(codegen_crate: &Path, target: &str) -> PathBuf {
     codegen_crate
         .join("target")
-        .join("debug")
+        .join(backend_build_profile(target))
         .join(backend_filename_for_target(target))
+}
+
+fn backend_build_profile(target: &str) -> &'static str {
+    if platform::is_windows_target(target) {
+        "release"
+    } else {
+        "debug"
+    }
 }
 
 fn rustc_sysroot_loader_dir(sysroot: &str, target: &str) -> PathBuf {
@@ -531,7 +544,7 @@ mod tests {
         assert_eq!(
             backend_artifact_path(root, "x86_64-pc-windows-msvc"),
             root.join("target")
-                .join("debug")
+                .join("release")
                 .join("rustc_codegen_cuda.dll")
         );
     }
