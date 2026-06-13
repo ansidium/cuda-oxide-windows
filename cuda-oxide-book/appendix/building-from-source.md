@@ -19,8 +19,8 @@ from a fresh checkout. If you just want to run an example, the
 
 ```{note}
 The native Windows path is experimental in this fork and does not change the
-Linux build instructions below. Windows GNU is unsupported initially. See
-[the Windows setup doc](../getting-started/windows.md) for the Windows setup
+Linux build instructions below. It targets `x86_64-pc-windows-msvc`. See the
+[Windows setup doc](../getting-started/windows.md) for the Windows setup
 checklist and [FORK.md](../../FORK.md) for fork policy.
 ```
 

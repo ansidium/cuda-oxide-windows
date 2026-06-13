@@ -18,8 +18,8 @@ This section walks through everything you need to get `cargo oxide run vecadd` w
 :::{note}
 Upstream cuda-oxide is Linux-first. This Windows-support fork keeps Linux
 upstream-compatible and adds experimental Windows 10 22H2/11 support for
-`x86_64-pc-windows-msvc`. Windows GNU is not supported initially. See the
-[Windows setup doc](windows.md) for the native Windows checklist.
+`x86_64-pc-windows-msvc`. See the [Windows setup doc](windows.md) for the
+native Windows checklist.
 :::
 
 ---

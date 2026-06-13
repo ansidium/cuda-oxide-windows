@@ -111,7 +111,7 @@ pub fn find_or_build_backend(workspace_root: &Path) -> PathBuf {
 /// 1. `CUDA_OXIDE_BACKEND` env var, returned even when the file is missing
 ///    so the caller can report the configured-but-absent path.
 /// 2. Packaged backend next to the running `cargo-oxide` executable.
-/// 3. Local repo build path (`crates/rustc-codegen-cuda/target/debug/...`).
+/// 3. Local repo build path (`crates/rustc-codegen-cuda/target/<profile>/...`).
 /// 4. Cache path at `~/.cargo/cuda-oxide/<platform filename>`.
 ///
 /// `cargo oxide doctor` uses this so that a diagnostic run never triggers a
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(
             backend_artifact_path(root, "x86_64-pc-windows-msvc"),
             root.join("target")
-                .join("debug")
+                .join("release")
                 .join("rustc_codegen_cuda.dll")
         );
     }

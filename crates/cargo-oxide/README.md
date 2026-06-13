@@ -122,14 +122,14 @@ Formats all crates in the workspace: root workspace, `rustc-codegen-cuda`, and a
 Validates that your environment is correctly set up: Rust nightly toolchain,
 CUDA headers (`cuda.h`), CUDA toolkit (`nvcc`, libNVVM, nvJitLink,
 libdevice), LLVM (`llc`), clang/libclang, the NVIDIA driver / GPU, and the
-codegen backend `.so`. Every check reports what was found or how to fix it.
+codegen backend dynamic library. Every check reports what was found or how to
+fix it.
 
 `cargo-oxide` itself builds and runs without the CUDA toolkit and without an
 NVIDIA driver, and `doctor` never builds anything first, so it works on a
 bare machine and tells you exactly what is missing. The driver / GPU check is
-informational (only `cargo oxide run` needs a GPU), and a missing backend
-`.so` just points at `cargo oxide setup` (`run`/`build` build it on demand
-anyway).
+informational (only `cargo oxide run` needs a GPU), and a missing backend just
+points at `cargo oxide setup` (`run`/`build` build it on demand anyway).
 
 ### `cargo oxide setup`
 
@@ -137,12 +137,15 @@ Explicitly builds (or rebuilds) the codegen backend. Normally this happens autom
 
 ## Backend Discovery
 
-When `cargo oxide` needs the `librustc_codegen_cuda.so` backend, it searches in this order:
+When `cargo oxide` needs the `rustc_codegen_cuda` backend dynamic library
+(`rustc_codegen_cuda.dll` on Windows, `librustc_codegen_cuda.so` on Linux), it
+searches in this order:
 
 1. **`CUDA_OXIDE_BACKEND` env var** — explicit path override
-2. **Local repo** — detects `crates/rustc-codegen-cuda` relative to workspace root, builds from source
-3. **Cached `.so`** — checks `~/.cargo/cuda-oxide/librustc_codegen_cuda.so`
-4. **Auto-fetch** — clones the cuda-oxide repo, builds, and caches (one-time)
+2. **Packaged backend** — checks next to the running `cargo-oxide` executable
+3. **Local repo** — detects `crates/rustc-codegen-cuda` relative to workspace root, builds from source
+4. **Cached backend** — checks `~/.cargo/cuda-oxide/<platform filename>`
+5. **Auto-fetch** — clones the cuda-oxide repo, builds, and caches (one-time)
 
 ## Architecture
 
