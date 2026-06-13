@@ -980,7 +980,25 @@ impl<'a> ModuleExportState<'a> {
         let op_ref = op.get_operation().deref(self.ctx);
         let asm_template = read_string_attr(op.get_attr_inline_asm_template(self.ctx));
         let constraints = read_string_attr(op.get_attr_inline_asm_constraints(self.ctx));
-        let kind = ops::asm_kind(self.ctx, op);
+        // NVVM-dialect ops carry an AsmKind tag (set by InlineAsmOpExt::build).
+        // User-written ptx_asm! ops carry separate sideeffect/convergent attrs.
+        // Resolve both into (has_sideeffect, is_convergent).
+        let kind = ops::asm_kind_opt(self.ctx, op);
+        let (has_sideeffect, is_convergent) = match kind {
+            Some(ops::AsmKind::Convergent) => (true, true),
+            Some(ops::AsmKind::ConvergentPure) => (false, true),
+            Some(ops::AsmKind::SideEffect) => (true, false),
+            Some(ops::AsmKind::Pure) => (false, false),
+            None => {
+                // ptx_asm! path: read the individual attributes.
+                let se = ops::inline_asm_sideeffect(self.ctx, op.get_operation());
+                let cv = op
+                    .get_attr_inline_asm_convergent(self.ctx)
+                    .map(|a| bool::from((*a).clone()))
+                    .unwrap_or(false);
+                (se, cv)
+            }
+        };
 
         // pliron-llvm always stores a single result slot (a void result for
         // no-value asm), so decide void vs valued by the result *type*, not the
@@ -995,14 +1013,13 @@ impl<'a> ModuleExportState<'a> {
             self.export_type(res_ty, output)?;
         }
 
-        // Emit `sideeffect` unless the asm is pure (no observable side effects).
-        let sideeffect = match kind {
-            ops::AsmKind::Pure | ops::AsmKind::ConvergentPure => "",
-            ops::AsmKind::Convergent | ops::AsmKind::SideEffect => " sideeffect",
-        };
+        write!(output, " asm").unwrap();
+        if has_sideeffect {
+            write!(output, " sideeffect").unwrap();
+        }
         let asm_template = format_string_literal(&asm_template);
         let constraints = format_string_literal(&constraints);
-        write!(output, " asm{sideeffect} {asm_template}, {constraints}(").unwrap();
+        write!(output, " {asm_template}, {constraints}(").unwrap();
         for (i, arg) in op_ref.operands().enumerate() {
             if i > 0 {
                 write!(output, ", ").unwrap();
@@ -1012,14 +1029,11 @@ impl<'a> ModuleExportState<'a> {
             self.export_value(arg, value_names, output)?;
         }
 
-        match kind {
-            ops::AsmKind::Convergent | ops::AsmKind::ConvergentPure => {
-                writeln!(output, ") #0").unwrap();
-                self.convergent_used = true;
-            }
-            ops::AsmKind::SideEffect | ops::AsmKind::Pure => {
-                writeln!(output, ")").unwrap();
-            }
+        if is_convergent {
+            writeln!(output, ") #0").unwrap();
+            self.convergent_used = true;
+        } else {
+            writeln!(output, ")").unwrap();
         }
         Ok(())
     }
