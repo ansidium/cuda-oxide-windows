@@ -14,12 +14,20 @@ concurrency:
 jobs:
   fmt:
     uses: ./.github/workflows/fmt.yml
+    with:
+      called_from_ci: true
 
   clippy:
     uses: ./.github/workflows/clippy.yml
+    with:
+      called_from_ci: true
 
   unit-tests:
     uses: ./.github/workflows/unit-tests.yml
+    with:
+      called_from_ci: true
 
   cargo-deny:
     uses: ./.github/workflows/cargo-deny.yml
+    with:
+      called_from_ci: true

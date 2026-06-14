@@ -7,10 +7,14 @@ on:
   pull_request:
     branches: [main]
   workflow_call:
+    inputs:
+      called_from_ci:
+        type: boolean
+        default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event_name == 'workflow_call' && 'child' || 'standalone' }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ inputs.called_from_ci && 'child' || 'standalone' }}
+  cancel-in-progress: ${{ !inputs.called_from_ci }}
 
 permissions:
   contents: read
