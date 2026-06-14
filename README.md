@@ -6,7 +6,7 @@
   <a href="https://github.com/ansidium/cuda-oxide-windows/actions/workflows/windows.yml"><img alt="windows" src="https://github.com/ansidium/cuda-oxide-windows/actions/workflows/windows.yml/badge.svg?branch=main"></a>
   <br>
   <br>
-  <img src="assets/windows-fork-logo.png" alt="cuda-oxide Windows-support fork logo" width="100%">
+  <img src="assets/windows-fork-logo.png" alt="cuda-oxide Windows-support fork logo" width="920">
 </p>
 
 # cuda-oxide
