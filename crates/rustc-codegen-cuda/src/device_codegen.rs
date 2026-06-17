@@ -99,8 +99,8 @@ use llvm_export::ops::{
 };
 use rustc_middle::ty::{EarlyBinder, TypingEnv};
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
-use rustc_span::{Span, hygiene};
 use rustc_session::config::DebugInfo;
+use rustc_span::{Span, hygiene};
 use std::path::PathBuf;
 
 /// Convert a rustc type to an LLVM type string for device extern declarations.
@@ -245,8 +245,9 @@ fn build_debug_source_scope_map<'tcx>(
                 );
                 let callsite = hygiene::walk_chain_collapsed(callsite, mir.span);
                 DebugInlinedScope {
-                    callee_name: rustc_middle::ty::print::with_no_trimmed_paths!(callee
-                        .to_string()),
+                    callee_name: rustc_middle::ty::print::with_no_trimmed_paths!(
+                        callee.to_string()
+                    ),
                     callsite: debug_position_from_span(tcx, callsite),
                 }
             });
@@ -300,11 +301,7 @@ fn debug_position_from_span(tcx: TyCtxt<'_>, span: Span) -> Option<DebugSourcePo
     }
 
     Some(DebugSourcePosition {
-        file: file
-            .name
-            .prefer_local_unconditionally()
-            .to_string()
-            .into(),
+        file: file.name.prefer_local_unconditionally().to_string().into(),
         line: line as i32,
         column: column as i32,
     })
@@ -543,19 +540,21 @@ pub fn generate_device_code<'tcx>(
             .zip(export_names.iter())
             .zip(debug_scope_maps.iter())
             .zip(inline_always_flags.iter())
-            .map(|(((func, (export_name, is_kernel)), debug_source_scopes), is_inline_always)| {
-                // Use rustc_internal::stable() to convert the Instance.
-                // This is the key bridge between rustc_middle and rustc_public types.
-                let stable_instance = rustc_internal::stable(func.instance);
+            .map(
+                |(((func, (export_name, is_kernel)), debug_source_scopes), is_inline_always)| {
+                    // Use rustc_internal::stable() to convert the Instance.
+                    // This is the key bridge between rustc_middle and rustc_public types.
+                    let stable_instance = rustc_internal::stable(func.instance);
 
-                mir_importer::CollectedFunction {
-                    instance: stable_instance,
-                    is_kernel: *is_kernel,
-                    export_name: export_name.clone(),
-                    debug_source_scopes: Some(debug_source_scopes.clone()),
-                    is_inline_always: *is_inline_always,
-                }
-            })
+                    mir_importer::CollectedFunction {
+                        instance: stable_instance,
+                        is_kernel: *is_kernel,
+                        export_name: export_name.clone(),
+                        debug_source_scopes: Some(debug_source_scopes.clone()),
+                        is_inline_always: *is_inline_always,
+                    }
+                },
+            )
             .collect();
 
         // Check for NVVM IR mode (set by cargo oxide --emit-nvvm-ir)
