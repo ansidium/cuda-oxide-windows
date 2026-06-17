@@ -96,7 +96,7 @@ mod kernels {
     ///
     /// `table.len()` must be a power of two (host-side invariant).
     #[kernel]
-    pub fn insert_kernel(table: &[u64], keys: &[u32], values: &[u32]) {
+    pub fn insert_kernel(table: &[DeviceAtomicU64], keys: &[u32], values: &[u32]) {
         let tid = thread::index_1d().get();
         if tid >= keys.len() {
             return;
@@ -108,7 +108,7 @@ mod kernels {
         let mut idx = (hash_u32(key) as usize) & mask;
 
         loop {
-            let slot = unsafe { DeviceAtomicU64::from_ptr(table.as_ptr().add(idx).cast_mut()) };
+            let slot = &table[idx];
 
             match slot.compare_exchange(
                 EMPTY,
@@ -148,7 +148,7 @@ mod kernels {
     /// On a fresh insert it reports `0`.
     #[kernel]
     pub fn try_insert_kernel(
-        table: &[u64],
+        table: &[DeviceAtomicU64],
         keys: &[u32],
         values: &[u32],
         mut out: DisjointSlice<u32>,
@@ -166,7 +166,7 @@ mod kernels {
         let mut idx = (hash_u32(key) as usize) & mask;
 
         loop {
-            let slot = unsafe { DeviceAtomicU64::from_ptr(table.as_ptr().add(idx).cast_mut()) };
+            let slot = &table[idx];
 
             match slot.compare_exchange(
                 EMPTY,
@@ -196,7 +196,7 @@ mod kernels {
     /// Linear-probe from `hash(key) & mask` and return the value if a key match
     /// is found, or `MISS = u32::MAX` if an EMPTY slot is hit first.
     #[kernel]
-    pub fn find_kernel(table: &[u64], keys: &[u32], mut out: DisjointSlice<u32>) {
+    pub fn find_kernel(table: &[DeviceAtomicU64], keys: &[u32], mut out: DisjointSlice<u32>) {
         let tid = thread::index_1d();
         let tid_raw = tid.get();
         let i = tid_raw;
@@ -209,7 +209,7 @@ mod kernels {
         let mut idx = (hash_u32(key) as usize) & mask;
 
         loop {
-            let slot = unsafe { DeviceAtomicU64::from_ptr(table.as_ptr().add(idx).cast_mut()) };
+            let slot = &table[idx];
             let observed = slot.load(AtomicOrdering::Acquire);
 
             if observed == EMPTY {
@@ -249,7 +249,7 @@ const FORBIDDEN_KEY: u32 = u32::MAX;
 /// inputs/outputs across the host/device boundary on the supplied stream.
 struct GpuHashMap {
     /// Device-side packed `(key, value)` slot array. Length = `capacity`.
-    slots: DeviceBuffer<u64>,
+    slots: DeviceBuffer<DeviceAtomicU64>,
     /// Number of slots. Always a power of two so `hash & (capacity - 1)`
     /// can serve as the probe-position mask.
     capacity: usize,
@@ -279,6 +279,12 @@ impl GpuHashMap {
                 stream.cu_stream(),
             )?;
         }
+
+        // View the storage as atomics so the kernels can soundly mutate it
+        // through a shared `&[DeviceAtomicU64]` (issue #151). `DeviceAtomicU64`
+        // is `#[repr(transparent)]` over `u64`, so the pointer, length, and the
+        // `0xFF`-filled bytes are all unchanged.
+        let slots = slots.cast_elem::<DeviceAtomicU64>();
 
         Ok(Self { slots, capacity })
     }

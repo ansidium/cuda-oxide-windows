@@ -234,7 +234,12 @@ pub mod kernels {
     /// `overwrite = true` (existing values for the same key are replaced
     /// last-writer-wins). Probe and reclaim mechanics live in the helper.
     #[kernel]
-    pub fn insert_kernel(ctrl: &[u32], slots: &[u64], keys: &[u32], values: &[u32]) {
+    pub fn insert_kernel(
+        ctrl: &[DeviceAtomicU32],
+        slots: &[DeviceAtomicU64],
+        keys: &[u32],
+        values: &[u32],
+    ) {
         let tid = thread::index_1d().get();
         if tid >= keys.len() {
             return;
@@ -252,8 +257,8 @@ pub mod kernels {
     ///   `out[tid] = FLAG_PRESENT (1)`      -> key was already in the table
     #[kernel]
     pub fn try_insert_kernel(
-        ctrl: &[u32],
-        slots: &[u64],
+        ctrl: &[DeviceAtomicU32],
+        slots: &[DeviceAtomicU64],
         keys: &[u32],
         values: &[u32],
         mut out: DisjointSlice<u32>,
@@ -289,7 +294,12 @@ pub mod kernels {
     /// within a warp" (the highest-rank lane has the largest input index
     /// in that warp, so its value is the most-recent for the warp).
     #[kernel]
-    pub fn insert_kernel_dedup(ctrl: &[u32], slots: &[u64], keys: &[u32], values: &[u32]) {
+    pub fn insert_kernel_dedup(
+        ctrl: &[DeviceAtomicU32],
+        slots: &[DeviceAtomicU64],
+        keys: &[u32],
+        values: &[u32],
+    ) {
         let block = this_thread_block();
         let tile = block.tiled_partition::<32>();
         let lane = tile.thread_rank();
@@ -334,21 +344,23 @@ pub mod kernels {
     /// across the old table so the host can bound the launch size without
     /// depending on cooperative-launch residency limits.
     #[kernel]
-    pub fn rehash_kernel(old_ctrl: &[u32], old_slots: &[u64], new_ctrl: &[u32], new_slots: &[u64]) {
+    pub fn rehash_kernel(
+        old_ctrl: &[DeviceAtomicU32],
+        old_slots: &[DeviceAtomicU64],
+        new_ctrl: &[DeviceAtomicU32],
+        new_slots: &[DeviceAtomicU64],
+    ) {
         let mut tid = thread::index_1d().get();
         let stride = (thread::gridDim_x() * thread::blockDim_x()) as usize;
 
         while tid < old_slots.len() {
             let ctrl_word_idx = tid / GROUP;
             let byte_in_word = tid % GROUP;
-            let ctrl_atomic = unsafe {
-                DeviceAtomicU32::from_ptr(old_ctrl.as_ptr().add(ctrl_word_idx).cast_mut())
-            };
+            let ctrl_atomic = &old_ctrl[ctrl_word_idx];
             let ctrl_word = ctrl_atomic.load(AtomicOrdering::Acquire);
             let tag = get_tag(ctrl_word, byte_in_word);
             if tag <= 0x7F {
-                let slot_atomic =
-                    unsafe { DeviceAtomicU64::from_ptr(old_slots.as_ptr().add(tid).cast_mut()) };
+                let slot_atomic = &old_slots[tid];
                 let slot = slot_atomic.load(AtomicOrdering::Acquire);
                 let _ = insert_into_table_core(
                     new_ctrl,
@@ -378,7 +390,12 @@ pub mod kernels {
     ///   - Otherwise (tile holds only FULL-mismatch + DELETED), triangular
     ///     advance and repeat. DELETED never terminates find.
     #[kernel]
-    pub fn find_kernel(ctrl: &[u32], slots: &[u64], keys: &[u32], mut out: DisjointSlice<u32>) {
+    pub fn find_kernel(
+        ctrl: &[DeviceAtomicU32],
+        slots: &[DeviceAtomicU64],
+        keys: &[u32],
+        mut out: DisjointSlice<u32>,
+    ) {
         let tid = thread::index_1d();
         let tid_raw = tid.get();
         let i_thread = tid_raw;
@@ -398,18 +415,14 @@ pub mod kernels {
             let mut has_empty = false;
             while g < PROBE_TILE {
                 let ctrl_word_idx = (probe_base + g) / GROUP;
-                let ctrl_atomic = unsafe {
-                    DeviceAtomicU32::from_ptr(ctrl.as_ptr().add(ctrl_word_idx).cast_mut())
-                };
+                let ctrl_atomic = &ctrl[ctrl_word_idx];
                 let word = ctrl_atomic.load(AtomicOrdering::Acquire);
                 let mut j = 0;
                 while j < GROUP {
                     let tag = get_tag(word, j);
                     if tag == h2 {
                         let slot_idx = probe_base + g + j;
-                        let slot_atomic = unsafe {
-                            DeviceAtomicU64::from_ptr(slots.as_ptr().add(slot_idx).cast_mut())
-                        };
+                        let slot_atomic = &slots[slot_idx];
                         let observed = slot_atomic.load(AtomicOrdering::Acquire);
                         if unpack_key(observed) == key {
                             if let Some(o) = out.get_mut(tid) {
@@ -446,7 +459,12 @@ pub mod kernels {
     ///
     /// Launch with `LaunchConfig::for_num_elems(keys.len() * 32)`.
     #[kernel]
-    pub fn find_kernel_tile_32(ctrl: &[u32], slots: &[u64], keys: &[u32], out: DisjointSlice<u32>) {
+    pub fn find_kernel_tile_32(
+        ctrl: &[DeviceAtomicU32],
+        slots: &[DeviceAtomicU64],
+        keys: &[u32],
+        out: DisjointSlice<u32>,
+    ) {
         let global_tid = thread::index_1d().get();
         find_tile_impl::<32>(ctrl, slots, keys, out, global_tid);
     }
@@ -467,7 +485,12 @@ pub mod kernels {
     ///
     /// Launch with `LaunchConfig::for_num_elems(keys.len() * 16)`.
     #[kernel]
-    pub fn find_kernel_tile_16(ctrl: &[u32], slots: &[u64], keys: &[u32], out: DisjointSlice<u32>) {
+    pub fn find_kernel_tile_16(
+        ctrl: &[DeviceAtomicU32],
+        slots: &[DeviceAtomicU64],
+        keys: &[u32],
+        out: DisjointSlice<u32>,
+    ) {
         let global_tid = thread::index_1d().get();
         find_tile_impl::<16>(ctrl, slots, keys, out, global_tid);
     }
@@ -506,8 +529,8 @@ pub mod kernels {
     /// `N = 16`. The same v3 table is queryable by either kernel.
     #[inline(always)]
     fn find_tile_impl<const N: u32>(
-        ctrl: &[u32],
-        slots: &[u64],
+        ctrl: &[DeviceAtomicU32],
+        slots: &[DeviceAtomicU64],
         keys: &[u32],
         mut out: DisjointSlice<u32>,
         global_tid: usize,
@@ -534,10 +557,7 @@ pub mod kernels {
                 let tag_pos = probe_base + sub + (lane as usize);
                 let ctrl_word_idx = tag_pos / GROUP;
                 let byte_in_word = tag_pos % GROUP;
-                let word = unsafe {
-                    DeviceAtomicU32::from_ptr(ctrl.as_ptr().add(ctrl_word_idx).cast_mut())
-                        .load(AtomicOrdering::Acquire)
-                };
+                let word = ctrl[ctrl_word_idx].load(AtomicOrdering::Acquire);
                 let tag: u8 = ((word >> (8 * byte_in_word)) & 0xFF) as u8;
 
                 let mut m_h2 = tile.ballot(tag == h2);
@@ -547,10 +567,7 @@ pub mod kernels {
                     let cand = m_h2.trailing_zeros();
                     let local_slot: u64 = if lane == cand {
                         let slot_idx = probe_base + sub + (cand as usize);
-                        unsafe {
-                            DeviceAtomicU64::from_ptr(slots.as_ptr().add(slot_idx).cast_mut())
-                                .load(AtomicOrdering::Acquire)
-                        }
+                        slots[slot_idx].load(AtomicOrdering::Acquire)
                     } else {
                         0
                     };
@@ -609,7 +626,12 @@ pub mod kernels {
     ///   `out[tid] = FLAG_FRESH_OR_OK (0)` -> deleted successfully
     ///   `out[tid] = FLAG_PRESENT (1)`     -> key was not in the table
     #[kernel]
-    pub fn delete_kernel(ctrl: &[u32], slots: &[u64], keys: &[u32], mut out: DisjointSlice<u32>) {
+    pub fn delete_kernel(
+        ctrl: &[DeviceAtomicU32],
+        slots: &[DeviceAtomicU64],
+        keys: &[u32],
+        mut out: DisjointSlice<u32>,
+    ) {
         let tid = thread::index_1d();
         let tid_raw = tid.get();
         let i_thread = tid_raw;
@@ -629,9 +651,7 @@ pub mod kernels {
             let mut g = 0usize;
             while g < PROBE_TILE {
                 let ctrl_word_idx = (probe_base + g) / GROUP;
-                let ctrl_atomic = unsafe {
-                    DeviceAtomicU32::from_ptr(ctrl.as_ptr().add(ctrl_word_idx).cast_mut())
-                };
+                let ctrl_atomic = &ctrl[ctrl_word_idx];
 
                 // Per-word retry loop: if our CAS to flip a tag to DELETED
                 // fails because someone else mutated this same word, re-read
@@ -644,9 +664,7 @@ pub mod kernels {
                         let tag = get_tag(word, j);
                         if tag == h2 {
                             let slot_idx = probe_base + g + j;
-                            let slot_atomic = unsafe {
-                                DeviceAtomicU64::from_ptr(slots.as_ptr().add(slot_idx).cast_mut())
-                            };
+                            let slot_atomic = &slots[slot_idx];
                             let observed = slot_atomic.load(AtomicOrdering::Acquire);
                             if unpack_key(observed) == key {
                                 let new_word = set_tag(word, j, DELETED_TAG);
@@ -732,8 +750,8 @@ enum ReclaimOutcome {
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn try_reclaim_deleted(
-    ctrl: &[u32],
-    slots: &[u64],
+    ctrl: &[DeviceAtomicU32],
+    slots: &[DeviceAtomicU64],
     del_word_idx: usize,
     del_j: usize,
     key: u32,
@@ -741,10 +759,9 @@ fn try_reclaim_deleted(
     h2: u8,
     overwrite: bool,
 ) -> ReclaimOutcome {
-    let ctrl_atomic =
-        unsafe { DeviceAtomicU32::from_ptr(ctrl.as_ptr().add(del_word_idx).cast_mut()) };
+    let ctrl_atomic = &ctrl[del_word_idx];
     let slot_idx = del_word_idx * GROUP + del_j;
-    let slot_atomic = unsafe { DeviceAtomicU64::from_ptr(slots.as_ptr().add(slot_idx).cast_mut()) };
+    let slot_atomic = &slots[slot_idx];
 
     loop {
         let cur = ctrl_atomic.load(AtomicOrdering::Acquire);
@@ -827,8 +844,8 @@ fn try_reclaim_deleted(
 ///     and repeat.
 #[inline(always)]
 fn insert_into_table_core(
-    ctrl: &[u32],
-    slots: &[u64],
+    ctrl: &[DeviceAtomicU32],
+    slots: &[DeviceAtomicU64],
     key: u32,
     value: u32,
     overwrite: bool,
@@ -848,17 +865,14 @@ fn insert_into_table_core(
         let mut g = 0usize;
         while g < PROBE_TILE {
             let ctrl_word_idx = (probe_base + g) / GROUP;
-            let ctrl_atomic =
-                unsafe { DeviceAtomicU32::from_ptr(ctrl.as_ptr().add(ctrl_word_idx).cast_mut()) };
+            let ctrl_atomic = &ctrl[ctrl_word_idx];
             let word = ctrl_atomic.load(AtomicOrdering::Acquire);
             let mut j = 0;
             while j < GROUP {
                 let tag = get_tag(word, j);
                 if tag == h2 {
                     let slot_idx = probe_base + g + j;
-                    let slot_atomic = unsafe {
-                        DeviceAtomicU64::from_ptr(slots.as_ptr().add(slot_idx).cast_mut())
-                    };
+                    let slot_atomic = &slots[slot_idx];
                     let observed = slot_atomic.load(AtomicOrdering::Acquire);
                     if unpack_key(observed) == key {
                         if overwrite {
@@ -902,17 +916,14 @@ fn insert_into_table_core(
         let mut g = 0usize;
         while g < PROBE_TILE {
             let ctrl_word_idx = (probe_base + g) / GROUP;
-            let ctrl_atomic =
-                unsafe { DeviceAtomicU32::from_ptr(ctrl.as_ptr().add(ctrl_word_idx).cast_mut()) };
+            let ctrl_atomic = &ctrl[ctrl_word_idx];
             let word = ctrl_atomic.load(AtomicOrdering::Acquire);
             let mut j = 0;
             while j < GROUP {
                 let tag = get_tag(word, j);
                 if tag == h2 {
                     let slot_idx = probe_base + g + j;
-                    let slot_atomic = unsafe {
-                        DeviceAtomicU64::from_ptr(slots.as_ptr().add(slot_idx).cast_mut())
-                    };
+                    let slot_atomic = &slots[slot_idx];
                     let observed = slot_atomic.load(AtomicOrdering::Acquire);
                     if unpack_key(observed) == key {
                         if overwrite {
@@ -922,9 +933,7 @@ fn insert_into_table_core(
                     }
                 } else if tag == EMPTY_TAG {
                     let slot_idx = probe_base + g + j;
-                    let slot_atomic = unsafe {
-                        DeviceAtomicU64::from_ptr(slots.as_ptr().add(slot_idx).cast_mut())
-                    };
+                    let slot_atomic = &slots[slot_idx];
                     match slot_atomic.compare_exchange(
                         EMPTY_SLOT,
                         pack(key, value),
@@ -1026,10 +1035,13 @@ pub const FORBIDDEN_KEY: u32 = u32::MAX;
 /// [`Self::insert_bulk_dedup`]; the bound is correct as a load-factor
 /// trigger but should not be treated as a key count.
 pub struct GpuSwissMap {
-    /// Packed tag bytes; 4 tags per `u32` word.
-    pub ctrl: DeviceBuffer<u32>,
-    /// Packed `(key, value)` slots — key in the upper 32 bits.
-    pub slots: DeviceBuffer<u64>,
+    /// Packed tag bytes; 4 tags per `u32` word. Element type is the
+    /// atomic wrapper so kernels can mutate it through a shared slice
+    /// without violating the `&[u32]` readonly/noalias contract.
+    pub ctrl: DeviceBuffer<DeviceAtomicU32>,
+    /// Packed `(key, value)` slots — key in the upper 32 bits. Atomic
+    /// element type for the same reason as `ctrl`.
+    pub slots: DeviceBuffer<DeviceAtomicU64>,
     /// Number of slots. Power of two, multiple of `GROUP`.
     capacity: usize,
     /// Conservative upper bound on live entries; only updated by
@@ -1069,6 +1081,11 @@ impl GpuSwissMap {
                 stream.cu_stream(),
             )?;
         }
+        // Reinterpret the allocations as slices of the atomic wrapper
+        // (`#[repr(transparent)]`, identical layout). The memset above
+        // is byte-level so it is unaffected by the element type.
+        let ctrl = ctrl.cast_elem::<DeviceAtomicU32>();
+        let slots = slots.cast_elem::<DeviceAtomicU64>();
 
         Ok(Self {
             ctrl,
@@ -1356,6 +1373,8 @@ impl GpuSwissMap {
                 stream.cu_stream(),
             )?;
         }
+        let new_ctrl = new_ctrl.cast_elem::<DeviceAtomicU32>();
+        let new_slots = new_slots.cast_elem::<DeviceAtomicU64>();
 
         let rehash_threads = self.capacity.min(REHASH_MAX_THREADS) as u32;
         let cfg = LaunchConfig::for_num_elems(rehash_threads);

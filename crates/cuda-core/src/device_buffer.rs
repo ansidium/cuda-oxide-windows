@@ -240,6 +240,37 @@ impl<T> DeviceBuffer<T> {
         let _dealloc_stream = unsafe { std::ptr::read(&this.dealloc_stream) };
         (ptr, len, ctx)
     }
+
+    /// Reinterpret the element type of this buffer as `A`.
+    ///
+    /// `A` must have the same size and alignment as `T` (e.g. `A` is
+    /// `#[repr(transparent)]` over `T`). This is the "atomic-slice launch
+    /// mapping" for issue #151: allocate and initialize a plain
+    /// `DeviceBuffer<u64>`, then hand it to a kernel that takes
+    /// `&[DeviceAtomicU64]`. The pointer, length, and bytes are unchanged;
+    /// only the element type the kernel sees changes to one whose pointee
+    /// permits shared mutation (so rustc does not mark it `readonly`/`noalias`).
+    ///
+    /// Element counts are preserved because `size_of::<A>() == size_of::<T>()`.
+    pub fn cast_elem<A>(self) -> DeviceBuffer<A> {
+        assert_eq!(
+            std::mem::size_of::<A>(),
+            std::mem::size_of::<T>(),
+            "cast_elem requires the same element size"
+        );
+        assert_eq!(
+            std::mem::align_of::<A>(),
+            std::mem::align_of::<T>(),
+            "cast_elem requires the same element alignment"
+        );
+        let (ptr, len, ctx) = self.into_raw_parts();
+        // SAFETY: `ptr` came from a valid `DeviceBuffer<T>` allocation of `len`
+        // elements; `A` has identical size and alignment, so the same allocation
+        // is a valid `DeviceBuffer<A>` of the same length and the same byte
+        // extent. Ownership transfers; the original buffer's `Drop` is
+        // suppressed by `into_raw_parts`.
+        unsafe { DeviceBuffer::<A>::from_raw_parts(ptr, len, ctx) }
+    }
 }
 
 impl<T: DeviceCopy> DeviceBuffer<T> {
