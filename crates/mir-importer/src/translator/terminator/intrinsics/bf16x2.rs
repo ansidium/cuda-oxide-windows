@@ -23,8 +23,8 @@ use rustc_public::mir;
 
 /// Emit `fma_bf16x2`: packed bf16x2 fused multiply-add.
 ///
-/// Args: `(a: u32, b: u32, c: u32)` — each carrying two packed bf16 lanes.
-/// Returns: `u32` — packed bf16x2 of `a * b + c`.
+/// Args: `(a: u32, b: u32, c: u32)`, each carrying two packed bf16 lanes.
+/// Returns: `u32`, packed bf16x2 of `a * b + c`.
 pub fn emit_fma_bf16x2(
     ctx: &mut Context,
     body: &mir::Body,

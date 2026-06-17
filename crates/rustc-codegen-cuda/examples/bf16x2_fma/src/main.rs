@@ -40,9 +40,19 @@ fn pack_bf16x2(lo: f32, hi: f32) -> u32 {
 }
 
 fn main() {
+    println!("=== bf16x2_fma ===");
     let expected = pack_bf16x2(13.0, 31.0);
 
     let ctx = CudaContext::new(0).expect("CUDA init");
+
+    // `fma.rn.bf16x2` needs sm_80+. Skip cleanly on older devices so the
+    // example does not report a hardware-capability failure as a bug.
+    let (major, minor) = ctx.compute_capability().expect("compute capability");
+    if major < 8 {
+        println!("skipping: fma.rn.bf16x2 requires sm_80+ (device is sm_{major}{minor})");
+        return;
+    }
+
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx).expect("load embedded PTX");
     let mut out = DeviceBuffer::<u32>::zeroed(&stream, 1).unwrap();
@@ -56,6 +66,8 @@ fn main() {
     println!("got:      0x{got:08x}");
 
     if got != expected {
+        println!("bf16x2_fma: FAIL");
         std::process::exit(1);
     }
+    println!("bf16x2_fma: PASS (lane0 = 2*3+7 = 13, lane1 = 4*5+11 = 31)");
 }

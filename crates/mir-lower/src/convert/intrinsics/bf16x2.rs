@@ -19,7 +19,7 @@ use pliron::result::Result;
 
 /// Convert `nvvm.fma_bf16x2` to inline PTX.
 ///
-/// `fma.rn.bf16x2 %d, %a, %b, %c;`  — per-thread arithmetic, non-convergent.
+/// `fma.rn.bf16x2 %d, %a, %b, %c;` (per-thread arithmetic, non-convergent).
 pub(crate) fn convert_fma_bf16x2(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,

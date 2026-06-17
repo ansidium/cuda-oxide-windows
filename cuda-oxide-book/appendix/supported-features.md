@@ -56,6 +56,7 @@ roadmap, **N/A** = not applicable or no identified need.
 |:--------|:-------|:------------|
 | 64-bit Arithmetic | **Full** | Full 64-bit integer arithmetic including shifts, bitwise ops, and descriptor field packing. |
 | Type Casting (all kinds) | **Full** | IntToInt, IntToFloat, FloatToInt, FloatToFloat, Transmute (bitcast), PtrToPtr, PtrToInt, IntToPtr, pointer coercions. |
+| Packed bf16x2 FMA | **Full** | `bf16x2::fma_bf16x2(a, b, c)` lowers to PTX `fma.rn.bf16x2`, two bf16 lanes per `u32`. sm_80+. |
 
 ## Compiler: Interop
 
