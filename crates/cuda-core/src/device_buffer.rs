@@ -21,6 +21,8 @@
 //! ```
 
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
+use std::num::Wrapping;
 use std::sync::Arc;
 
 use cuda_bindings::CUdeviceptr;
@@ -82,6 +84,15 @@ unsafe impl<T: DeviceCopy, const N: usize> DeviceCopy for [T; N] {}
 unsafe impl<T: ?Sized> DeviceCopy for *const T {}
 unsafe impl<T: ?Sized> DeviceCopy for *mut T {}
 
+// Wrapper types that don't change the byte representation: a value of the
+// wrapper has the same layout and validity invariants as the inner `T`.
+// `PhantomData<T>` is a zero-sized marker -- always trivially copyable
+// regardless of `T`. `MaybeUninit<T>` accepts any bit pattern by design.
+// `Wrapping<T>` is a `#[repr(transparent)]` newtype.
+unsafe impl<T: ?Sized> DeviceCopy for PhantomData<T> {}
+unsafe impl<T: DeviceCopy> DeviceCopy for MaybeUninit<T> {}
+unsafe impl<T: DeviceCopy> DeviceCopy for Wrapping<T> {}
+
 macro_rules! impl_device_copy_tuple {
     ($($name:ident),+ $(,)?) => {
         unsafe impl<$($name: DeviceCopy),+> DeviceCopy for ($($name,)+) {}
@@ -121,6 +132,15 @@ pub struct DeviceBuffer<T> {
     ptr: CUdeviceptr,
     len: usize,
     ctx: Arc<CudaContext>,
+    /// When the allocation came from the stream-ordered pool
+    /// (`cuMemAllocAsync`), this holds an `Arc` to the owning stream so the
+    /// implicit `Drop` can free it with `cuMemFreeAsync` on that same stream
+    /// (stream-ordered, race-free). `None` for synchronous (`cuMemAlloc`)
+    /// allocations, which `Drop` frees with the synchronous `cuMemFree`.
+    /// Freeing an async-pool pointer with the synchronous `cuMemFree` while
+    /// stream work is still pending is a use-after-free (compute-sanitizer:
+    /// "free-before-alloc").
+    dealloc_stream: Option<Arc<CudaStream>>,
     _marker: PhantomData<T>,
 }
 
@@ -135,8 +155,17 @@ impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if self.ptr != 0 {
             self.ctx.record_err(self.ctx.bind_to_thread());
-            self.ctx
-                .record_err(unsafe { crate::memory::free_sync(self.ptr) });
+            // Free with the allocator that matches how the memory was
+            // allocated. Stream-ordered (`cuMemAllocAsync`) memory must be
+            // released stream-ordered with `cuMemFreeAsync` on its owning
+            // stream; using the synchronous `cuMemFree` here races with
+            // pending stream work (use-after-free). Synchronous allocations
+            // free synchronously as before.
+            let result = match &self.dealloc_stream {
+                Some(stream) => unsafe { crate::memory::free_async(self.ptr, stream.cu_stream()) },
+                None => unsafe { crate::memory::free_sync(self.ptr) },
+            };
+            self.ctx.record_err(result);
         }
     }
 }
@@ -180,22 +209,36 @@ impl<T> DeviceBuffer<T> {
     ///   `len * size_of::<T>()` bytes.
     /// - `ptr` must belong to the same CUDA context as `ctx`.
     /// - The caller transfers ownership -- `ptr` will be freed on drop.
+    /// - `ptr` is assumed to be a synchronous (`cuMemAlloc`) allocation and is
+    ///   freed with the synchronous `cuMemFree` on drop. Do not pass a
+    ///   stream-ordered (`cuMemAllocAsync`) pointer here.
     pub unsafe fn from_raw_parts(ptr: CUdeviceptr, len: usize, ctx: Arc<CudaContext>) -> Self {
         Self {
             ptr,
             len,
             ctx,
+            dealloc_stream: None,
             _marker: PhantomData,
         }
     }
 
     /// Consumes the buffer and returns the raw parts without freeing.
     ///
-    /// The caller is responsible for eventually freeing `ptr`.
+    /// The caller is responsible for eventually freeing `ptr` with the
+    /// allocator that matches how it was created.
     pub fn into_raw_parts(self) -> (CUdeviceptr, usize, Arc<CudaContext>) {
-        let parts = (self.ptr, self.len, self.ctx.clone());
-        std::mem::forget(self);
-        parts
+        // Suppress the buffer's `Drop` (which would free `ptr`) while still
+        // dropping the heap-owned fields (`ctx` is moved out and returned;
+        // `dealloc_stream`'s `Arc` is dropped here so its strong count is not
+        // leaked).
+        let this = std::mem::ManuallyDrop::new(self);
+        let ptr = this.ptr;
+        let len = this.len;
+        // SAFETY: `this` is `ManuallyDrop` and is never used again, so reading
+        // out its non-`Copy` fields takes ownership without a double drop.
+        let ctx = unsafe { std::ptr::read(&this.ctx) };
+        let _dealloc_stream = unsafe { std::ptr::read(&this.dealloc_stream) };
+        (ptr, len, ctx)
     }
 }
 
@@ -475,5 +518,117 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         unsafe {
             crate::memory::memcpy_htod_async(self.ptr, src.as_ptr(), num_bytes, stream.cu_stream())
         }
+    }
+
+    /// Allocates `len` elements of uninitialized device memory, enqueued on
+    /// `stream`.
+    ///
+    /// Unlike [`Self::zeroed`], no `cuMemsetD8` is enqueued. The contents of
+    /// the returned buffer are undefined until the caller writes them.
+    ///
+    /// The buffer co-owns `stream` (via the `Arc`) so its implicit `Drop` can
+    /// release the stream-ordered allocation with `cuMemFreeAsync` on the same
+    /// stream. Call [`Self::drop_async`] to free explicitly on a chosen stream
+    /// instead.
+    ///
+    /// # Safety
+    ///
+    /// Reading from the returned buffer before any kernel or memcpy has
+    /// written it is undefined behavior.
+    pub unsafe fn uninitialized_async(
+        stream: &Arc<CudaStream>,
+        len: usize,
+    ) -> Result<Self, DriverError> {
+        let ctx = stream.context().clone();
+        let num_bytes = len * std::mem::size_of::<T>();
+        if num_bytes == 0 {
+            // SAFETY: a null pointer with zero bytes is never dereferenced
+            // and Drop/drop_async ignore it.
+            return Ok(unsafe { Self::from_raw_parts(0, len, ctx) });
+        }
+
+        let ptr = unsafe { crate::memory::malloc_async(stream.cu_stream(), num_bytes)? };
+        Ok(Self {
+            ptr,
+            len,
+            ctx,
+            dealloc_stream: Some(stream.clone()),
+            _marker: PhantomData,
+        })
+    }
+
+    /// Copies `other` into `self` device-to-device, enqueued on `stream`.
+    ///
+    /// Panics if `other.len() != self.len()`.
+    pub fn copy_from_device_async(
+        &mut self,
+        other: &DeviceBuffer<T>,
+        stream: &CudaStream,
+    ) -> Result<(), DriverError> {
+        assert_eq!(
+            self.len, other.len,
+            "device-to-device copy length mismatch: dst {} != src {}",
+            self.len, other.len
+        );
+        if self.num_bytes() == 0 {
+            return Ok(());
+        }
+        unsafe {
+            crate::memory::memcpy_dtod_async(
+                self.ptr,
+                other.ptr,
+                self.num_bytes(),
+                stream.cu_stream(),
+            )
+        }
+    }
+
+    /// Copies `src` into `self` host-to-device, enqueued on `stream`.
+    ///
+    /// The host slice must remain valid until the copy completes on `stream`.
+    /// Panics if `src.len() != self.len()`.
+    pub fn copy_from_host_async(
+        &mut self,
+        src: &[T],
+        stream: &CudaStream,
+    ) -> Result<(), DriverError> {
+        assert_eq!(
+            self.len,
+            src.len(),
+            "host-to-device copy length mismatch: dst {} != src {}",
+            self.len,
+            src.len()
+        );
+        if self.num_bytes() == 0 {
+            return Ok(());
+        }
+        unsafe {
+            crate::memory::memcpy_htod_async(
+                self.ptr,
+                src.as_ptr(),
+                self.num_bytes(),
+                stream.cu_stream(),
+            )
+        }
+    }
+
+    /// Consumes the buffer and frees it asynchronously on `stream`.
+    ///
+    /// Use this for buffers whose lifetime must be ordered relative to in-flight
+    /// stream work.
+    pub fn drop_async(self, stream: &CudaStream) -> Result<(), DriverError> {
+        let (ptr, _len, _ctx) = self.into_raw_parts();
+        if ptr == 0 {
+            return Ok(());
+        }
+        unsafe { crate::memory::free_async(ptr, stream.cu_stream()) }
+    }
+
+    /// Zeroes every byte in the buffer asynchronously on `stream`.
+    pub fn zero_async(&mut self, stream: &CudaStream) -> Result<(), DriverError> {
+        if self.num_bytes() == 0 {
+            return Ok(());
+        }
+        unsafe { crate::memory::memset_d8_async(self.ptr, 0, self.num_bytes(), stream.cu_stream()) }
     }
 }

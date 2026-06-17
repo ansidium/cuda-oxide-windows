@@ -48,15 +48,21 @@
 //! ```
 
 use crate::context::{DeviceGlobalsMap, DynamicSmemAlignmentMap, SharedGlobalsMap};
-use crate::convert::types::convert_type;
+use crate::convert::types::{convert_type, get_type_size};
 use crate::helpers;
 use dialect_mir::types::MirPtrType;
+use llvm_export::attributes::IntegerOverflowFlagsAttr;
+use llvm_export::op_interfaces::IntBinArithOpWithOverflowFlag;
 use llvm_export::ops as llvm;
 use llvm_export::ops::GlobalOpExt;
-use llvm_export::types::ArrayType;
+use llvm_export::types::{ArrayType, FuncType, VoidType};
+use pliron::attribute::AttrObj;
+use pliron::builtin::attributes::IntegerAttr;
+use pliron::builtin::op_interfaces::CallOpCallable;
 use pliron::builtin::op_interfaces::SymbolOpInterface;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
+use pliron::identifier::Identifier;
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
 use pliron::irbuild::inserter::Inserter;
 use pliron::irbuild::rewriter::Rewriter;
@@ -66,6 +72,7 @@ use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::result::Result;
 use pliron::r#type::{TypeObj, Typed};
+use pliron::utils::apint::APInt;
 
 fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
     pliron::create_error!(
@@ -95,6 +102,9 @@ pub(crate) fn convert_store(
     };
 
     let llvm_store = llvm::StoreOp::new(ctx, val, ptr);
+    if dialect_mir::ops::MirStoreOp::new(op).is_volatile(ctx) {
+        llvm_export::ops::set_op_volatile(ctx, llvm_store.get_operation(), true);
+    }
     copy_alignment(ctx, op, llvm_store.get_operation());
     rewriter.insert_operation(ctx, llvm_store.get_operation());
     rewriter.erase_operation(ctx, op);
@@ -126,6 +136,152 @@ fn copy_debug_local_variable(ctx: &mut Context, mir_op: Ptr<Operation>, llvm_op:
     }
 }
 
+/// Convert `mir.memcpy` to the matching `llvm.memcpy.p<dst>.p<src>.i<bits>`.
+///
+/// MIR's count is measured in pointee elements, while LLVM's memcpy intrinsic
+/// expects bytes. The pre-conversion destination pointer type still carries the
+/// MIR pointee, so use it to scale the count before emitting the call.
+///
+/// The intrinsic name is an overload: LLVM encodes each pointer's address
+/// space and the length width into it, and its verifier rejects a call whose
+/// argument types disagree with the name. Today every pointer reaching a
+/// `copy_nonoverlapping` is a Rust raw pointer, which cuda-oxide normalizes to
+/// the generic address space (an `addrspacecast` is inserted when the raw
+/// pointer is formed), so the operands are always `p0` and `i64`. We still
+/// derive the suffix from the real operand types rather than hardcoding
+/// `p0.p0.i64`: it matches how every other overloaded intrinsic is named here
+/// (`ctpop`, `fptosi.sat`, ...), and it keeps this lowering correct if raw
+/// pointers ever start carrying a non-generic address space.
+pub(crate) fn convert_memcpy(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    operands_info: &OperandsInfo,
+) -> Result<()> {
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    let (dst, src, count) = match operands.as_slice() {
+        [dst, src, count] => (*dst, *src, *count),
+        _ => {
+            return pliron::input_err_noloc!("Memcpy operation requires exactly 3 operands");
+        }
+    };
+
+    let pointee = {
+        let dst_ptr_ty = operands_info
+            .lookup_most_recent_of_type::<MirPtrType>(ctx, dst)
+            .ok_or_else(|| {
+                pliron::create_error!(
+                    op.deref(ctx).loc(),
+                    pliron::result::ErrorKind::VerificationFailed,
+                    pliron::result::StringError(
+                        "Memcpy destination must be a MIR pointer before lowering".to_string()
+                    )
+                )
+            })?;
+        dst_ptr_ty.pointee
+    };
+    let elem_ty = convert_type(ctx, pointee).map_err(anyhow_to_pliron)?;
+    let elem_size = get_type_size(ctx, elem_ty);
+
+    let bytes = if elem_size == 1 {
+        count
+    } else {
+        let count_ty = count.get_type(ctx);
+        let bits = count_ty
+            .deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .map(|ty| ty.width())
+            .unwrap_or(64);
+        let count_int_ty = IntegerType::get(ctx, bits, Signedness::Signless);
+        let size_attr: AttrObj = IntegerAttr::new(
+            count_int_ty,
+            APInt::from_u64(
+                elem_size,
+                std::num::NonZeroUsize::new(bits as usize).unwrap(),
+            ),
+        )
+        .into();
+        let size_const = llvm::ConstantOp::new(ctx, size_attr);
+        let size_val = size_const.get_operation().deref(ctx).get_result(0);
+        rewriter.insert_operation(ctx, size_const.get_operation());
+
+        let flags = IntegerOverflowFlagsAttr::default();
+        let mul = llvm::MulOp::new_with_overflow_flag(ctx, count, size_val, flags);
+        rewriter.insert_operation(ctx, mul.get_operation());
+        mul.get_operation().deref(ctx).get_result(0)
+    };
+
+    let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+    let false_attr: AttrObj = IntegerAttr::new(
+        i1_ty,
+        APInt::from_u64(0, std::num::NonZeroUsize::new(1).unwrap()),
+    )
+    .into();
+    let volatile = llvm::ConstantOp::new(ctx, false_attr);
+    rewriter.insert_operation(ctx, volatile.get_operation());
+    let volatile_val = volatile.get_operation().deref(ctx).get_result(0);
+
+    let void_ty = VoidType::get(ctx);
+    let func_ty = FuncType::get(
+        ctx,
+        void_ty.into(),
+        vec![
+            dst.get_type(ctx),
+            src.get_type(ctx),
+            bytes.get_type(ctx),
+            volatile_val.get_type(ctx),
+        ],
+        false,
+    );
+    let parent_block = op.deref(ctx).get_parent_block().ok_or_else(|| {
+        pliron::create_error!(
+            op.deref(ctx).loc(),
+            pliron::result::ErrorKind::VerificationFailed,
+            pliron::result::StringError("Memcpy operation has no parent block".to_string())
+        )
+    })?;
+    // Derive the overload suffix from the real (already type-converted)
+    // operands so the name can never disagree with the argument types.
+    let dst_ty = dst.get_type(ctx);
+    let dst_as = dst_ty
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::PointerType>()
+        .map(|pt| pt.address_space())
+        .unwrap_or(0);
+    let src_ty = src.get_type(ctx);
+    let src_as = src_ty
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::PointerType>()
+        .map(|pt| pt.address_space())
+        .unwrap_or(0);
+    let len_bits = bytes
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .map(|t| t.width())
+        .unwrap_or(64);
+    let intrinsic_name = format!("llvm_memcpy_p{dst_as}_p{src_as}_i{len_bits}");
+    helpers::ensure_intrinsic_declared(ctx, parent_block, &intrinsic_name, func_ty)
+        .map_err(anyhow_to_pliron)?;
+
+    let callee: Identifier = intrinsic_name.as_str().try_into().map_err(|e| {
+        pliron::create_error!(
+            op.deref(ctx).loc(),
+            pliron::result::ErrorKind::VerificationFailed,
+            pliron::result::StringError(format!("Invalid memcpy intrinsic name: {e:?}"))
+        )
+    })?;
+    let call = llvm::CallOp::new(
+        ctx,
+        CallOpCallable::Direct(callee),
+        func_ty,
+        vec![dst, src, bytes, volatile_val],
+    );
+    rewriter.insert_operation(ctx, call.get_operation());
+    rewriter.erase_operation(ctx, op);
+    Ok(())
+}
+
 /// Convert `mir.load` to `llvm.load`.
 ///
 /// Takes a single pointer operand and returns the loaded value.
@@ -141,6 +297,9 @@ pub(crate) fn convert_load(
     let llvm_ty = convert_type(ctx, result_ty).map_err(anyhow_to_pliron)?;
 
     let llvm_load = llvm::LoadOp::new(ctx, ptr, llvm_ty);
+    if dialect_mir::ops::MirLoadOp::new(op).is_volatile(ctx) {
+        llvm_export::ops::set_op_volatile(ctx, llvm_load.get_operation(), true);
+    }
     copy_alignment(ctx, op, llvm_load.get_operation());
     rewriter.insert_operation(ctx, llvm_load.get_operation());
     rewriter.replace_operation(ctx, op, llvm_load.get_operation());
@@ -894,6 +1053,38 @@ mod tests {
     }
 
     #[test]
+    fn convert_store_preserves_volatile() {
+        let mut ctx = make_ctx();
+        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into(), i32_ty], vec![]);
+        let ptr_val = block.deref(&ctx).get_argument(0);
+        let val = block.deref(&ctx).get_argument(1);
+
+        let store_op = Operation::new(
+            &mut ctx,
+            mir::MirStoreOp::get_concrete_op_info(),
+            vec![],
+            vec![ptr_val, val],
+            vec![],
+            0,
+        );
+        mir::MirStoreOp::new(store_op).set_volatile(&mut ctx, true);
+        store_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let store = find_first::<llvm::StoreOp>(&ctx, &body).unwrap();
+        assert!(
+            llvm_export::ops::op_volatile(&ctx, store.get_operation()),
+            "volatile mir.store must lower to a volatile llvm.store"
+        );
+    }
+
+    #[test]
     fn convert_load_lowers_to_llvm_load() {
         let mut ctx = make_ctx();
         let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
@@ -1082,6 +1273,37 @@ mod tests {
             dbg_values[0].get_operation().deref(&ctx).loc(),
             decl_loc,
             "debug records for source-less promoted ops should fall back to the local declaration"
+        );
+    }
+
+    #[test]
+    fn convert_load_preserves_volatile() {
+        let mut ctx = make_ctx();
+        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, false);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into()], vec![]);
+        let ptr_val = block.deref(&ctx).get_argument(0);
+
+        let load_op = Operation::new(
+            &mut ctx,
+            mir::MirLoadOp::get_concrete_op_info(),
+            vec![i32_ty],
+            vec![ptr_val],
+            vec![],
+            0,
+        );
+        mir::MirLoadOp::new(load_op).set_volatile(&mut ctx, true);
+        load_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let load = find_first::<llvm::LoadOp>(&ctx, &body).unwrap();
+        assert!(
+            llvm_export::ops::op_volatile(&ctx, load.get_operation()),
+            "volatile mir.load must lower to a volatile llvm.load"
         );
     }
 

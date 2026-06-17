@@ -903,15 +903,13 @@ fn translate_call(
         }
     }
 
-    // Handle closure trait method calls (FnOnce::call_once, FnMut::call_mut, Fn::call)
-    // These calls pass arguments as a tuple, but the closure body expects unpacked args.
-    // We need to unpack the tuple before calling the closure.
-    //
-    // MIR shows: <{closure} as FnMut<(u32,)>>::call_mut(self_ref, tuple_args)
-    // But the closure body expects: fn(self_ref, unpacked_arg1, unpacked_arg2, ...)
+    // Handle genuine closure trait method calls. The receiver test matters:
+    // wrapper ADTs can carry a closure in their generic substitutions while
+    // still expecting the rust-call tuple as one argument.
     if let Some(ref name) = pattern_name
         && (name.contains("call_once") || name.contains("call_mut") || name.ends_with("::call"))
-        && substs_contains("Closure")
+        && !args.is_empty()
+        && receiver_is_closure(&args[0], body)
     {
         return translate_closure_call(
             ctx,
@@ -1451,6 +1449,46 @@ fn translate_closure_call(
     }
 }
 
+/// True only when the rust-call receiver is itself a closure.
+///
+/// We type the operand's base local (or constant) and ignore any
+/// `place.projection`, and we peel at most one reference. Both are safe for
+/// the rust-call receiver specifically: rustc lowers a closure-trait call
+/// (`Fn::call` / `FnMut::call_mut` / `FnOnce::call_once`) so that the receiver
+/// argument is the closure passed by value, or a single `&`/`&mut` borrow of
+/// it, materialized into its own temporary local, never an in-place projection
+/// of a larger aggregate and never behind multiple references. So a closure
+/// reached through a field (`(self.f)(x)`) still arrives here as a base local
+/// of type `&{closure}`, and one `Ref` peel plus a base-local type check covers
+/// every genuine closure-call shape. A wrapper ADT that merely carries a
+/// closure in its generic substitutions (the case this guard exists to reject)
+/// has a non-closure receiver type and is correctly left on the ordinary call
+/// path with its rust-call tuple intact.
+fn receiver_is_closure(receiver: &mir::Operand, body: &mir::Body) -> bool {
+    let ty = match receiver {
+        mir::Operand::Copy(place) | mir::Operand::Move(place) => {
+            let local: usize = place.local;
+            let local_decls: Vec<_> = body.local_decls().collect();
+            match local_decls.get(local).map(|(_, decl)| decl.ty) {
+                Some(ty) => ty,
+                None => return false,
+            }
+        }
+        mir::Operand::Constant(const_op) => const_op.const_.ty(),
+        _ => return false,
+    };
+
+    let inner = match ty.kind() {
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(_, inner, _)) => inner,
+        _ => ty,
+    };
+
+    matches!(
+        inner.kind(),
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Closure(_, _))
+    )
+}
+
 /// Extracts the closure body's mangled name from a closure operand.
 ///
 /// In unified compilation with `std`, when we see a call like:
@@ -1535,14 +1573,19 @@ fn extract_closure_body_name(closure_arg: &mir::Operand, body: &mir::Body) -> Op
 ///
 /// # Naming strategy
 ///
-/// `CrateDef::name()` returns the fully qualified name (FQDN) in the `rustc_public`
-/// API (e.g. `helper_fn::cuda_oxide_device_<hash>_vecadd_device`). We use this directly as
-/// both `pattern_name` and `call_name` (for non-generic calls). The collector
-/// produces matching FQDNs, and the lowering layer (`mir-lower`) converts `::` to
-/// `__` on both sides to produce valid LLVM/PTX identifiers.
+/// `CrateDef::name()` returns the fully qualified name (FQDN) in the
+/// `rustc_public` API (e.g. `helper_fn::cuda_oxide_device_<hash>_vecadd_device`).
+/// We use the raw `FnDef` name as `pattern_name` for intrinsic matching, then
+/// use the resolved `Instance::name()` as `call_name` for monomorphic calls.
+/// Raw `FnDef` substitutions are not authoritative for this decision: concrete
+/// trait impl calls can carry a trait self type in the operand while resolving
+/// to a monomorphic instance, and the resolved impl FQDN can differ from the
+/// trait item FQDN.
 ///
-/// For generic calls, `Instance::resolve` + `mangled_name` is used instead, which
-/// the collector also matches via `compute_export_name`.
+/// For resolved instances that still carry generic args, `Instance::mangled_name`
+/// is used instead, which the collector also matches via `compute_export_name`.
+/// Non-generic FQDNs with characters such as `<`, `>`, and `::` are passed raw to
+/// the same pliron `Legaliser` used for definition symbols.
 ///
 /// Foreign items (`extern "C"` block declarations) are the exception: they
 /// have no MIR body, so the collector never exports a definition under the
@@ -1564,22 +1607,20 @@ fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Op
 
                         let pattern_name = fn_def.name().as_str().to_string();
 
-                        let has_generic_args = !substs.0.is_empty();
-                        let call_name = if has_generic_args {
-                            if let Ok(instance) = Instance::resolve(*fn_def, substs) {
+                        let resolved = Instance::resolve(*fn_def, substs).ok();
+                        let call_name = if let Some(instance) = resolved {
+                            if instance.is_foreign_item() {
+                                // Foreign items (`extern "C"` blocks) have no MIR
+                                // body, so no definition is ever exported under
+                                // the FQDN. Emit the call under the link symbol
+                                // (e.g. `__nv_asinf`), which is what libdevice or
+                                // externally linked LTOIR actually provides.
+                                instance.mangled_name()
+                            } else if !instance.args().0.is_empty() {
                                 instance.mangled_name()
                             } else {
-                                pattern_name.clone()
+                                instance.name().to_string()
                             }
-                        } else if let Ok(instance) = Instance::resolve(*fn_def, substs)
-                            && instance.is_foreign_item()
-                        {
-                            // Foreign items (`extern "C"` blocks) have no MIR
-                            // body, so no definition is ever exported under
-                            // the FQDN. Emit the call under the link symbol
-                            // (e.g. `__nv_asinf`), which is what libdevice or
-                            // externally linked LTOIR actually provides.
-                            instance.mangled_name()
                         } else {
                             pattern_name.clone()
                         };
@@ -1744,6 +1785,56 @@ fn try_dispatch_intrinsic(
                 block_map,
                 loc,
                 name,
+            )?))
+        }
+        "core::intrinsics::volatile_load" | "std::intrinsics::volatile_load" => {
+            Ok(Some(intrinsics::memory::emit_volatile_load(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
+        "core::intrinsics::volatile_store" | "std::intrinsics::volatile_store" => {
+            Ok(Some(intrinsics::memory::emit_volatile_store(
+                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
+            )?))
+        }
+
+        "core::intrinsics::ptr_offset_from" | "std::intrinsics::ptr_offset_from" => {
+            Ok(Some(intrinsics::memory::emit_ptr_offset_from(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
+
+        "core::intrinsics::ptr_offset_from_unsigned"
+        | "std::intrinsics::ptr_offset_from_unsigned" => {
+            Ok(Some(intrinsics::memory::emit_ptr_offset_from_unsigned(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
             )?))
         }
 
@@ -2918,6 +3009,22 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
+
+        // =================================================================
+        // bf16x2 packed arithmetic (from intrinsics::bf16x2)
+        // =================================================================
+        "cuda_device::bf16x2::fma_bf16x2" => Ok(Some(intrinsics::bf16x2::emit_fma_bf16x2(
+            ctx,
+            body,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
 
         // =================================================================
         // CLC - Cluster Launch Control (from intrinsics::clc)

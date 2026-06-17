@@ -17,6 +17,9 @@ roadmap, **N/A** = not applicable or no identified need.
 | HMM / Unified Memory Management | **Full** | GPU directly reads/writes host memory without `cudaMemcpy`. Reference captures in closures leverage HMM for host pointer access. Requires Turing+ GPU, Linux 6.1.24+, CUDA 12.2+. |
 | Unified Struct ABI (no `#[repr(C)]`) | **Full** | Device struct layout matches host exactly. The compiler queries rustc's actual layout and reproduces it with explicit padding in LLVM IR. Works with `#[repr(Rust)]` default. |
 | Dynamic Layout Matching | **Full** | Compiler queries rustc's `fields_by_offset_order()` and byte offsets, builds LLVM structs with correct field order and explicit padding bytes. Independent of LLVM's datalayout. |
+| Pointer Distance (`offset_from`) | **Full** | `ptr_offset_from` / `ptr_offset_from_unsigned` intrinsics (and the `offset_from`, `offset_from_unsigned`, `byte_offset_from`, `byte_offset_from_unsigned` methods) lower to an address difference divided by the rustc-reported pointee size, returning `isize` (signed) or `usize` (unsigned). Errors on a zero-sized pointee. |
+| Volatile Load/Store | **Full** | `core::ptr::read_volatile` / `write_volatile` carry an explicit volatile bit through MIR import, mem2reg (volatile accesses are never promoted), MIR-to-LLVM lowering, and textual export (`load volatile` / `store volatile`). Emits `ld.volatile` / `st.volatile` in PTX. |
+| Bulk Copy (`copy_nonoverlapping`) | **Full** | `core::ptr::copy_nonoverlapping` lowers to a `mir.memcpy` op and then `llvm.memcpy`, with the element count scaled to bytes for the pointee. The intrinsic overload suffix is derived from the operand address spaces and length width. |
 
 ## Compiler: Type System
 
@@ -25,9 +28,14 @@ roadmap, **N/A** = not applicable or no identified need.
 | Generics and Monomorphization | **Full** | Generic kernels and device functions with trait bounds. Monomorphized instances collected from rustc MIR. Const generics supported. |
 | Enums (`Option<T>`, `Result<T,E>`, custom) | **Full** | Full enum support including discriminant extraction and payload access. Pattern matching on enums works. |
 | Struct Construction and Field Access | **Full** | Struct literals, field access, pass-by-value and return values. User-defined structs supported without annotations. |
-| Array Types (`[T; N]`) | **Full** | Static array construction, constant-index and runtime-index access. Mutable arrays auto-promoted to memory-backed. |
+| Array Types (`[T; N]`) | **Full** | Static construction, constant- and runtime-index access. Array value constants (bare and nested) materialized. Mutable arrays auto-promoted to memory-backed. |
 | `CuSimd<T, N>` SIMD Type | **Full** | Generic SIMD register type with named accessors (`x`/`y`/`z`/`w`), runtime and compile-time indexing, `to_array` conversion. |
 | ABI Scalarization | **Full** | Slices are scalarized at kernel boundaries (`&[T]` -> `(ptr, len)`, reconstructed inside the function). Structs and closures pass by value as one byval `.param`; field flattening still applies on internal device-to-device calls. |
+
+Array value constants are limited to primitive leaves (integers, `f16`,
+`f32`, `f64`) and nested arrays of those. Arrays whose elements are
+structs or other ADTs are not yet materialized as constants; they need
+layout-aware field decoding rather than the primitive byte-slicing rule.
 
 ## Compiler: Closures
 
@@ -54,6 +62,7 @@ roadmap, **N/A** = not applicable or no identified need.
 |:--------|:-------|:------------|
 | 64-bit Arithmetic | **Full** | Full 64-bit integer arithmetic including shifts, bitwise ops, and descriptor field packing. |
 | Type Casting (all kinds) | **Full** | IntToInt, IntToFloat, FloatToInt, FloatToFloat, Transmute (bitcast), PtrToPtr, PtrToInt, IntToPtr, pointer coercions. |
+| Packed bf16x2 FMA | **Full** | `bf16x2::fma_bf16x2(a, b, c)` lowers to PTX `fma.rn.bf16x2`, two bf16 lanes per `u32`. sm_80+. |
 
 ## Compiler: Interop
 
@@ -70,7 +79,7 @@ roadmap, **N/A** = not applicable or no identified need.
 | Feature | Status | Description |
 |:--------|:-------|:------------|
 | `#[kernel]` Attribute | **Full** | Marks functions as GPU kernel entry points (`ptx_kernel` calling convention). Multiple kernels per file. |
-| `#[device]` Helper Functions | **Full** | Device-side helper functions callable from kernels. Inlined aggressively by `llc`. |
+| `#[device]` Helper Functions | **Full** | Device-side helper functions callable from kernels. `#[inline(always)]` is preserved as the LLVM `alwaysinline` attribute (emitted alongside the convergent group and any `!dbg` scope), so `opt` honors the inline intent. |
 | Standalone `#[device]` Functions | **Full** | Device functions compiled without any kernel present. Clean export names for C++ consumption. |
 | Multi-Kernel Modules | **Full** | Multiple `#[kernel]` functions in a single source file compile to a single PTX module. |
 

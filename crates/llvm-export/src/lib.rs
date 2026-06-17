@@ -464,6 +464,8 @@ pub mod ops {
     const DEBUG_LOCAL_SCOPE_KEY: &str = "cuda_oxide_debug_local_scope";
     const DEBUG_SOURCE_SCOPE_COUNT_KEY: &str = "cuda_oxide_debug_scope_count";
     const DEBUG_SOURCE_SCOPE_LOCATION_COUNT_KEY: &str = "cuda_oxide_debug_scope_location_count";
+    /// Op-attribute key for ordinary volatile `load` / `store` operations.
+    const OP_VOLATILE_KEY: &str = "cuda_oxide_op_volatile";
 
     /// Stamp the ABI alignment (bytes) onto a memory op.
     pub fn set_op_alignment(ctx: &mut Context, op: Ptr<Operation>, align: u32) {
@@ -865,6 +867,23 @@ pub mod ops {
         fn verify(&self, _ctx: &Context) -> Result<(), Error> {
             Ok(())
         }
+    }
+
+    /// Stamp volatile memory semantics onto an ordinary LLVM load/store op.
+    pub fn set_op_volatile(ctx: &mut Context, op: Ptr<Operation>, volatile: bool) {
+        let key = Identifier::try_new(OP_VOLATILE_KEY.to_string()).expect("valid identifier");
+        op.deref_mut(ctx)
+            .attributes
+            .set(key, BoolAttr::new(volatile));
+    }
+
+    /// Read the volatile flag stamped on an ordinary LLVM load/store op.
+    pub fn op_volatile(ctx: &Context, op: Ptr<Operation>) -> bool {
+        let key = Identifier::try_new(OP_VOLATILE_KEY.to_string()).expect("valid identifier");
+        op.deref(ctx)
+            .attributes
+            .get::<BoolAttr>(&key)
+            .is_some_and(|attr| bool::from(attr.clone()))
     }
 
     /// Alignment helpers re-homed from the pre-migration local `GlobalOp`.

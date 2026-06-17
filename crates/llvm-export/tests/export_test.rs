@@ -13,7 +13,7 @@ use llvm_export::{
         AddressOfOp, AllocaOp, BrOp, CallOp, ConstantOp, DebugLocalTypeKind,
         DebugLocalVariableInfo, DebugSourcePosition, DebugSourceScope, DebugSourceScopeLocation,
         DebugSourceScopeMap, DebugValueOp, FuncOp, GepIndex, GetElementPtrOp, GlobalOp,
-        InlineAsmOp, ReturnOp,
+        InlineAsmOp, LoadOp, ReturnOp, StoreOp,
     },
     types::{FuncType, PointerType, VoidType},
 };
@@ -25,7 +25,7 @@ use pliron::{
         ops::ModuleOp,
         types::{IntegerType, Signedness},
     },
-    context::Context,
+    context::{Context, Ptr},
     identifier::Identifier,
     linked_list::ContainsLinkedList,
     location::{Located, Location, Source},
@@ -74,6 +74,96 @@ fn src_location(ctx: &mut Context, file: &str, line: i32, column: i32) -> Locati
         src: Source::new_from_file(ctx, PathBuf::from(file)),
         pos: SourcePosition { line, column },
     }
+}
+
+fn module_top_block(ctx: &mut Context, module: &ModuleOp) -> Ptr<BasicBlock> {
+    let module_region = module.get_operation().deref(ctx).get_region(0);
+    {
+        let region = module_region.deref(ctx);
+        if let Some(block) = region.iter(ctx).next() {
+            return block;
+        }
+    }
+
+    let block = BasicBlock::new(ctx, None, vec![]);
+    block.insert_at_back(module_region, ctx);
+    block
+}
+
+#[test]
+fn export_volatile_load_prints_keyword() {
+    let mut ctx = Context::new();
+
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+    let ptr_ty = PointerType::get(&mut ctx, 0);
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&mut ctx, void_ty.to_ptr(), vec![ptr_ty.to_ptr()], false);
+    let func = FuncOp::new(&mut ctx, "volatile_load_test".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let ptr = entry.deref(&ctx).get_argument(0);
+
+    let load = LoadOp::new(&mut ctx, ptr, i32_ty.to_ptr());
+    llvm_export::ops::set_op_volatile(&mut ctx, load.get_operation(), true);
+    load.get_operation().insert_at_back(entry, &ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string(&ctx, &module).expect("export succeeds");
+    let line = ir
+        .lines()
+        .find(|line| line.contains("load volatile"))
+        .expect("volatile load line");
+
+    assert!(
+        line.trim_start().contains(" = load volatile i32, ptr "),
+        "volatile load keyword must appear immediately after load:\n{ir}"
+    );
+}
+
+#[test]
+fn export_volatile_store_prints_keyword() {
+    let mut ctx = Context::new();
+
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+    let ptr_ty = PointerType::get(&mut ctx, 0);
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(
+        &mut ctx,
+        void_ty.to_ptr(),
+        vec![ptr_ty.to_ptr(), i32_ty.to_ptr()],
+        false,
+    );
+    let func = FuncOp::new(&mut ctx, "volatile_store_test".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let ptr = entry.deref(&ctx).get_argument(0);
+    let val = entry.deref(&ctx).get_argument(1);
+
+    let store = StoreOp::new(&mut ctx, val, ptr);
+    llvm_export::ops::set_op_volatile(&mut ctx, store.get_operation(), true);
+    store.get_operation().insert_at_back(entry, &ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string(&ctx, &module).expect("export succeeds");
+    let line = ir
+        .lines()
+        .find(|line| line.contains("store volatile"))
+        .expect("volatile store line");
+
+    assert!(
+        line.trim_start().starts_with("store volatile i32 "),
+        "volatile store keyword must appear immediately after store:\n{ir}"
+    );
 }
 
 #[test]
@@ -371,6 +461,89 @@ fn line_table_debug_metadata_emits_function_scope_and_instruction_locations() {
     assert!(
         ir.contains("!DILocation(line: 8, column: 5, scope: !"),
         "instruction location should preserve the source line and column:\n{ir}"
+    );
+}
+
+#[test]
+fn export_alwaysinline_function_attribute_uses_llvm_define_syntax() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&mut ctx, void_ty.to_ptr(), vec![], false);
+    let func = FuncOp::new(&mut ctx, "inline_helper".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+
+    let key: pliron::identifier::Identifier = "alwaysinline".try_into().unwrap();
+    func.get_operation()
+        .deref_mut(&ctx)
+        .attributes
+        .set(key, StringAttr::new("true".to_string()));
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string(&ctx, &module).expect("export succeeds");
+    let define_line = ir
+        .lines()
+        .find(|line| line.starts_with("define void @inline_helper("))
+        .expect("inline helper definition");
+    assert_eq!(
+        define_line, "define void @inline_helper() alwaysinline #0 {",
+        "`alwaysinline` must be emitted after the parameter list, before attr group #0:\n{ir}"
+    );
+    assert!(
+        ir.contains("attributes #0 = { convergent }"),
+        "convergent attribute group must still be emitted:\n{ir}"
+    );
+}
+
+#[test]
+fn export_alwaysinline_coexists_with_debug_scope() {
+    // alwaysinline and the !dbg scope are emitted on the same define line and
+    // must not crowd each other out. This guards the 4-way emission: a future
+    // change that drops either one when both are present fails here.
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&mut ctx, void_ty.to_ptr(), vec![], false);
+    let func = FuncOp::new(&mut ctx, "inline_helper".try_into().unwrap(), func_ty);
+    let func_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/kernel.rs", 7, 1);
+    func.get_operation().deref_mut(&ctx).set_loc(func_loc);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let ret = ReturnOp::new(&mut ctx, None);
+    let ret_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/kernel.rs", 8, 5);
+    ret.get_operation().deref_mut(&ctx).set_loc(ret_loc);
+    ret.get_operation().insert_at_back(entry, &ctx);
+
+    let key: pliron::identifier::Identifier = "alwaysinline".try_into().unwrap();
+    func.get_operation()
+        .deref_mut(&ctx)
+        .attributes
+        .set(key, StringAttr::new("true".to_string()));
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let config = DebugConfig {
+        inner: PtxExportConfig,
+        debug_kind: DebugKind::LineTables,
+    };
+    let ir =
+        export_module_to_string_with_config(&ctx, &module, &config).expect("debug export succeeds");
+    let define_line = ir
+        .lines()
+        .find(|line| line.starts_with("define void @inline_helper("))
+        .expect("inline helper definition");
+    assert!(
+        define_line.contains("alwaysinline"),
+        "alwaysinline must survive when debug info is on:\n{ir}"
+    );
+    assert!(
+        define_line.contains("!dbg !"),
+        "!dbg scope must survive when alwaysinline is present:\n{ir}"
     );
 }
 
@@ -1221,5 +1394,62 @@ fn assert_no_undefined_temporaries(ir: &str) {
     assert!(
         undefined.is_empty(),
         "IR references undefined SSA temporaries: {undefined:?}\nIR:\n{ir}"
+    );
+}
+
+/// A float binop carrying `FastmathFlags` must export with the matching LLVM
+/// fast-math keyword (`fast` for the all-bits set), while a float binop with no
+/// flags must export with none. Regression guard: the textual exporter
+/// previously dropped fast-math flags entirely, making the `f*_fast` intrinsic
+/// lowering inert end to end.
+#[test]
+fn export_emits_fast_math_flags_only_on_flagged_float_ops() {
+    use llvm_export::attributes::FastmathFlags;
+    use llvm_export::op_interfaces::{BinArithOp, FloatBinArithOpWithFastMathFlags};
+    use llvm_export::ops::{FAddOp, FMulOp};
+    use pliron::builtin::types::FP32Type;
+
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_region = module.get_operation().deref(&ctx).get_region(0);
+    let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+
+    let f32_ty = FP32Type::get(&ctx);
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(
+        &mut ctx,
+        void_ty.to_ptr(),
+        vec![f32_ty.into(), f32_ty.into()],
+        false,
+    );
+    let func = FuncOp::new(&mut ctx, "fast_math".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let a = entry.deref(&ctx).get_argument(0);
+    let b = entry.deref(&ctx).get_argument(1);
+
+    // fadd with the full fast-math set.
+    let fadd = FAddOp::new_with_fast_math_flags(&mut ctx, a, b, FastmathFlags::FAST.into());
+    fadd.get_operation().insert_at_back(entry, &ctx);
+    // fmul with no flags: must stay flag-free.
+    let fmul = FMulOp::new(&mut ctx, a, b);
+    fmul.get_operation().insert_at_back(entry, &ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string(&ctx, &module).expect("export succeeds");
+
+    assert!(
+        ir.contains("fadd fast float"),
+        "fast-math fadd must export the `fast` keyword:\n{ir}"
+    );
+    let fmul_line = ir
+        .lines()
+        .find(|line| line.contains("fmul"))
+        .expect("exported fmul line");
+    assert!(
+        !fmul_line.contains("fast"),
+        "a float binop with no fast-math flags must not gain them:\n{ir}"
     );
 }

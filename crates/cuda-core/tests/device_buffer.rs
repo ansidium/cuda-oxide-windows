@@ -58,3 +58,76 @@ fn device_buffer_supports_empty_allocations() {
     assert_eq!(dev_buf_host.num_bytes(), 0);
     assert!(dev_buf_host.is_empty());
 }
+
+#[test]
+fn device_buffer_async_compat_methods_roundtrip() {
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+
+    let data = [7_u32, 11, 13, 17];
+    let mut dev = unsafe { DeviceBuffer::<u32>::uninitialized_async(&stream, data.len()) }
+        .expect("failed to allocate uninitialized device buffer");
+    dev.copy_from_host_async(&data, &stream)
+        .expect("failed to copy host data into device buffer");
+
+    let mut clone = unsafe { DeviceBuffer::<u32>::uninitialized_async(&stream, data.len()) }
+        .expect("failed to allocate clone device buffer");
+    clone
+        .copy_from_device_async(&dev, &stream)
+        .expect("failed to copy device buffer");
+    assert_eq!(
+        clone
+            .to_host_vec(&stream)
+            .expect("failed to copy clone back to host"),
+        data
+    );
+
+    clone
+        .zero_async(&stream)
+        .expect("failed to zero device buffer");
+    assert_eq!(
+        clone
+            .to_host_vec(&stream)
+            .expect("failed to copy zeroed buffer back to host"),
+        [0, 0, 0, 0]
+    );
+
+    clone
+        .drop_async(&stream)
+        .expect("failed to async free clone");
+    dev.drop_async(&stream)
+        .expect("failed to async free source");
+
+    let empty = unsafe { DeviceBuffer::<u8>::uninitialized_async(&stream, 0) }
+        .expect("failed to allocate empty uninitialized device buffer");
+    empty
+        .drop_async(&stream)
+        .expect("failed to async free empty buffer");
+    stream.synchronize().expect("stream sync failed");
+}
+
+// Dangerous-path regression: a stream-ordered (`cuMemAllocAsync`) buffer that
+// is dropped *implicitly* while a copy is still in flight, with NO explicit
+// synchronization. The buffer co-owns its stream, so `Drop` frees it with
+// `cuMemFreeAsync` on that same stream (stream-ordered, race-free) instead of
+// the synchronous `cuMemFree`. Run under `compute-sanitizer --tool memcheck`
+// to catch a regression: pairing async-pool allocation with the synchronous
+// free reports "free-before-alloc" here.
+#[test]
+fn uninitialized_async_implicit_drop_is_stream_ordered() {
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+
+    let n = 1 << 20; // 4 MiB of u32
+    let src = DeviceBuffer::<u32>::zeroed(&stream, n).expect("failed to allocate source buffer");
+    for _ in 0..64 {
+        let mut dst = unsafe { DeviceBuffer::<u32>::uninitialized_async(&stream, n) }
+            .expect("failed to allocate uninitialized device buffer");
+        // Enqueue a large async device-to-device copy, then let `dst` drop
+        // immediately with no `stream.synchronize()` in between.
+        dst.copy_from_device_async(&src, &stream)
+            .expect("failed to enqueue device-to-device copy");
+        drop(dst);
+    }
+    stream.synchronize().expect("stream sync failed");
+}

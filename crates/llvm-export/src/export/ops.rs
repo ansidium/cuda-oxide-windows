@@ -25,9 +25,10 @@ use pliron::{
 
 use crate::{
     attributes::{
-        AtomicOrderingAttr, AtomicRmwKindAttr, FCmpPredicateAttr, FPHalfAttr, GepIndexAttr,
-        ICmpPredicateAttr,
+        AtomicOrderingAttr, AtomicRmwKindAttr, FCmpPredicateAttr, FPHalfAttr, FastmathFlags,
+        FastmathFlagsAttr, GepIndexAttr, ICmpPredicateAttr,
     },
+    op_interfaces::ATTR_KEY_FAST_MATH_FLAGS,
     ops,
     types::{FuncType, VoidType},
 };
@@ -485,8 +486,13 @@ impl<'a> ModuleExportState<'a> {
         let res_name = value_names.get(&res).unwrap();
         let ty = res.get_type(self.ctx);
         let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
+        let volatile_kw = if crate::ops::op_volatile(self.ctx, op.get_operation()) {
+            "volatile "
+        } else {
+            ""
+        };
 
-        write!(output, "  {res_name} = load ").unwrap();
+        write!(output, "  {res_name} = load {volatile_kw}").unwrap();
         self.export_type(ty, output)?;
         write!(output, ", {}", ptr_qualifier(addrspace)).unwrap();
         self.export_value(ptr, value_names, output)?;
@@ -507,8 +513,13 @@ impl<'a> ModuleExportState<'a> {
         let ptr = op_ref.get_operand(1);
         let val_ty = val.get_type(self.ctx);
         let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
+        let volatile_kw = if crate::ops::op_volatile(self.ctx, op.get_operation()) {
+            "volatile "
+        } else {
+            ""
+        };
 
-        write!(output, "  store ").unwrap();
+        write!(output, "  store {volatile_kw}").unwrap();
         self.export_type(val_ty, output)?;
         write!(output, " ").unwrap();
         self.export_value(val, value_names, output)?;
@@ -1149,7 +1160,21 @@ impl<'a> ModuleExportState<'a> {
         let rhs = op_ref.get_operand(1);
         let res_name = value_names.get(&res).unwrap();
 
+        // Float binops (fadd/fsub/fmul/fdiv/frem) may carry fast-math flags;
+        // they are emitted right after the opcode (e.g. `fadd fast float ...`).
+        // Integer binops never carry the attribute, and float ops lowered from
+        // ordinary Rust arithmetic carry empty flags, so this is a no-op for
+        // every existing op and only fires for the `f*_fast` intrinsics.
+        let fast_math = op_ref
+            .attributes
+            .get::<FastmathFlagsAttr>(&ATTR_KEY_FAST_MATH_FLAGS)
+            .map(|attr| attr.0)
+            .unwrap_or_else(FastmathFlags::empty);
+
         write!(output, "  {res_name} = {op_name} ").unwrap();
+        if !fast_math.is_empty() {
+            write!(output, "{} ", fastmath_keywords(fast_math)).unwrap();
+        }
         self.export_type(lhs.get_type(self.ctx), output)?;
         write!(output, " ").unwrap();
         self.export_value(lhs, value_names, output)?;
@@ -1195,6 +1220,40 @@ impl<'a> ModuleExportState<'a> {
         }
         Ok(())
     }
+}
+
+/// Render LLVM fast-math flag keywords for the given flag set.
+///
+/// The all-bits set (`FastmathFlags::FAST`) prints as the `fast` shorthand;
+/// any proper subset prints the individual keywords in LLVM's canonical order.
+/// Callers only emit this when the set is non-empty.
+fn fastmath_keywords(flags: FastmathFlags) -> String {
+    if flags.contains(FastmathFlags::FAST) {
+        return "fast".to_string();
+    }
+    let mut parts = Vec::new();
+    if flags.contains(FastmathFlags::NNAN) {
+        parts.push("nnan");
+    }
+    if flags.contains(FastmathFlags::NINF) {
+        parts.push("ninf");
+    }
+    if flags.contains(FastmathFlags::NSZ) {
+        parts.push("nsz");
+    }
+    if flags.contains(FastmathFlags::ARCP) {
+        parts.push("arcp");
+    }
+    if flags.contains(FastmathFlags::CONTRACT) {
+        parts.push("contract");
+    }
+    if flags.contains(FastmathFlags::AFN) {
+        parts.push("afn");
+    }
+    if flags.contains(FastmathFlags::REASSOC) {
+        parts.push("reassoc");
+    }
+    parts.join(" ")
 }
 
 /// Return the address space of a pointer type, or 0 for non-pointer types.
