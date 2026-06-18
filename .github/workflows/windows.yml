@@ -71,6 +71,10 @@ jobs:
             $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append
           }
 
+      - name: Install libffi
+        shell: pwsh
+        run: .\.github\scripts\install-libffi.ps1
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -125,6 +129,10 @@ jobs:
             "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
             $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append
           }
+
+      - name: Install libffi
+        shell: pwsh
+        run: .\.github\scripts\install-libffi.ps1
 
       - name: Build codegen backend
         run: cargo oxide setup

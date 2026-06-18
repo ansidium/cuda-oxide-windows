@@ -26,6 +26,7 @@
 //! re-clones fresh and rebuilds, rather than rebuilding from a clone that
 //! was taken whenever the user first installed.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -436,13 +437,38 @@ fn find_windows_libffi_paths() -> Option<WindowsLibffiPaths> {
 }
 
 fn windows_vcpkg_roots() -> Vec<PathBuf> {
+    windows_vcpkg_roots_from_env(std::env::var_os("VCPKG_ROOT"), std::env::var_os("PATH"))
+}
+
+fn windows_vcpkg_roots_from_env(
+    vcpkg_root: Option<OsString>,
+    path: Option<OsString>,
+) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(root) = std::env::var_os("VCPKG_ROOT").map(PathBuf::from) {
+    if let Some(root) = vcpkg_root.map(PathBuf::from).filter(|root| root.is_dir()) {
         push_unique_path(&mut roots, root);
     }
-    push_unique_path(&mut roots, PathBuf::from(r"C:\BuildData\tools\vcpkg"));
-    push_unique_path(&mut roots, PathBuf::from(r"C:\vcpkg"));
+
+    if let Some(path) = path {
+        for dir in std::env::split_paths(&path) {
+            if vcpkg_executable_names()
+                .iter()
+                .any(|name| dir.join(name).is_file())
+            {
+                push_unique_path(&mut roots, dir);
+            }
+        }
+    }
+
     roots
+}
+
+fn vcpkg_executable_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["vcpkg.exe", "vcpkg"]
+    } else {
+        &["vcpkg"]
+    }
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -600,6 +626,22 @@ mod tests {
                 bin_dir: Some(bin_dir)
             })
         );
+    }
+
+    #[test]
+    fn windows_vcpkg_roots_uses_env_and_path_only() {
+        let env_root = tempdir();
+        let path_root = tempdir();
+        let exe_name = vcpkg_executable_names()[0];
+        std::fs::write(path_root.join(exe_name), b"vcpkg").unwrap();
+        let path = std::env::join_paths([path_root.clone()]).unwrap();
+
+        assert_eq!(
+            windows_vcpkg_roots_from_env(Some(env_root.clone().into_os_string()), Some(path)),
+            vec![env_root, path_root]
+        );
+
+        assert!(windows_vcpkg_roots_from_env(None, None).is_empty());
     }
 
     #[test]

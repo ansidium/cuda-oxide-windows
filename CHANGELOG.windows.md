@@ -5,8 +5,9 @@
 - Synced `main` onto
   `upstream/main@56b843f618d973aef6ae4cb613b590008df09a70`.
 - Strengthened the hosted Windows no-GPU canary so the regular `windows`
-  workflow builds the codegen backend and compile-checks `vecadd` with
-  `cargo oxide build vecadd --arch sm_75`.
+  workflow installs `libffi:x64-windows` through a temporary vcpkg manifest,
+  seeds that manifest with the runner's vcpkg baseline, builds the codegen
+  backend, and compile-checks `vecadd` with `cargo oxide build vecadd --arch sm_75`.
 - Resolved upstream-sync fallout around `DeviceBuffer` field initialization
   after upstream's async-free changes.
 - No new Windows release was published; the upstream release baseline remains

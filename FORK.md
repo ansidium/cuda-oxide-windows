@@ -158,8 +158,10 @@ from upstream:
 - Files/area: Windows CI, cargo-oxide backend loader-path handling, and
   cuda-core sync repair.
 - Intentional divergence: keep the Windows support layer rebased on current
-  upstream while strengthening the hosted no-GPU Windows canary to build the
-  codegen backend and compile-check `vecadd`.
+  upstream while strengthening the hosted no-GPU Windows canary to install
+  `libffi:x64-windows` through a temporary vcpkg manifest seeded with the
+  runner's vcpkg baseline, build the codegen backend, and compile-check
+  `vecadd`.
 - Linux impact: intended to be none. The sync repair preserves the existing
   `DeviceBuffer` behavior while filling fields required by upstream's
   async-free model.
