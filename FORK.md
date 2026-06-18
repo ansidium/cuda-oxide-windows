@@ -150,6 +150,25 @@ from upstream:
 
 ## Current Divergence Log
 
+## 2026-06-18 - Upstream sync and stronger Windows canary
+
+- Branch: `main` Windows release fork branch tracking `upstream/main`.
+- Upstream baseline: `upstream/main@56b843f618d973aef6ae4cb613b590008df09a70`,
+  CUDA-Oxide 0.2.1.
+- Files/area: Windows CI, cargo-oxide backend loader-path handling, and
+  cuda-core sync repair.
+- Intentional divergence: keep the Windows support layer rebased on current
+  upstream while strengthening the hosted no-GPU Windows canary to build the
+  codegen backend and compile-check `vecadd`.
+- Linux impact: intended to be none. The sync repair preserves the existing
+  `DeviceBuffer` behavior while filling fields required by upstream's
+  async-free model.
+- Windows validation: `cargo oxide setup` built
+  `rustc_codegen_cuda.dll` in release profile, and
+  `cargo oxide build vecadd --arch sm_75` completed successfully.
+- Follow-up: no new `windows-vX.Y.Z` release is needed until upstream publishes
+  a new CUDA-Oxide release baseline.
+
 ## 2026-06-14 - Windows support layer
 
 - Branch: `main` Windows release fork branch tracking `upstream/main`.
