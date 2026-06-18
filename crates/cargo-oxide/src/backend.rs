@@ -199,10 +199,9 @@ pub fn build_backend_from_source(codegen_crate: &Path) {
 
     if let Some(ref path) = loader_path
         && !is_windows
+        && let Some(value) = platform::append_env_paths("LIBRARY_PATH", vec![path.clone()])
     {
-        if let Some(value) = platform::append_env_paths("LIBRARY_PATH", vec![path.clone()]) {
-            cmd.env("LIBRARY_PATH", value);
-        }
+        cmd.env("LIBRARY_PATH", value);
     }
 
     let loader_env = platform::loader_env_var(&host_target);

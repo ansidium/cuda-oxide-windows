@@ -342,6 +342,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             len,
             num_bytes,
             ctx,
+            dealloc_stream: None,
             _marker: PhantomData,
         })
     }
@@ -407,6 +408,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             len,
             num_bytes,
             ctx,
+            dealloc_stream: None,
             _marker: PhantomData,
         })
     }
@@ -604,7 +606,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         len: usize,
     ) -> Result<Self, DriverError> {
         let ctx = stream.context().clone();
-        let num_bytes = len * std::mem::size_of::<T>();
+        let num_bytes = crate::memory::allocation_size::<T>(len)?;
         if num_bytes == 0 {
             // SAFETY: a null pointer with zero bytes is never dereferenced
             // and Drop/drop_async ignore it.
@@ -615,6 +617,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         Ok(Self {
             ptr,
             len,
+            num_bytes,
             ctx,
             dealloc_stream: Some(stream.clone()),
             _marker: PhantomData,
