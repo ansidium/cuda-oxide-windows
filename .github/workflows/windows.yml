@@ -33,7 +33,7 @@ jobs:
   windows-msvc-no-gpu:
     name: windows-latest MSVC no-GPU canary
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Clone repository
@@ -79,6 +79,12 @@ jobs:
 
       - name: Test oxide-artifacts object feature
         run: cargo test -p oxide-artifacts --features object
+
+      - name: Build codegen backend
+        run: cargo oxide setup
+
+      - name: Compile vecadd
+        run: cargo oxide build vecadd --arch sm_75
 
   windows-cuda-compile:
     name: Windows CUDA compile (manual best effort)
