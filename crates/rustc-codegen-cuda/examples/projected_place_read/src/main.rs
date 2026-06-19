@@ -15,8 +15,20 @@
 //! Run: cargo oxide run projected_place_read
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
-use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_device::{DisjointSlice, device, kernel, thread};
 use cuda_host::cuda_module;
+
+#[derive(Clone, Copy)]
+pub struct Point {
+    x: f64,
+    y: f64,
+}
+
+#[device]
+#[inline(never)]
+pub fn read_point(point: &Point) -> f64 {
+    point.x + point.y
+}
 
 #[cuda_module]
 mod kernels {
@@ -52,6 +64,29 @@ mod kernels {
             *slot = value;
         }
     }
+
+    /// Struct field reads through a reference.
+    ///
+    /// This pins the broader read model after the #231 fix: field reads that
+    /// have a real backing address should use `Deref -> Field`, then emit one
+    /// final scalar load for each field.
+    #[kernel]
+    pub fn projected_read_struct_field(x_arg: usize, y_arg: usize, mut out: DisjointSlice<f64>) {
+        let idx = thread::index_1d();
+        if idx.get() != 0 {
+            return;
+        }
+
+        let point = Point {
+            x: x_arg as f64,
+            y: y_arg as f64,
+        };
+        let value = read_point(&point);
+
+        if let Some(slot) = out.get_mut(idx) {
+            *slot = value;
+        }
+    }
 }
 
 fn main() {
@@ -75,6 +110,25 @@ fn main() {
     assert!(
         (out[0] - 3.0_f64).abs() < 1e-12,
         "projected_read_2d: got {}, want 3.0",
+        out[0]
+    );
+
+    // value = 6 + 5 = 11
+    let mut out_dev = DeviceBuffer::<f64>::zeroed(&stream, 1).unwrap();
+    module
+        .projected_read_struct_field(
+            &stream,
+            LaunchConfig::for_num_elems(1),
+            6usize,
+            5usize,
+            &mut out_dev,
+        )
+        .expect("projected_read_struct_field launch");
+
+    let out = out_dev.to_host_vec(&stream).unwrap();
+    assert!(
+        (out[0] - 11.0_f64).abs() < 1e-12,
+        "projected_read_struct_field: got {}, want 11.0",
         out[0]
     );
 
