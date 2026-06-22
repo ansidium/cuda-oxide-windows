@@ -4,9 +4,8 @@
 
 - Merged `main` with
   `upstream/main@d63a0a8d3fef2db450ee342bdcd862a7829c3cbb`.
-- Added a weekly upstream sync candidate workflow that opens a review PR from a
-  `custom/upstream-sync-*` branch without pushing `main`, moving tags, or
-  changing versions.
+- Added a weekly upstream sync workflow for `main`; failed syncs open or update
+  one issue.
 - Strengthened the hosted Windows no-GPU canary so the regular `windows`
   workflow installs `libffi:x64-windows` through a temporary vcpkg manifest,
   seeds that manifest with the runner's vcpkg baseline, builds the codegen

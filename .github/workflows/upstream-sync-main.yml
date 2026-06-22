@@ -1,0 +1,272 @@
+---
+name: upstream-sync-main
+
+on:
+  schedule:
+    # Weekly sync, after the Monday drift monitor.
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    name: Sync upstream into main
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Compare upstream
+        id: compare
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git checkout -B main origin/main
+          git remote remove upstream >/dev/null 2>&1 || true
+          git remote add upstream https://github.com/NVlabs/cuda-oxide.git
+          git fetch --tags upstream "+refs/heads/main:refs/remotes/upstream/main"
+
+          upstream_ref="refs/remotes/upstream/main"
+          local_head="$(git rev-parse HEAD)"
+          upstream_head="$(git rev-parse "${upstream_ref}")"
+          ahead_count="$(git rev-list --count "${upstream_ref}..HEAD")"
+          behind_count="$(git rev-list --count "HEAD..${upstream_ref}")"
+
+          {
+            echo "local_head=${local_head}"
+            echo "upstream_head=${upstream_head}"
+            echo "ahead_count=${ahead_count}"
+            echo "behind_count=${behind_count}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Install CUDA toolkit
+        if: steps.compare.outputs.behind_count != '0'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: "13.1.1"
+          method: network
+          sub-packages: '["nvcc", "cudart-dev"]'
+          non-cuda-sub-packages: '["libcurand-dev"]'
+
+      - name: Prepare check environment
+        if: steps.compare.outputs.behind_count != '0'
+        shell: bash
+        env:
+          CUDA_TOOLKIT_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
+        run: |
+          set -euo pipefail
+
+          rustup component add rustfmt
+
+          sysroot="$(rustc --print sysroot)"
+          cuda_stub_dir=""
+          if [ -n "${CUDA_TOOLKIT_PATH:-}" ] && [ -f "${CUDA_TOOLKIT_PATH}/lib64/stubs/libcuda.so" ]; then
+            cuda_stub_dir="${RUNNER_TEMP}/libcuda-stub"
+            mkdir -p "${cuda_stub_dir}"
+            ln -sf "${CUDA_TOOLKIT_PATH}/lib64/stubs/libcuda.so" "${cuda_stub_dir}/libcuda.so.1"
+          fi
+
+          {
+            echo "CUDA_TOOLKIT_PATH=${CUDA_TOOLKIT_PATH}"
+            echo "LIBRARY_PATH=${sysroot}/lib:${LIBRARY_PATH:-}"
+            if [ -n "${cuda_stub_dir}" ]; then
+              echo "LD_LIBRARY_PATH=${cuda_stub_dir}:${sysroot}/lib:${LD_LIBRARY_PATH:-}"
+            else
+              echo "LD_LIBRARY_PATH=${sysroot}/lib:${LD_LIBRARY_PATH:-}"
+            fi
+          } >> "${GITHUB_ENV}"
+
+      - name: Run sync
+        id: sync
+        if: steps.compare.outputs.behind_count != '0'
+        continue-on-error: true
+        shell: pwsh
+        run: .\scripts\sync-upstream.ps1 -RunChecks -Push
+
+      - name: Collect final state
+        id: final
+        if: always()
+        shell: bash
+        env:
+          BEHIND_COUNT: ${{ steps.compare.outputs.behind_count || '0' }}
+          SYNC_OUTCOME: ${{ steps.sync.outcome || 'skipped' }}
+        run: |
+          set -euo pipefail
+
+          result="skipped"
+          if [ "${BEHIND_COUNT}" != "0" ]; then
+            if [ "${SYNC_OUTCOME}" = "success" ]; then
+              result="pushed"
+            else
+              result="blocked"
+            fi
+          fi
+
+          current_head="$(git rev-parse HEAD)"
+          status="$(git status --porcelain=v1 --untracked-files=all || true)"
+
+          {
+            echo "result=${result}"
+            echo "current_head=${current_head}"
+            echo "status<<EOF"
+            printf '%s\n' "${status}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Write sync summary
+        if: always()
+        shell: bash
+        env:
+          WORKTREE_STATUS: ${{ steps.final.outputs.status }}
+        run: |
+          {
+            echo "## Upstream sync"
+            echo
+            echo "- Upstream: NVlabs/cuda-oxide/main"
+            echo "- Local HEAD: \`${{ steps.compare.outputs.local_head || 'unknown' }}\`"
+            echo "- Upstream HEAD: \`${{ steps.compare.outputs.upstream_head || 'unknown' }}\`"
+            echo "- Ahead count: ${{ steps.compare.outputs.ahead_count || 'unknown' }}"
+            echo "- Behind count: ${{ steps.compare.outputs.behind_count || 'unknown' }}"
+            echo "- Result: ${{ steps.final.outputs.result || 'unknown' }}"
+            echo "- Current HEAD: \`${{ steps.final.outputs.current_head || 'unknown' }}\`"
+            echo
+            if [ -n "${WORKTREE_STATUS}" ]; then
+              echo "### Working tree"
+              echo
+              echo '```text'
+              printf '%s\n' "${WORKTREE_STATUS}"
+              echo '```'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Create or update blocked sync issue
+        if: steps.final.outputs.result == 'blocked'
+        uses: actions/github-script@v7
+        env:
+          LOCAL_HEAD: ${{ steps.compare.outputs.local_head }}
+          UPSTREAM_HEAD: ${{ steps.compare.outputs.upstream_head }}
+          AHEAD_COUNT: ${{ steps.compare.outputs.ahead_count }}
+          BEHIND_COUNT: ${{ steps.compare.outputs.behind_count }}
+          CURRENT_HEAD: ${{ steps.final.outputs.current_head }}
+          WORKTREE_STATUS: ${{ steps.final.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const marker = '<!-- cuda-oxide-upstream-sync-main-blocked -->';
+            const { owner, repo } = context.repo;
+            const title = `Upstream sync to main blocked: ${process.env.UPSTREAM_HEAD.slice(0, 7)}`;
+            const status = process.env.WORKTREE_STATUS || 'No working-tree status was captured.';
+            const body = [
+              marker,
+              '## Upstream sync to main blocked',
+              '',
+              '- Upstream: NVlabs/cuda-oxide/main',
+              `- Local HEAD: \`${process.env.LOCAL_HEAD}\``,
+              `- Upstream HEAD: \`${process.env.UPSTREAM_HEAD}\``,
+              `- Current workflow HEAD: \`${process.env.CURRENT_HEAD}\``,
+              `- Ahead count: ${process.env.AHEAD_COUNT}`,
+              `- Behind count: ${process.env.BEHIND_COUNT}`,
+              `- Workflow run: ${process.env.RUN_URL}`,
+              '',
+              'Resolve locally:',
+              '',
+              '```powershell',
+              'git fetch upstream --tags',
+              'git checkout main',
+              '.\\scripts\\sync-upstream.ps1 -RunChecks',
+              '.\\scripts\\sync-upstream.ps1 -RunChecks -Push',
+              '```',
+              '',
+              'Working-tree status from the failed run:',
+              '',
+              '```text',
+              status,
+              '```',
+              '',
+            ].join('\n');
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const existing = issues.find((issue) =>
+              !issue.pull_request &&
+              issue.title.startsWith('Upstream sync to main blocked:') &&
+              issue.body &&
+              issue.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existing.number,
+                title,
+                body,
+              });
+              core.info(`Updated issue #${existing.number}`);
+            } else {
+              const { data: created } = await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                body,
+              });
+              core.info(`Created issue #${created.number}`);
+            }
+
+      - name: Close stale sync issues
+        if: steps.compare.outcome == 'success' && (steps.final.outputs.result == 'pushed' || steps.final.outputs.result == 'skipped')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const markers = [
+              '<!-- cuda-oxide-upstream-sync-main-blocked -->',
+              '<!-- cuda-oxide-upstream-monitor -->',
+            ];
+            const { owner, repo } = context.repo;
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const staleIssues = issues.filter((issue) =>
+              !issue.pull_request &&
+              issue.body &&
+              markers.some((marker) => issue.body.includes(marker))
+            );
+
+            for (const issue of staleIssues) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              core.info(`Closed issue #${issue.number}`);
+            }

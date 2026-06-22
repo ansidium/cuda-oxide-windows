@@ -170,7 +170,7 @@ jobs:
               '.\\scripts\\sync-upstream.ps1 -RunChecks -Push',
               '```',
               '',
-              'This workflow only reports drift. It does not push, move tags, publish releases, or change versions.',
+              'Scope: drift report only.',
             ].join('\n');
 
             const { owner, repo } = context.repo;

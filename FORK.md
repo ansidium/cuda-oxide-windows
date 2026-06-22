@@ -14,15 +14,15 @@ helpers needed for `x86_64-pc-windows-msvc`.
 - Upstream release baseline: CUDA-Oxide 0.2.1
 - Primary local branch: `main` Windows release fork branch tracking
   `upstream/main`
-- Windows branches: `custom/windows-*`
+- Short-lived branches may be used for experiments, but routine upstream sync
+  lands directly on `main`.
 
 ## Branch Rules
 
 - `main` remains the Windows release fork branch. It tracks
-  `NVlabs/cuda-oxide` `upstream/main` and should stay suitable for Linux users
-  following NVlabs/cuda-oxide documentation.
-- `custom/windows-*` branches are used for Windows enablement work, experiments,
-  CI fixes, and short-lived compatibility patches.
+  `NVlabs/cuda-oxide` `upstream/main`.
+- Short-lived branches may be used for Windows enablement work, experiments,
+  CI fixes, and compatibility patches.
 - Keep Windows patches narrow and reviewable. Prefer build-system, path,
   environment, and documentation helpers over API changes.
 - Do not add fork-only public API unless it has been discussed and documented.
@@ -52,7 +52,7 @@ Regular sync should use this fetch-plus-merge flow on `main` so the fork keeps
 its published history intact while still carrying upstream commits promptly.
 
 The working tree must be clean before merging. If you have unfinished Windows
-work, move it to a `custom/windows-*` branch before syncing.
+work, move it to a short-lived branch before syncing.
 
 Merge upstream:
 
@@ -118,14 +118,12 @@ release-readiness gaps.
 
 ## Maintenance Cycle
 
-- Daily upstream monitor: `.github/workflows/upstream-monitor.yml` compares this
-  fork with `NVlabs/cuda-oxide/main` and opens or updates one maintenance issue
-  when upstream has new commits.
-- Weekly upstream monitor: the same workflow runs a weekly cadence for a
-  slower, human-friendly sync checkpoint.
-- Weekly upstream sync candidate: `.github/workflows/upstream-sync-candidate.yml`
-  attempts a merge into a `custom/upstream-sync-*` branch and opens a PR. It
-  never pushes `main`, moves tags, publishes releases, or changes versions.
+- Daily and weekly upstream monitor: `.github/workflows/upstream-monitor.yml`
+  compares this fork with `NVlabs/cuda-oxide/main` and opens or updates one
+  issue when upstream has new commits.
+- Weekly upstream sync: `.github/workflows/upstream-sync-main.yml` merges
+  `NVlabs/cuda-oxide/main` into `main`, runs `.\scripts\sync-upstream.ps1
+  -RunChecks -Push`, and opens or updates one issue if the sync fails.
 - Weekly hosted Windows canary: `.github/workflows/windows.yml` runs the
   no-GPU MSVC lane on GitHub-hosted `windows-latest`.
 - Manual sync: run `.\scripts\sync-upstream.ps1 -RunChecks`; add `-Push` only
@@ -159,9 +157,8 @@ from upstream:
   CUDA-Oxide 0.2.1.
 - Files/area: upstream merge integration, cargo-oxide backend cache handling,
   cuda-core upstream behavior, and sync automation.
-- Intentional divergence: keep the Windows support layer on top of current
-  upstream while preserving published fork history through merge commits and
-  reviewable `custom/upstream-sync-*` candidate PRs.
+- Intentional divergence: keep the Windows support layer on current upstream
+  through merge-based `main` syncs.
 - Linux impact: intended to be none. Upstream `DeviceBuffer` behavior and
   backend cache source/toolchain invalidation are preserved; Windows-specific
   artifact naming, release-profile backend builds, and loader path handling
