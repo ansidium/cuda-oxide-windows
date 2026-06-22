@@ -48,20 +48,19 @@ git checkout main
 git status --short
 ```
 
-Regular sync should use this fetch-plus-rebase flow on `main` so upstream
-history remains easy to inspect and Windows fork patches stay reviewable.
+Regular sync should use this fetch-plus-merge flow on `main` so the fork keeps
+its published history intact while still carrying upstream commits promptly.
 
-The working tree must be clean before rebasing. If you have unfinished Windows
+The working tree must be clean before merging. If you have unfinished Windows
 work, move it to a `custom/windows-*` branch before syncing.
 
-Rebase onto upstream:
+Merge upstream:
 
 ```bash
-git rebase upstream/main
+git merge --no-ff upstream/main
 ```
 
-If local integration policy requires a merge commit instead, keep the same
-conflict policy and record the reason in the integration notes.
+Do not rewrite published `main` history for routine syncs.
 
 Conflict policy:
 
@@ -74,7 +73,7 @@ Conflict policy:
 - Update this file only when the resolved result intentionally diverges from
   upstream behavior.
 
-No-GPU sync checks after rebase:
+No-GPU sync checks after merge:
 
 ```powershell
 cargo fmt --all --check
@@ -99,9 +98,9 @@ Push a completed sync only after the checks pass:
 .\scripts\sync-upstream.ps1 -RunChecks -Push
 ```
 
-The helper rebases `main` onto `upstream/main` and, when `-Push` is passed,
-uses `git push --force-with-lease`. It does not create releases, move tags, or
-change versions.
+The helper merges `upstream/main` into `main` and, when `-Push` is passed,
+uses a normal `git push origin main`. It does not create releases, move tags,
+or change versions.
 
 On a Windows GPU host, also run the full Windows smoke path:
 
@@ -124,6 +123,9 @@ release-readiness gaps.
   when upstream has new commits.
 - Weekly upstream monitor: the same workflow runs a weekly cadence for a
   slower, human-friendly sync checkpoint.
+- Weekly upstream sync candidate: `.github/workflows/upstream-sync-candidate.yml`
+  attempts a merge into a `custom/upstream-sync-*` branch and opens a PR. It
+  never pushes `main`, moves tags, publishes releases, or changes versions.
 - Weekly hosted Windows canary: `.github/workflows/windows.yml` runs the
   no-GPU MSVC lane on GitHub-hosted `windows-latest`.
 - Manual sync: run `.\scripts\sync-upstream.ps1 -RunChecks`; add `-Push` only
@@ -150,6 +152,25 @@ from upstream:
 
 ## Current Divergence Log
 
+## 2026-06-22 - Upstream sync and non-rewriting maintenance
+
+- Branch: `main` Windows release fork branch tracking `upstream/main`.
+- Upstream baseline: `upstream/main@d63a0a8d3fef2db450ee342bdcd862a7829c3cbb`,
+  CUDA-Oxide 0.2.1.
+- Files/area: upstream merge integration, cargo-oxide backend cache handling,
+  cuda-core upstream behavior, and sync automation.
+- Intentional divergence: keep the Windows support layer on top of current
+  upstream while preserving published fork history through merge commits and
+  reviewable `custom/upstream-sync-*` candidate PRs.
+- Linux impact: intended to be none. Upstream `DeviceBuffer` behavior and
+  backend cache source/toolchain invalidation are preserved; Windows-specific
+  artifact naming, release-profile backend builds, and loader path handling
+  remain scoped to Windows targets.
+- Windows validation: run the no-GPU sync sequence and hosted Windows canary
+  before publishing release artifacts.
+- Follow-up: no new `windows-vX.Y.Z` release is needed until upstream publishes
+  a new CUDA-Oxide release baseline.
+
 ## 2026-06-18 - Upstream sync and stronger Windows canary
 
 - Branch: `main` Windows release fork branch tracking `upstream/main`.
@@ -157,7 +178,7 @@ from upstream:
   CUDA-Oxide 0.2.1.
 - Files/area: Windows CI, cargo-oxide backend loader-path handling, and
   cuda-core sync repair.
-- Intentional divergence: keep the Windows support layer rebased on current
+- Intentional divergence: keep the Windows support layer synced with current
   upstream while strengthening the hosted no-GPU Windows canary to install
   `libffi:x64-windows` through a temporary vcpkg manifest seeded with the
   runner's vcpkg baseline, build the codegen backend, and compile-check

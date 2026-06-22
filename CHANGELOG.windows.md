@@ -2,12 +2,18 @@
 
 ## Unreleased
 
-- Synced `main` onto
-  `upstream/main@56b843f618d973aef6ae4cb613b590008df09a70`.
+- Merged `main` with
+  `upstream/main@d63a0a8d3fef2db450ee342bdcd862a7829c3cbb`.
+- Added a weekly upstream sync candidate workflow that opens a review PR from a
+  `custom/upstream-sync-*` branch without pushing `main`, moving tags, or
+  changing versions.
 - Strengthened the hosted Windows no-GPU canary so the regular `windows`
   workflow installs `libffi:x64-windows` through a temporary vcpkg manifest,
   seeds that manifest with the runner's vcpkg baseline, builds the codegen
   backend, and compile-checks `vecadd` with `cargo oxide build vecadd --arch sm_75`.
+- Restored `DeviceBuffer` context binding, empty-buffer copy fast paths, and
+  the previous `copy_from_host_async(src, stream)` entry point after merging
+  upstream's safer host-copy API.
 - Resolved upstream-sync fallout around `DeviceBuffer` field initialization
   after upstream's async-free changes.
 - No new Windows release was published; the upstream release baseline remains

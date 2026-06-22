@@ -84,7 +84,7 @@ function Assert-NoGitOperationInProgress {
 function Assert-CleanWorkingTree {
     $status = Invoke-GitOutput 'git status --porcelain' @('status', '--porcelain=v1', '--untracked-files=all')
     if (-not [string]::IsNullOrWhiteSpace($status)) {
-        throw "Refusing to rebase because the working tree is dirty."
+        throw "Refusing to sync because the working tree is dirty."
     }
 }
 
@@ -196,7 +196,17 @@ try {
 }
 Write-SyncStatus 'Upstream HEAD' $upstreamHead
 
-Invoke-Git "git rebase $upstreamRef" @('rebase', $upstreamRef)
+$ancestorStatus = 0
+& git merge-base --is-ancestor $upstreamRef HEAD
+$ancestorStatus = $LASTEXITCODE
+if ($ancestorStatus -eq 0) {
+    Write-SyncStatus 'Merge' 'skipped (upstream already contained)'
+} elseif ($ancestorStatus -eq 1) {
+    Invoke-Git "git merge --no-ff --no-edit $upstreamRef" @('merge', '--no-ff', '--no-edit', $upstreamRef)
+    Write-SyncStatus 'Merge' 'completed'
+} else {
+    throw "git merge-base --is-ancestor failed with exit code $ancestorStatus."
+}
 
 $newHead = Invoke-GitOutput 'git rev-parse HEAD' @('rev-parse', 'HEAD')
 Write-SyncStatus 'New HEAD' $newHead
@@ -216,8 +226,8 @@ if ($RunChecks) {
 
 if ($Push) {
     try {
-        Invoke-Git 'git push --force-with-lease origin main' @('push', '--force-with-lease', 'origin', 'main')
-        Write-SyncStatus 'Push' 'pushed origin main with --force-with-lease'
+        Invoke-Git "git push origin $LocalBranch" @('push', 'origin', $LocalBranch)
+        Write-SyncStatus 'Push' "pushed origin $LocalBranch"
     } catch {
         Write-SyncStatus 'Push' 'failed'
         throw
