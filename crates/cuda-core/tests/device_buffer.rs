@@ -51,12 +51,34 @@ fn device_buffer_supports_empty_allocations() {
     assert_eq!(dev_buf.len(), 0);
     assert_eq!(dev_buf.num_bytes(), 0);
     assert!(dev_buf.is_empty());
+    assert_eq!(
+        dev_buf
+            .to_host_vec(&stream)
+            .expect("failed to read empty device buffer"),
+        Vec::<u8>::new()
+    );
+    dev_buf
+        .copy_to_host(&stream, &mut [])
+        .expect("failed to copy empty device buffer to host");
 
-    let dev_buf_host = DeviceBuffer::<u8>::from_host(&stream, &[])
+    let mut pinned_out =
+        PinnedHostBuffer::<u8>::zeroed(&ctx, 0).expect("failed to allocate empty pinned output");
+    dev_buf
+        .copy_to_pinned_host(&stream, &mut pinned_out)
+        .expect("failed to copy empty device buffer to pinned host");
+
+    let mut dev_buf_host = DeviceBuffer::<u8>::from_host(&stream, &[])
         .expect("failed to allocate empty device buffer from empty slice");
     assert_eq!(dev_buf_host.len(), 0);
     assert_eq!(dev_buf_host.num_bytes(), 0);
     assert!(dev_buf_host.is_empty());
+
+    let pinned_in = PinnedHostBuffer::<u8>::from_slice(&ctx, &[])
+        .expect("failed to allocate empty pinned input");
+    // SAFETY: there are no bytes to read, and the method must return before
+    // enqueueing any CUDA work for an empty copy.
+    unsafe { dev_buf_host.copy_from_pinned_host_async(&stream, &pinned_in) }
+        .expect("failed to copy empty pinned host buffer to device");
 }
 
 #[test]
@@ -118,6 +140,50 @@ fn device_buffer_async_compat_methods_roundtrip() {
         .drop_async(&stream)
         .expect("failed to async free empty buffer");
     stream.synchronize().expect("stream sync failed");
+}
+
+#[test]
+fn device_buffer_legacy_copy_from_host_async_shim_roundtrip() {
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+
+    let data = [2_u32, 4, 6, 8];
+    let mut dev =
+        DeviceBuffer::<u32>::zeroed(&stream, data.len()).expect("failed to allocate device");
+    dev.copy_from_host_async(&data, &stream)
+        .expect("failed to copy through legacy async shim");
+
+    assert_eq!(
+        dev.to_host_vec(&stream)
+            .expect("failed to copy device buffer back to host"),
+        data
+    );
+}
+
+#[test]
+fn device_buffer_methods_bind_stream_context_on_worker_thread() {
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+
+    std::thread::spawn(move || {
+        let data = [10_u32, 20, 30, 40];
+        let mut dev = DeviceBuffer::from_host(&stream, &data)
+            .expect("failed to allocate DeviceBuffer from worker thread");
+        assert_eq!(
+            dev.to_host_vec(&stream)
+                .expect("failed to copy worker-thread buffer back"),
+            data
+        );
+        dev.zero_async(&stream)
+            .expect("failed to zero worker-thread buffer");
+        assert_eq!(
+            dev.to_host_vec(&stream)
+                .expect("failed to copy zeroed worker-thread buffer back"),
+            [0, 0, 0, 0]
+        );
+    })
+    .join()
+    .expect("worker thread panicked");
 }
 
 #[test]

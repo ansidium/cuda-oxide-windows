@@ -340,6 +340,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             return Ok(unsafe { Self::from_raw_parts(0, len, ctx) });
         }
 
+        ctx.bind_to_thread()?;
         let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
         // SAFETY: `ptr` was just allocated with `num_bytes` bytes in the
         // stream's context; ownership transfers to `buf` here so any early
@@ -380,6 +381,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             return Ok(unsafe { Self::from_raw_parts(0, len, ctx) });
         }
 
+        ctx.bind_to_thread()?;
         let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
         // SAFETY: `ptr` was just allocated with `num_bytes` bytes in the
         // stream's context; ownership transfers to `buf` here so any early
@@ -462,6 +464,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             return Ok(unsafe { Self::from_raw_parts(0, len, ctx) });
         }
 
+        ctx.bind_to_thread()?;
         let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
         // SAFETY: `ptr` was just allocated with `num_bytes` bytes in the
         // stream's context; ownership transfers to `buf` here so any early
@@ -479,6 +482,11 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
     /// to read immediately.
     pub fn to_host_vec(&self, stream: &CudaStream) -> Result<Vec<T>, DriverError> {
         let mut host = Vec::with_capacity(self.len);
+        if self.num_bytes() == 0 {
+            unsafe { host.set_len(self.len) };
+            return Ok(host);
+        }
+        stream.context().bind_to_thread()?;
         unsafe {
             crate::memory::memcpy_dtoh_async(
                 host.as_mut_ptr(),
@@ -503,6 +511,10 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             dst.len(),
             self.len
         );
+        if self.num_bytes() == 0 {
+            return Ok(());
+        }
+        stream.context().bind_to_thread()?;
         unsafe {
             crate::memory::memcpy_dtoh_async(
                 dst.as_mut_ptr(),
@@ -570,6 +582,10 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             dst.len(),
             self.len
         );
+        if self.num_bytes() == 0 {
+            return Ok(());
+        }
+        stream.context().bind_to_thread()?;
         unsafe {
             crate::memory::memcpy_dtoh_async(
                 dst.as_mut_ptr(),
@@ -623,6 +639,10 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             self.len
         );
         let num_bytes = src.num_bytes();
+        if num_bytes == 0 {
+            return Ok(());
+        }
+        stream.context().bind_to_thread()?;
         unsafe {
             crate::memory::memcpy_htod_async(self.ptr, src.as_ptr(), num_bytes, stream.cu_stream())
         }
@@ -655,6 +675,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             return Ok(unsafe { Self::from_raw_parts(0, len, ctx) });
         }
 
+        ctx.bind_to_thread()?;
         let ptr = unsafe { crate::memory::malloc_async(stream.cu_stream(), num_bytes)? };
         Ok(Self {
             ptr,
@@ -682,6 +703,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         if self.num_bytes() == 0 {
             return Ok(());
         }
+        stream.context().bind_to_thread()?;
         unsafe {
             crate::memory::memcpy_dtod_async(
                 self.ptr,
@@ -711,6 +733,20 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         sync_result
     }
 
+    /// Legacy host-to-device copy entry point.
+    ///
+    /// This method keeps the previous API shape (`src`, then `stream`) while
+    /// using the safe synchronized semantics of [`Self::copy_from_host`].
+    /// For true host-device overlap with caller-managed source lifetimes, use
+    /// [`Self::copy_from_host_async_unchecked`].
+    pub fn copy_from_host_async(
+        &mut self,
+        src: &[T],
+        stream: &CudaStream,
+    ) -> Result<(), DriverError> {
+        self.copy_from_host(stream, src)
+    }
+
     /// Copies `src` into `self` host-to-device, enqueued on `stream`, and
     /// returns without synchronizing.
     ///
@@ -737,6 +773,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         if self.num_bytes() == 0 {
             return Ok(());
         }
+        stream.context().bind_to_thread()?;
         unsafe {
             crate::memory::memcpy_htod_async(
                 self.ptr,
@@ -756,6 +793,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         if ptr == 0 {
             return Ok(());
         }
+        stream.context().bind_to_thread()?;
         unsafe { crate::memory::free_async(ptr, stream.cu_stream()) }
     }
 
@@ -764,6 +802,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         if self.num_bytes() == 0 {
             return Ok(());
         }
+        stream.context().bind_to_thread()?;
         unsafe { crate::memory::memset_d8_async(self.ptr, 0, self.num_bytes(), stream.cu_stream()) }
     }
 }
