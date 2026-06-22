@@ -270,3 +270,10 @@ jobs:
               });
               core.info(`Closed issue #${issue.number}`);
             }
+
+      - name: Fail blocked sync
+        if: steps.final.outputs.result == 'blocked'
+        shell: bash
+        run: |
+          echo "Upstream sync is blocked. See the workflow summary and maintenance issue for details."
+          exit 1
