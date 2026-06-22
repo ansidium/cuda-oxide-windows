@@ -202,6 +202,7 @@ pub fn emit_function_call(
 /// - `ReadPtxSregCtaidX/Y` (blockIdx.x/y)
 /// - `ReadPtxSregNtidX/Y` (blockDim.x/y)
 /// - `ReadPtxSregLaneId` (lane_id)
+/// - `ReadPtxSregLanemaskLt/Le/Eq/Ge/Gt` (lane-position masks)
 #[allow(clippy::too_many_arguments)]
 pub fn emit_nvvm_intrinsic(
     ctx: &mut Context,

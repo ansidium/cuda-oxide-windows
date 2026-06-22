@@ -70,6 +70,83 @@ pub fn lane_id() -> u32 {
     unreachable!("lane_id called outside CUDA kernel context")
 }
 
+// =============================================================================
+// Lane-Position Masks
+// =============================================================================
+//
+// These five read-only special registers each return a 32-bit value whose
+// bit `k` corresponds to lane `k` in the warp. They encode the calling lane's
+// position relative to the rest of the warp and are the building blocks of
+// warp-level scans, prefix sums, and stream compaction.
+//
+// A typical idiom combines a ballot with `lanemask_lt`:
+//
+// ```rust,ignore
+// let active = warp::active_mask();
+// let pred   = some_condition();
+// let ballot = warp::ballot_sync(active, pred);
+// // How many lanes *before* me also voted true → my output slot.
+// let rank = (ballot & warp::lanemask_lt()).count_ones();
+// ```
+//
+// Unlike the `*_sync` collectives these are plain register reads: they require
+// no participation mask and are not warp-convergent.
+
+/// Mask of all lanes with ID **strictly less** than the calling lane.
+///
+/// PTX `%lanemask_lt` (LLVM `@llvm.nvvm.read.ptx.sreg.lanemask.lt`). For lane
+/// `i` the result is `(1 << i) - 1`. The canonical input to a warp prefix sum:
+/// `(ballot & lanemask_lt()).count_ones()` is the number of earlier lanes that
+/// satisfied the ballot predicate.
+#[inline(never)]
+pub fn lanemask_lt() -> u32 {
+    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.lt()
+    unreachable!("lanemask_lt called outside CUDA kernel context")
+}
+
+/// Mask of all lanes with ID **less than or equal to** the calling lane.
+///
+/// PTX `%lanemask_le` (LLVM `@llvm.nvvm.read.ptx.sreg.lanemask.le`). For lane
+/// `i` the result is `(1 << (i + 1)) - 1` (i.e. `lanemask_lt() | lanemask_eq()`),
+/// giving an inclusive prefix mask.
+#[inline(never)]
+pub fn lanemask_le() -> u32 {
+    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.le()
+    unreachable!("lanemask_le called outside CUDA kernel context")
+}
+
+/// Mask with **only the calling lane's** bit set.
+///
+/// PTX `%lanemask_eq` (LLVM `@llvm.nvvm.read.ptx.sreg.lanemask.eq`). For lane
+/// `i` the result is `1 << i` — equivalent to `1u32 << lane_id()` but read
+/// directly from a hardware register.
+#[inline(never)]
+pub fn lanemask_eq() -> u32 {
+    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.eq()
+    unreachable!("lanemask_eq called outside CUDA kernel context")
+}
+
+/// Mask of all lanes with ID **greater than or equal to** the calling lane.
+///
+/// PTX `%lanemask_ge` (LLVM `@llvm.nvvm.read.ptx.sreg.lanemask.ge`). For lane
+/// `i` the result sets bits `i..=31` (i.e. `lanemask_gt() | lanemask_eq()`).
+#[inline(never)]
+pub fn lanemask_ge() -> u32 {
+    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.ge()
+    unreachable!("lanemask_ge called outside CUDA kernel context")
+}
+
+/// Mask of all lanes with ID **strictly greater** than the calling lane.
+///
+/// PTX `%lanemask_gt` (LLVM `@llvm.nvvm.read.ptx.sreg.lanemask.gt`). For lane
+/// `i` the result sets bits `(i + 1)..=31`. Useful for "lanes after me" suffix
+/// scans and for finding the next active lane via `(ballot & lanemask_gt())`.
+#[inline(never)]
+pub fn lanemask_gt() -> u32 {
+    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.gt()
+    unreachable!("lanemask_gt called outside CUDA kernel context")
+}
+
 /// Synchronize a subset of warp lanes given by `mask`.
 ///
 /// PTX `bar.warp.sync mask` (LLVM `@llvm.nvvm.bar.warp.sync(i32)`). All
@@ -516,4 +593,163 @@ pub fn match_all_i64_sync(mask: u32, value: u64) -> u32 {
 pub fn redux_sync_add(mask: u32, value: u32) -> u32 {
     let _ = (mask, value);
     unreachable!("redux_sync_add called outside CUDA kernel context")
+}
+
+// -----------------------------------------------------------------------------
+// Integer min/max/and/or/xor reductions (sm_80+).
+//
+// Same shape and convergence rules as `redux_sync_add` (see its docs): every
+// lane named in `mask` contributes its `value`, and the reduced result is
+// broadcast back to all participating lanes.
+//
+// `min`/`max` come in signed (`_i32`) and unsigned (`_u32`) flavors because the
+// comparison differs: e.g. `min(0xFFFFFFFF, 0)` is `-1` signed but `0` unsigned.
+// `and`/`or`/`xor` are bitwise, so a single `u32` form covers `i32` too.
+// -----------------------------------------------------------------------------
+
+/// Warp-wide unsigned minimum (single instruction, sm_80+).
+///
+/// Lowered to `@llvm.nvvm.redux.sync.umin` → PTX `redux.sync.min.u32`.
+/// Convergent; participating lanes must be converged at the call.
+#[inline(never)]
+pub fn redux_sync_min_u32(mask: u32, value: u32) -> u32 {
+    let _ = (mask, value);
+    unreachable!("redux_sync_min_u32 called outside CUDA kernel context")
+}
+
+/// Warp-wide signed minimum (single instruction, sm_80+).
+///
+/// Lowered to `@llvm.nvvm.redux.sync.min` → PTX `redux.sync.min.s32`.
+/// Convergent; participating lanes must be converged at the call.
+#[inline(never)]
+pub fn redux_sync_min_i32(mask: u32, value: i32) -> i32 {
+    let _ = (mask, value);
+    unreachable!("redux_sync_min_i32 called outside CUDA kernel context")
+}
+
+/// Warp-wide unsigned maximum (single instruction, sm_80+).
+///
+/// Lowered to `@llvm.nvvm.redux.sync.umax` → PTX `redux.sync.max.u32`.
+/// Convergent; participating lanes must be converged at the call.
+#[inline(never)]
+pub fn redux_sync_max_u32(mask: u32, value: u32) -> u32 {
+    let _ = (mask, value);
+    unreachable!("redux_sync_max_u32 called outside CUDA kernel context")
+}
+
+/// Warp-wide signed maximum (single instruction, sm_80+).
+///
+/// Lowered to `@llvm.nvvm.redux.sync.max` → PTX `redux.sync.max.s32`.
+/// Convergent; participating lanes must be converged at the call.
+#[inline(never)]
+pub fn redux_sync_max_i32(mask: u32, value: i32) -> i32 {
+    let _ = (mask, value);
+    unreachable!("redux_sync_max_i32 called outside CUDA kernel context")
+}
+
+/// Warp-wide bitwise AND reduction (single instruction, sm_80+).
+///
+/// Lowered to `@llvm.nvvm.redux.sync.and` → PTX `redux.sync.and.b32`.
+/// Convergent; participating lanes must be converged at the call.
+#[inline(never)]
+pub fn redux_sync_and(mask: u32, value: u32) -> u32 {
+    let _ = (mask, value);
+    unreachable!("redux_sync_and called outside CUDA kernel context")
+}
+
+/// Warp-wide bitwise OR reduction (single instruction, sm_80+).
+///
+/// Lowered to `@llvm.nvvm.redux.sync.or` → PTX `redux.sync.or.b32`.
+/// Convergent; participating lanes must be converged at the call.
+#[inline(never)]
+pub fn redux_sync_or(mask: u32, value: u32) -> u32 {
+    let _ = (mask, value);
+    unreachable!("redux_sync_or called outside CUDA kernel context")
+}
+
+/// Warp-wide bitwise XOR reduction (single instruction, sm_80+).
+///
+/// Lowered to `@llvm.nvvm.redux.sync.xor` → PTX `redux.sync.xor.b32`.
+/// Convergent; participating lanes must be converged at the call.
+#[inline(never)]
+pub fn redux_sync_xor(mask: u32, value: u32) -> u32 {
+    let _ = (mask, value);
+    unreachable!("redux_sync_xor called outside CUDA kernel context")
+}
+
+// =============================================================================
+// Leader election (sm_90+)
+// =============================================================================
+//
+// `elect.sync` collectively chooses a single "leader" lane out of those named
+// in `mask`. The hardware picks the lowest-numbered participating lane and
+// hands every lane two facts: the leader's lane id, and whether *it* is the
+// leader. It replaces the pre-Hopper idiom
+//
+// ```rust,ignore
+// let active = warp::active_mask();
+// let leader = active.trailing_zeros();   // lowest set bit
+// let is_leader = warp::lane_id() == leader;
+// ```
+//
+// with one instruction. The classic use is warp-aggregated work: elect one
+// lane to perform a single atomic / allocation / write on behalf of the warp.
+
+/// Elect a single leader lane from the participating `mask` (sm_90+).
+///
+/// PTX `elect.sync d|p, membermask` (emitted as convergent inline PTX — the
+/// `@llvm.nvvm.elect.sync` intrinsic has no NVPTX lowering in current LLVM).
+/// The lowest-numbered lane set in `mask` becomes the leader. Returns
+/// `(leader_lane, is_elected)`:
+///
+/// - `leader_lane`: the lane id of the elected leader. PTX only defines this
+///   value on the elected lane itself; it is unspecified on non-elected lanes,
+///   so broadcast it (e.g. via [`shuffle_sync`]) if the rest of the warp needs
+///   it.
+/// - `is_elected`: `true` only for the calling lane if it is the leader.
+///
+/// Requires Hopper (sm_90+). Convergent: every lane named in `mask` must be
+/// converged at the call (see [`redux_sync_add`] for the full convergence
+/// contract — it is a runtime requirement on the caller, distinct from the
+/// `convergent` attribute on the lowered intrinsic).
+///
+/// Most callers only need "am I the leader?"; reach for [`is_elected_sync`]
+/// in that case and let the leader-id field fold away.
+///
+/// # Example: warp-aggregated counter
+///
+/// ```rust,ignore
+/// // One lane per warp bumps a global counter and broadcasts the base index.
+/// let (leader, elected) = warp::elect_sync(u32::MAX);
+/// let base = if elected {
+///     atomic_add(global_counter, 32)   // only the leader writes
+/// } else {
+///     0
+/// };
+/// // Share the leader's result with the rest of the warp.
+/// let base = warp::shuffle_sync(u32::MAX, base, leader);
+/// ```
+#[inline(never)]
+pub fn elect_sync(mask: u32) -> (u32, bool) {
+    let _ = mask;
+    unreachable!("elect_sync called outside CUDA kernel context")
+}
+
+/// Whether the calling lane is the elected leader of `mask` (sm_90+).
+///
+/// Convenience wrapper over [`elect_sync`] for the common "do this once per
+/// warp" pattern; the elected leader-id field is discarded (and folds away in
+/// codegen). See [`elect_sync`] for the hardware semantics and convergence
+/// contract.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// if warp::is_elected_sync(u32::MAX) {
+///     // Runs on exactly one lane of the warp.
+/// }
+/// ```
+#[inline(always)]
+pub fn is_elected_sync(mask: u32) -> bool {
+    elect_sync(mask).1
 }

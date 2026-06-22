@@ -125,6 +125,30 @@ pub enum RustFloatMathIntrinsic {
     CbrtF32,
     /// `f64::cbrt` / `std::sys::cmath::cbrt`.
     CbrtF64,
+    /// `f32::sinh` / `std::sys::cmath::sinhf`.
+    SinhF32,
+    /// `f64::sinh` / `std::sys::cmath::sinh`.
+    SinhF64,
+    /// `f32::cosh` / `std::sys::cmath::coshf`.
+    CoshF32,
+    /// `f64::cosh` / `std::sys::cmath::cosh`.
+    CoshF64,
+    /// `f32::tanh` / `std::sys::cmath::tanhf`.
+    TanhF32,
+    /// `f64::tanh` / `std::sys::cmath::tanh`.
+    TanhF64,
+    /// `f32::exp_m1` / `std::sys::cmath::expm1f`.
+    Expm1F32,
+    /// `f64::exp_m1` / `std::sys::cmath::expm1`.
+    Expm1F64,
+    /// `f32::ln_1p` / `std::sys::cmath::log1pf`.
+    Log1pF32,
+    /// `f64::ln_1p` / `std::sys::cmath::log1p`.
+    Log1pF64,
+    /// `f32::hypot` / `std::sys::cmath::hypotf` (binary).
+    HypotF32,
+    /// `f64::hypot` / `std::sys::cmath::hypot` (binary).
+    HypotF64,
     /// Generic `core::intrinsics::fadd_fast` (lowered to `llvm.fadd` + fast-math).
     FaddFast,
     /// Generic `core::intrinsics::fsub_fast` (lowered to `llvm.fsub` + fast-math).
@@ -200,6 +224,20 @@ impl RustFloatMathIntrinsic {
             | "std::intrinsics::minimum_number_nsz_f32" => Some(Self::MinNumNszF32),
             "core::intrinsics::minimum_number_nsz_f64"
             | "std::intrinsics::minimum_number_nsz_f64" => Some(Self::MinNumNszF64),
+            // Trig that still routes through `std`'s libm shim. On current
+            // nightlies `core_float_math` moves `sin`/`cos` into core
+            // intrinsics (caught above), but `tan` is *not* in that feature,
+            // so `f{32,64}::tan()` lowers to `std::sys::cmath::tan{,f}` and
+            // would otherwise trip the forbidden-`std`-crate guard. Intercept
+            // it (and sin/cos defensively, for toolchains/builds that take the
+            // std path) and lower to `__nv_tan{,f}` like every other libdevice
+            // math call.
+            "std::sys::cmath::sinf" => Some(Self::SinF32),
+            "std::sys::cmath::sin" => Some(Self::SinF64),
+            "std::sys::cmath::cosf" => Some(Self::CosF32),
+            "std::sys::cmath::cos" => Some(Self::CosF64),
+            "std::sys::cmath::tanf" => Some(Self::TanF32),
+            "std::sys::cmath::tan" => Some(Self::TanF64),
             "std::sys::cmath::asinf" => Some(Self::AsinF32),
             "std::sys::cmath::asin" => Some(Self::AsinF64),
             "std::sys::cmath::acosf" => Some(Self::AcosF32),
@@ -212,6 +250,22 @@ impl RustFloatMathIntrinsic {
             "std::sys::cmath::cbrt" => Some(Self::CbrtF64),
             "core::num::imp::libm::cbrtf" => Some(Self::CbrtF32),
             "core::num::imp::libm::cbrt" => Some(Self::CbrtF64),
+            // Hyperbolic + extended transcendentals. Like `tan`, none of
+            // these are in `core_float_math`, so `f{32,64}::{sinh,..,hypot}()`
+            // lower to their `std::sys::cmath::*` shims and would hit the
+            // std-crate guard without interception.
+            "std::sys::cmath::sinhf" => Some(Self::SinhF32),
+            "std::sys::cmath::sinh" => Some(Self::SinhF64),
+            "std::sys::cmath::coshf" => Some(Self::CoshF32),
+            "std::sys::cmath::cosh" => Some(Self::CoshF64),
+            "std::sys::cmath::tanhf" => Some(Self::TanhF32),
+            "std::sys::cmath::tanh" => Some(Self::TanhF64),
+            "std::sys::cmath::expm1f" => Some(Self::Expm1F32),
+            "std::sys::cmath::expm1" => Some(Self::Expm1F64),
+            "std::sys::cmath::log1pf" => Some(Self::Log1pF32),
+            "std::sys::cmath::log1p" => Some(Self::Log1pF64),
+            "std::sys::cmath::hypotf" => Some(Self::HypotF32),
+            "std::sys::cmath::hypot" => Some(Self::HypotF64),
             other => Self::from_libm_path(other).or_else(|| Self::from_fast_intrinsic_path(other)),
         }
     }
@@ -281,6 +335,18 @@ impl RustFloatMathIntrinsic {
             "atan" => Some(Self::AtanF64),
             "cbrtf" => Some(Self::CbrtF32),
             "cbrt" => Some(Self::CbrtF64),
+            "sinhf" => Some(Self::SinhF32),
+            "sinh" => Some(Self::SinhF64),
+            "coshf" => Some(Self::CoshF32),
+            "cosh" => Some(Self::CoshF64),
+            "tanhf" => Some(Self::TanhF32),
+            "tanh" => Some(Self::TanhF64),
+            "expm1f" => Some(Self::Expm1F32),
+            "expm1" => Some(Self::Expm1F64),
+            "log1pf" => Some(Self::Log1pF32),
+            "log1p" => Some(Self::Log1pF64),
+            "hypotf" => Some(Self::HypotF32),
+            "hypot" => Some(Self::HypotF64),
             _ => None,
         }
     }
@@ -358,6 +424,18 @@ impl RustFloatMathIntrinsic {
             Self::AtanF64 => rust_intrinsics::CALLEE_ATAN_F64,
             Self::CbrtF32 => rust_intrinsics::CALLEE_CBRT_F32,
             Self::CbrtF64 => rust_intrinsics::CALLEE_CBRT_F64,
+            Self::SinhF32 => rust_intrinsics::CALLEE_SINH_F32,
+            Self::SinhF64 => rust_intrinsics::CALLEE_SINH_F64,
+            Self::CoshF32 => rust_intrinsics::CALLEE_COSH_F32,
+            Self::CoshF64 => rust_intrinsics::CALLEE_COSH_F64,
+            Self::TanhF32 => rust_intrinsics::CALLEE_TANH_F32,
+            Self::TanhF64 => rust_intrinsics::CALLEE_TANH_F64,
+            Self::Expm1F32 => rust_intrinsics::CALLEE_EXPM1_F32,
+            Self::Expm1F64 => rust_intrinsics::CALLEE_EXPM1_F64,
+            Self::Log1pF32 => rust_intrinsics::CALLEE_LOG1P_F32,
+            Self::Log1pF64 => rust_intrinsics::CALLEE_LOG1P_F64,
+            Self::HypotF32 => rust_intrinsics::CALLEE_HYPOT_F32,
+            Self::HypotF64 => rust_intrinsics::CALLEE_HYPOT_F64,
             Self::FaddFast => rust_intrinsics::CALLEE_FADD_FAST,
             Self::FsubFast => rust_intrinsics::CALLEE_FSUB_FAST,
             Self::FmulFast => rust_intrinsics::CALLEE_FMUL_FAST,

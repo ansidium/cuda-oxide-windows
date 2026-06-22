@@ -161,6 +161,35 @@ pub const CALLEE_CBRT_F32: &str = placeholder!("cbrtf32");
 /// Placeholder call used for `f64::cbrt` / `std::sys::cmath::cbrt`.
 pub const CALLEE_CBRT_F64: &str = placeholder!("cbrtf64");
 
+/// Placeholder call used for `f32::sinh` / `std::sys::cmath::sinhf`.
+pub const CALLEE_SINH_F32: &str = placeholder!("sinhf32");
+/// Placeholder call used for `f64::sinh` / `std::sys::cmath::sinh`.
+pub const CALLEE_SINH_F64: &str = placeholder!("sinhf64");
+/// Placeholder call used for `f32::cosh` / `std::sys::cmath::coshf`.
+pub const CALLEE_COSH_F32: &str = placeholder!("coshf32");
+/// Placeholder call used for `f64::cosh` / `std::sys::cmath::cosh`.
+pub const CALLEE_COSH_F64: &str = placeholder!("coshf64");
+/// Placeholder call used for `f32::tanh` / `std::sys::cmath::tanhf`.
+pub const CALLEE_TANH_F32: &str = placeholder!("tanhf32");
+/// Placeholder call used for `f64::tanh` / `std::sys::cmath::tanh`.
+pub const CALLEE_TANH_F64: &str = placeholder!("tanhf64");
+// Note: `f{32,64}::{asinh,acosh,atanh}` are pure-Rust formulas in `std`
+// (compositions of `ln`/`sqrt`/`ln_1p`), not `std::sys::cmath` calls, so
+// they need no placeholder of their own. `atanh` works once `ln_1p` (below)
+// is intercepted.
+/// Placeholder call used for `f32::exp_m1` / `std::sys::cmath::expm1f`.
+pub const CALLEE_EXPM1_F32: &str = placeholder!("expm1f32");
+/// Placeholder call used for `f64::exp_m1` / `std::sys::cmath::expm1`.
+pub const CALLEE_EXPM1_F64: &str = placeholder!("expm1f64");
+/// Placeholder call used for `f32::ln_1p` / `std::sys::cmath::log1pf`.
+pub const CALLEE_LOG1P_F32: &str = placeholder!("log1pf32");
+/// Placeholder call used for `f64::ln_1p` / `std::sys::cmath::log1p`.
+pub const CALLEE_LOG1P_F64: &str = placeholder!("log1pf64");
+/// Placeholder call used for `f32::hypot` / `std::sys::cmath::hypotf` (binary).
+pub const CALLEE_HYPOT_F32: &str = placeholder!("hypotf32");
+/// Placeholder call used for `f64::hypot` / `std::sys::cmath::hypot` (binary).
+pub const CALLEE_HYPOT_F64: &str = placeholder!("hypotf64");
+
 /// Placeholder call used for `core::intrinsics::fadd_fast` (generic over float type).
 ///
 /// Lowered to `llvm.fadd` with explicit `fast` fast-math flags. The `f*_fast` intrinsics

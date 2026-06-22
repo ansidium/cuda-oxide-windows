@@ -113,7 +113,7 @@ let results = c_dev.to_host_vec(&stream).unwrap();
 
 | Method                            | Direction     | Description                    |
 |:--------------------------------- |:--------------|:-------------------------------|
-| `from_host(&stream, &[T])`        | Host → Device | Allocate + async copy          |
+| `from_host(&stream, &[T])`        | Host → Device | Allocate + blocking copy       |
 | `zeroed(&stream, len)`            | --            | Allocate + zero-fill           |
 | `to_host_vec(&stream)`            | Device → Host | Async copy + return `Vec<T>`   |
 | `copy_to_host(&stream, &mut [T])` | Device → Host | Copy into existing slice       |

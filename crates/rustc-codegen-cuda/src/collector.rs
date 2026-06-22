@@ -407,31 +407,36 @@ pub fn is_fully_monomorphized<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>)
     true
 }
 
-/// Paths into `std::sys::cmath` that mir-importer rewrites to a libdevice
-/// intrinsic placeholder.
+/// `std::sys::cmath::*` names we allow in device code and rewrite to GPU math.
 ///
-/// `f32::atan2`, `f32::atan`, `f64::atan2`, and `f64::atan` are declared
-/// in `std` and dispatched through `extern "C"` shims in `std::sys::cmath`.
-/// `f32::atan2` (etc.) is `#[inline]`, so MIR-opt collapses the wrapper and
-/// the surviving call site points directly at one of these shims. Device
-/// codegen must never see them: mir-importer matches the same FQDN and
-/// emits an `__nv_*` libdevice call instead, and the collector silently
-/// skips them here so the std-crate guard doesn't fire.
+/// When you call `x.tan()` (also `atan`, `acos`, `cbrt`, the hyperbolics,
+/// `exp_m1`, `ln_1p`, `hypot`, ...), the compiler turns it into a call to a
+/// tiny `std` wrapper like `std::sys::cmath::tan`, which on a CPU forwards to
+/// the system C math library. The GPU has no such library, and device code
+/// may not call into `std`, so our "no std on the GPU" guard would normally
+/// reject the call.
 ///
-/// Keep this list in sync with the `std::sys::cmath` matches in
-/// `mir-importer/src/translator/terminator/intrinsics/float_math.rs`.
+/// We never actually run `std` here: mir-importer rewrites each of these
+/// names to the matching NVIDIA libdevice function (`__nv_tan`, `__nv_sinh`,
+/// ...). This list just tells the guard "these are fine, we handle them."
+/// Keep it in sync with the `std::sys::cmath` matches in float_math.rs.
 ///
-/// Only `std::`-crate paths belong here: the guard is consulted solely
-/// inside the forbidden-std branch of `should_collect_from_crate`, where
-/// every def path starts with `std::`. Intrinsic-lowered shims that live
-/// in `core` (e.g. the `core::num::imp::libm::cbrtf` / `cbrt` extern
-/// declarations that back `f{32,64}::cbrt` on the pinned toolchain) never
-/// need an entry: `core` is an allowed crate, and the declarations have
-/// no MIR, so the collector's no-MIR skip already excludes them.
+/// A few functions (`sin`, `cos`, `exp`, ...) take a different, allowed route
+/// on this toolchain: the compiler lowers them to a builtin in `core`, so
+/// they never reach here. The ones below still go through `std` because they
+/// are not part of `core_float_math`; `sin`/`cos` are listed defensively in
+/// case a build ever takes the `std` route too. Only `std::`-prefixed names
+/// belong here; `core`-based shims are already allowed.
 fn is_intrinsic_lowered_cmath_shim(fn_path: &str) -> bool {
     matches!(
         fn_path,
-        "std::sys::cmath::asinf"
+        "std::sys::cmath::sinf"
+            | "std::sys::cmath::sin"
+            | "std::sys::cmath::cosf"
+            | "std::sys::cmath::cos"
+            | "std::sys::cmath::tanf"
+            | "std::sys::cmath::tan"
+            | "std::sys::cmath::asinf"
             | "std::sys::cmath::asin"
             | "std::sys::cmath::acosf"
             | "std::sys::cmath::acos"
@@ -441,6 +446,18 @@ fn is_intrinsic_lowered_cmath_shim(fn_path: &str) -> bool {
             | "std::sys::cmath::atan"
             | "std::sys::cmath::cbrtf"
             | "std::sys::cmath::cbrt"
+            | "std::sys::cmath::sinhf"
+            | "std::sys::cmath::sinh"
+            | "std::sys::cmath::coshf"
+            | "std::sys::cmath::cosh"
+            | "std::sys::cmath::tanhf"
+            | "std::sys::cmath::tanh"
+            | "std::sys::cmath::expm1f"
+            | "std::sys::cmath::expm1"
+            | "std::sys::cmath::log1pf"
+            | "std::sys::cmath::log1p"
+            | "std::sys::cmath::hypotf"
+            | "std::sys::cmath::hypot"
     )
 }
 

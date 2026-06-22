@@ -12,7 +12,7 @@ use crate::error::{TranslationErr, TranslationResult};
 use crate::translator::rvalue;
 use crate::translator::types;
 use crate::translator::values::ValueMap;
-use dialect_nvvm::ops::{ActiveMaskOp, BarWarpSyncOp, ReadPtxSregLaneIdOp};
+use dialect_nvvm::ops::{ActiveMaskOp, BarWarpSyncOp, ElectSyncOp, ReadPtxSregLaneIdOp};
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
@@ -478,14 +478,18 @@ pub fn emit_warp_match(
     )
 }
 
-/// Emit a warp reduction operation (`redux.sync.add`).
+/// Emit a warp reduction operation (`redux.sync.{add,min,max,and,or,xor}`).
 ///
 /// Same MIR shape as [`emit_warp_match`]: 2 operands `[mask, value]` and 1
-/// result (the u32 sum). Kept as its own helper (rather than reusing
-/// `emit_warp_match`) for clarity and to ease adding min/max/and/or/xor later.
+/// result. Kept as its own helper (rather than reusing `emit_warp_match`) for
+/// clarity and to share the whole integer reduction family.
 ///
 /// # Parameters
 /// - `redux_opid`: The NVVM opid for the specific reduction variant
+/// - `signed`: result signedness — `true` for the signed `min.s32`/`max.s32`
+///   variants (result type must match an `i32` destination slot), `false` for
+///   `add`, the unsigned `min.u32`/`max.u32`, and the bitwise `and`/`or`/`xor`
+///   variants (all `u32`).
 /// - `args`: `[mask, value]`
 pub fn emit_warp_redux(
     ctx: &mut Context,
@@ -494,6 +498,7 @@ pub fn emit_warp_redux(
         fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
         std::any::TypeId,
     ),
+    signed: bool,
     args: &[mir::Operand],
     destination: &mir::Place,
     target: &Option<usize>,
@@ -513,7 +518,14 @@ pub fn emit_warp_redux(
         );
     }
 
-    let result_ty = IntegerType::get(ctx, 32, Signedness::Unsigned).to_ptr();
+    // Result signedness must match the destination local's slot type so the
+    // store typechecks: `i32` locals are `Signed`, `u32` locals `Unsigned`.
+    let signedness = if signed {
+        Signedness::Signed
+    } else {
+        Signedness::Unsigned
+    };
+    let result_ty = IntegerType::get(ctx, 32, signedness).to_ptr();
 
     let (mask, mut last_op) = rvalue::translate_operand(
         ctx,
@@ -564,6 +576,114 @@ pub fn emit_warp_redux(
         block_map,
         loc,
         "warp redux call without target block",
+    )
+}
+
+/// Emit `elect.sync`: elect the lowest participating lane as leader (sm_90+).
+///
+/// The device fn returns `(u32, bool)` = `(leader_lane, is_elected)`. The LLVM
+/// intrinsic produces both halves in one `{i32, i1}` struct, so we build a
+/// 2-result `nvvm.elect_sync` op and pack its results into the destination
+/// tuple here; the lowering does the struct field extraction. `args` is
+/// `[mask]`.
+pub fn emit_elect_sync(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::MirConstructTupleOp;
+    use dialect_mir::types::MirTupleType;
+
+    if args.len() != 1 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "warp::elect_sync expects 1 argument [mask], got {}",
+                args.len()
+            ))
+        );
+    }
+
+    // The destination local is the `(u32, bool)` tuple. Derive the leader and
+    // predicate element types from it so the op results and the packed tuple
+    // typecheck against the slot exactly.
+    let tuple_ty = types::translate_type(ctx, &body.locals()[destination.local].ty)?;
+    let (leader_ty, elected_ty) = {
+        let t = tuple_ty.deref(ctx);
+        match t.downcast_ref::<MirTupleType>() {
+            Some(tup) if tup.get_types().len() == 2 => (tup.get_types()[0], tup.get_types()[1]),
+            _ => {
+                return input_err!(
+                    loc.clone(),
+                    TranslationErr::unsupported(
+                        "warp::elect_sync destination must be a (u32, bool) tuple".to_string()
+                    )
+                );
+            }
+        }
+    };
+
+    let (mask, last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+
+    // One op, two results: [leader (i32), is_elected (i1)].
+    let elect_op = Operation::new(
+        ctx,
+        ElectSyncOp::get_concrete_op_info(),
+        vec![leader_ty, elected_ty],
+        vec![mask],
+        vec![],
+        0,
+    );
+    elect_op.deref_mut(ctx).set_loc(loc.clone());
+
+    if let Some(prev) = last_op {
+        elect_op.insert_after(ctx, prev);
+    } else {
+        elect_op.insert_at_front(block_ptr, ctx);
+    }
+
+    let leader_val = elect_op.deref(ctx).get_result(0);
+    let elected_val = elect_op.deref(ctx).get_result(1);
+
+    // Pack (leader, is_elected) into the destination tuple.
+    let tuple_op = Operation::new(
+        ctx,
+        MirConstructTupleOp::get_concrete_op_info(),
+        vec![tuple_ty],
+        vec![leader_val, elected_val],
+        vec![],
+        0,
+    );
+    tuple_op.deref_mut(ctx).set_loc(loc.clone());
+    tuple_op.insert_after(ctx, elect_op);
+    let tuple_val = tuple_op.deref(ctx).get_result(0);
+
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        tuple_val,
+        target,
+        block_ptr,
+        tuple_op,
+        value_map,
+        block_map,
+        loc,
+        "warp::elect_sync call without target block",
     )
 }
 

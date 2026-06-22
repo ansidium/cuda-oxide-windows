@@ -25,10 +25,46 @@
 //! drop both the cached backend *and* the cached source tree so that step 4
 //! re-clones fresh and rebuilds, rather than rebuilding from a clone that
 //! was taken whenever the user first installed.
+//!
+//! ## Cache staleness vs. source (backend source advances)
+//!
+//! The binary-mtime check above does not fire when the developer updates
+//! the backend SOURCE (the `rustc-codegen-cuda` crate) but leaves the
+//! `cargo-oxide` binary unchanged. In that case the cached `.so` is older
+//! than the source it was built from, yet the binary check sees no upgrade
+//! and the stale backend is silently reused. To catch this we also compare
+//! the cached `.so` against the newest mtime of the backend source inputs
+//! (the crate's `src/**` and `Cargo.toml`) found in the cached source tree.
+//! When the source tree cannot be located we degrade gracefully to the
+//! binary-only check rather than erroring.
+//!
+//! The two stale signals call for different recovery. A binary upgrade means
+//! the cached source may no longer match the new binary, so we drop the
+//! source tree and re-clone fresh (above). A source advance means the cached
+//! source IS the newer truth, so we rebuild the `.so` from that existing
+//! source in place; re-cloning would throw away the very source that
+//! triggered the rebuild. Binary staleness takes precedence when both fire.
+//!
+//! ## Cache staleness vs. toolchain (the active rustc changes)
+//!
+//! The mtime checks above miss a toolchain swap: the cached `.so` is
+//! dynamically linked against one specific `librustc_driver-<hash>.so`, but a
+//! repo `rust-toolchain.toml` or a changed default nightly leaves the
+//! `cargo-oxide` binary and the cached source untouched. The stale `.so` then
+//! loads against the wrong driver and fails with a cryptic
+//! `librustc_driver-<hash>.so: cannot open shared object file`. To catch this
+//! we record the active toolchain fingerprint (`rustc -vV`) next to the cached
+//! `.so` at build time and compare it on every lookup; a recorded fingerprint
+//! that differs from the active toolchain forces a fresh re-clone and rebuild.
+//! This check has the highest precedence, since a toolchain mismatch makes the
+//! cached `.so` unloadable regardless of mtimes. A cache predating the
+//! fingerprint file defers to the mtime checks (a `cargo-oxide` reinstall or
+//! `rm -rf ~/.cargo/cuda-oxide` heals those).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use crate::platform;
 
@@ -92,10 +128,30 @@ pub fn find_or_build_backend(workspace_root: &Path) -> PathBuf {
     if let Some(cache_dir) = cache_directory() {
         let cached_backend = cache_dir.join(&backend_filename);
         if cached_backend.exists() {
-            if !cached_backend_is_stale(&cached_backend) {
-                return cached_backend;
+            let source_dir = cache_dir.join("src/crates/rustc-codegen-cuda");
+            match cached_backend_status(&cached_backend, Some(&source_dir)) {
+                CacheStatus::Fresh => return cached_backend,
+                CacheStatus::StaleVsBinary => invalidate_cache(&cache_dir, &backend_filename),
+                CacheStatus::StaleVsToolchain => {
+                    eprintln!(
+                        "Cached backend was built against a different Rust \
+                         toolchain; re-cloning and rebuilding at {}.",
+                        cache_dir.display()
+                    );
+                    invalidate_cache(&cache_dir, &backend_filename);
+                }
+                CacheStatus::StaleVsSource => {
+                    // The cached source advanced; rebuild the backend from it
+                    // in place. We do NOT invalidate the cache here, so the
+                    // auto-fetch step below skips the clone (the source tree
+                    // is still present) and rebuilds from the existing source.
+                    eprintln!(
+                        "Cached backend source at {} is newer than the cached \
+                         library; rebuilding from it in place.",
+                        source_dir.display()
+                    );
+                }
             }
-            invalidate_cache(&cache_dir, &backend_filename);
         }
     }
 
@@ -139,28 +195,155 @@ pub fn backend_candidate(workspace_root: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(backend_filename))
 }
 
-/// Returns true when the cached backend dynamic library is older than the running
-/// `cargo-oxide` binary, which means the user has upgraded the binary
-/// since the cache was last built.
+/// Why the cached backend is out of date, or that it is current. The two
+/// stale variants drive different recovery (re-clone vs. rebuild in place);
+/// see the module-level comment.
+#[derive(Debug, PartialEq, Eq)]
+enum CacheStatus {
+    /// Cache is up to date; reuse the cached `.so`.
+    Fresh,
+    /// The running `cargo-oxide` binary is newer than the cache: the user
+    /// upgraded the binary, so the cached source may no longer match it.
+    StaleVsBinary,
+    /// The cached backend source is newer than the cached `.so`: the source
+    /// was advanced in place and the `.so` should be rebuilt from it.
+    StaleVsSource,
+    /// The cached `.so` was built against a different Rust toolchain than the
+    /// active one: it links a `librustc_driver` hash that no longer resolves,
+    /// so it must be re-cloned and rebuilt. Highest precedence: an unloadable
+    /// `.so` is stale regardless of mtimes.
+    StaleVsToolchain,
+}
+
+/// Classifies the cached backend `.so` against the running `cargo-oxide`
+/// binary (the user upgraded the binary) and the newest backend source input
+/// (the developer advanced the source). When `source_dir` is `None`, or no
+/// source inputs can be found under it, only the binary check applies.
+/// Binary staleness takes precedence when both fire, since a binary upgrade
+/// wants a fresh clone (which also picks up the newest source).
 ///
-/// Conservative on errors: if we can't resolve our own executable path or
-/// stat either file, we report "not stale" so a working cache is never
-/// invalidated on a failed metadata read.
-fn cached_backend_is_stale(cached_backend: &Path) -> bool {
-    let Ok(self_path) = std::env::current_exe() else {
+/// Conservative on errors: if we can't stat the cached `.so`, we report
+/// [`CacheStatus::Fresh`] so a working cache is never invalidated on a failed
+/// metadata read.
+fn cached_backend_status(cached_so: &Path, source_dir: Option<&Path>) -> CacheStatus {
+    let Ok(so_meta) = std::fs::metadata(cached_so) else {
+        return CacheStatus::Fresh;
+    };
+    let Ok(so_mtime) = so_meta.modified() else {
+        return CacheStatus::Fresh;
+    };
+
+    // Toolchain check (highest precedence): a toolchain swap makes the cached
+    // `.so` unloadable no matter what the mtimes say, so it wins over the
+    // binary/source mtime signals below.
+    if let Some(cache_dir) = cached_so.parent()
+        && toolchain_fingerprint_mismatch(cache_dir)
+    {
+        return CacheStatus::StaleVsToolchain;
+    }
+
+    let self_mtime = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
+
+    // Binary check: if we can't stat our own executable, fall through to the
+    // source check rather than declaring the cache fresh, so the source
+    // signal is still honoured.
+    if matches!(self_mtime, Some(self_mtime) if self_mtime > so_mtime) {
+        return CacheStatus::StaleVsBinary;
+    }
+
+    let stale_vs_source = source_dir
+        .and_then(newest_backend_source_mtime)
+        .map(|src_mtime| src_mtime > so_mtime)
+        .unwrap_or(false);
+    if stale_vs_source {
+        return CacheStatus::StaleVsSource;
+    }
+
+    CacheStatus::Fresh
+}
+
+/// File next to the cached `.so` recording the toolchain it was built against.
+const TOOLCHAIN_FINGERPRINT_FILE: &str = "toolchain-fingerprint.txt";
+
+/// A stable fingerprint of the active Rust toolchain: the full `rustc -vV`
+/// output (release, commit-hash, host, LLVM version). The cached backend `.so`
+/// links against this toolchain's `librustc_driver`, so any change here means
+/// the cache can no longer be loaded.
+fn current_toolchain_fingerprint() -> Option<String> {
+    let output = Command::new("rustc").args(["-vV"]).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// True when the cached backend records a toolchain fingerprint that differs
+/// from the active toolchain. Conservative: if the active fingerprint cannot be
+/// read, or no fingerprint was recorded (a cache predating this check), returns
+/// `false` and defers to the mtime checks rather than thrashing a working
+/// cache. Pre-fingerprint caches are healed by the binary-mtime check on the
+/// next `cargo-oxide` reinstall, or by `rm -rf ~/.cargo/cuda-oxide`.
+fn toolchain_fingerprint_mismatch(cache_dir: &Path) -> bool {
+    let Some(current) = current_toolchain_fingerprint() else {
         return false;
     };
-    let Ok(self_meta) = std::fs::metadata(&self_path) else {
-        return false;
+    match std::fs::read_to_string(cache_dir.join(TOOLCHAIN_FINGERPRINT_FILE)) {
+        Ok(stored) => stored.trim() != current,
+        Err(_) => false,
+    }
+}
+
+/// Records the active toolchain fingerprint next to the cached `.so`. Best
+/// effort: a write failure just means the next run re-detects a mismatch and
+/// rebuilds again.
+fn write_toolchain_fingerprint(cache_dir: &Path) {
+    if let Some(fp) = current_toolchain_fingerprint() {
+        let _ = std::fs::write(cache_dir.join(TOOLCHAIN_FINGERPRINT_FILE), fp);
+    }
+}
+
+/// Returns the newest mtime among the backend source inputs under
+/// `source_dir`: every file in `src/**` plus the crate `Cargo.toml`.
+///
+/// Returns `None` when the directory cannot be located or yields no
+/// readable inputs, which lets [`cached_backend_status`] degrade to the
+/// binary-only check. The walk is best-effort: unreadable entries are
+/// skipped rather than treated as failures.
+fn newest_backend_source_mtime(source_dir: &Path) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+
+    let mut consider = |path: &Path| {
+        if let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) {
+            newest = Some(match newest {
+                Some(cur) if cur >= mtime => cur,
+                _ => mtime,
+            });
+        }
     };
-    let Ok(backend_meta) = std::fs::metadata(cached_backend) else {
-        return false;
+
+    consider(&source_dir.join("Cargo.toml"));
+    visit_files(&source_dir.join("src"), &mut consider);
+
+    newest
+}
+
+/// Recursively visits every regular file under `dir`, calling `f` on each.
+/// Best-effort: directories that cannot be read are skipped silently.
+fn visit_files(dir: &Path, f: &mut dyn FnMut(&Path)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
-    let (Ok(self_mtime), Ok(backend_mtime)) = (self_meta.modified(), backend_meta.modified())
-    else {
-        return false;
-    };
-    self_mtime > backend_mtime
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => visit_files(&path, f),
+            Ok(ft) if ft.is_file() => f(&path),
+            _ => {}
+        }
+    }
 }
 
 /// Drop both the cached backend and the cached source tree at `cache_dir`.
@@ -318,6 +501,7 @@ fn auto_fetch_and_build() -> PathBuf {
     let built_backend = backend_artifact_path(&codegen_crate, &host_target);
     if built_backend.exists() {
         std::fs::copy(&built_backend, &backend_path).expect("Failed to copy backend to cache");
+        write_toolchain_fingerprint(&cache_dir);
         eprintln!("✓ Backend cached at {}", backend_path.display());
     }
 
@@ -530,9 +714,10 @@ mod tests {
             SystemTime::now() - Duration::from_secs(365 * 24 * 60 * 60),
         );
 
-        assert!(
-            cached_backend_is_stale(&so),
-            "cache backdated by 1y must be reported stale"
+        assert_eq!(
+            cached_backend_status(&so, None),
+            CacheStatus::StaleVsBinary,
+            "cache backdated by 1y must be stale vs the running binary"
         );
     }
 
@@ -549,8 +734,9 @@ mod tests {
             SystemTime::now() + Duration::from_secs(365 * 24 * 60 * 60),
         );
 
-        assert!(
-            !cached_backend_is_stale(&so),
+        assert_eq!(
+            cached_backend_status(&so, None),
+            CacheStatus::Fresh,
             "cache postdating the test binary must be reported fresh"
         );
     }
@@ -562,7 +748,201 @@ mod tests {
     fn not_stale_when_cache_file_missing() {
         let dir = tempdir();
         let so = dir.join("does_not_exist.so");
-        assert!(!cached_backend_is_stale(&so));
+        assert_eq!(cached_backend_status(&so, None), CacheStatus::Fresh);
+    }
+
+    /// A backend source input newer than the cached `.so` must report
+    /// `StaleVsSource` (the "developer advanced the source" case that issue
+    /// #49's binary check alone misses). To isolate the source signal from
+    /// the binary signal, the `.so` is future-dated past the running test
+    /// binary, and the source file is dated later still.
+    #[test]
+    fn stale_when_source_postdates_cache() {
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        // Cache newer than the running binary so binary-staleness does NOT fire.
+        let cache_mtime = SystemTime::now() + year;
+        write_with_mtime(&so, b"built", cache_mtime);
+
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // Source newer than the cache: this is what trips source-staleness.
+        write_with_mtime(
+            &src.join("lib.rs"),
+            b"// updated source",
+            cache_mtime + year,
+        );
+        // Cargo.toml older than the .so; the src file is what trips staleness.
+        write_with_mtime(&dir.join("Cargo.toml"), b"[package]", SystemTime::now());
+
+        assert_eq!(
+            cached_backend_status(&so, Some(&dir)),
+            CacheStatus::StaleVsSource,
+            "source newer than cached .so must be stale vs source (rebuild in place)"
+        );
+    }
+
+    /// When every source input predates the cached `.so` (and the running
+    /// binary too), the cache is fresh and must not be invalidated.
+    #[test]
+    fn fresh_when_source_predates_cache() {
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        // Cache far in the future so the running test binary can't make it stale.
+        let cache_mtime = SystemTime::now() + Duration::from_secs(365 * 24 * 60 * 60);
+        write_with_mtime(&so, b"built", cache_mtime);
+
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        write_with_mtime(
+            &src.join("lib.rs"),
+            b"// old source",
+            SystemTime::now() - Duration::from_secs(60),
+        );
+        write_with_mtime(
+            &dir.join("Cargo.toml"),
+            b"[package]",
+            SystemTime::now() - Duration::from_secs(60),
+        );
+
+        assert_eq!(
+            cached_backend_status(&so, Some(&dir)),
+            CacheStatus::Fresh,
+            "source older than cached .so must be reported fresh"
+        );
+    }
+
+    /// A missing source tree must degrade to the binary-only check rather
+    /// than erroring or spuriously invalidating a future-dated cache.
+    #[test]
+    fn fresh_when_source_dir_absent() {
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        write_with_mtime(
+            &so,
+            b"fresh",
+            SystemTime::now() + Duration::from_secs(365 * 24 * 60 * 60),
+        );
+        let absent = dir.join("no-such-src-tree");
+        assert_eq!(
+            cached_backend_status(&so, Some(&absent)),
+            CacheStatus::Fresh,
+            "absent source tree must fall back to binary-only (fresh here)"
+        );
+    }
+
+    /// When BOTH the running binary and the cached source postdate the `.so`,
+    /// the binary signal wins so recovery re-clones fresh rather than
+    /// rebuilding from a source tree that a binary upgrade may have outdated.
+    #[test]
+    fn binary_staleness_takes_precedence_over_source() {
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        // Backdate the `.so` so the freshly built test binary is newer than it.
+        let base = SystemTime::now() - Duration::from_secs(365 * 24 * 60 * 60);
+        write_with_mtime(&so, b"built", base);
+
+        // Make the cached source newer than the `.so` too, so both signals fire.
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        write_with_mtime(
+            &src.join("lib.rs"),
+            b"// updated source",
+            base + Duration::from_secs(30),
+        );
+
+        assert_eq!(
+            cached_backend_status(&so, Some(&dir)),
+            CacheStatus::StaleVsBinary,
+            "binary staleness must win over source staleness"
+        );
+    }
+
+    /// A cached `.so` whose recorded toolchain fingerprint differs from the
+    /// active toolchain must be `StaleVsToolchain`, even when the mtimes alone
+    /// would call it fresh. This is the case the mtime checks miss: the active
+    /// rustc changed (e.g. a repo `rust-toolchain.toml`) while the binary and
+    /// source are untouched, leaving the cached `.so` linked against a
+    /// `librustc_driver` hash that no longer resolves.
+    #[test]
+    fn stale_when_toolchain_fingerprint_differs() {
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        // Future-date the `.so` so the binary/source mtime checks cannot fire.
+        write_with_mtime(&so, b"built", SystemTime::now() + year);
+        std::fs::write(
+            dir.join(TOOLCHAIN_FINGERPRINT_FILE),
+            "rustc 0.0.0 (deadbeef 1970-01-01)",
+        )
+        .unwrap();
+
+        assert_eq!(
+            cached_backend_status(&so, None),
+            CacheStatus::StaleVsToolchain,
+            "a recorded fingerprint differing from the active toolchain must be stale"
+        );
+    }
+
+    /// A cached `.so` whose recorded fingerprint matches the active toolchain
+    /// (with fresh mtimes) must be `Fresh`.
+    #[test]
+    fn fresh_when_toolchain_fingerprint_matches() {
+        let Some(fp) = current_toolchain_fingerprint() else {
+            return; // no rustc here; nothing to assert
+        };
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        write_with_mtime(&so, b"built", SystemTime::now() + year);
+        std::fs::write(dir.join(TOOLCHAIN_FINGERPRINT_FILE), fp).unwrap();
+
+        assert_eq!(
+            cached_backend_status(&so, None),
+            CacheStatus::Fresh,
+            "a matching fingerprint with fresh mtimes must be fresh"
+        );
+    }
+
+    /// A missing fingerprint file (a cache predating this check) must defer to
+    /// the mtime checks rather than forcing a rebuild, so existing caches are
+    /// not thrashed. Here the future-dated `.so` is therefore `Fresh`.
+    #[test]
+    fn missing_toolchain_fingerprint_defers_to_mtime() {
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        write_with_mtime(&so, b"built", SystemTime::now() + year);
+        // No fingerprint file written.
+        assert_eq!(
+            cached_backend_status(&so, None),
+            CacheStatus::Fresh,
+            "absent fingerprint must defer to mtime checks (fresh here)"
+        );
+    }
+
+    /// The toolchain check has the highest precedence: a differing fingerprint
+    /// wins even when the cache is also stale-vs-binary, because an unloadable
+    /// `.so` must be re-cloned regardless of why else it is stale.
+    #[test]
+    fn toolchain_staleness_takes_precedence_over_binary() {
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        // Backdate the `.so` so binary-staleness would otherwise fire.
+        write_with_mtime(&so, b"built", SystemTime::now() - year);
+        std::fs::write(
+            dir.join(TOOLCHAIN_FINGERPRINT_FILE),
+            "rustc 0.0.0 (deadbeef 1970-01-01)",
+        )
+        .unwrap();
+
+        assert_eq!(
+            cached_backend_status(&so, None),
+            CacheStatus::StaleVsToolchain,
+            "toolchain mismatch must win over binary staleness"
+        );
     }
 
     #[test]

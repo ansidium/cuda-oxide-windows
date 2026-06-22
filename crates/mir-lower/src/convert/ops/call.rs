@@ -226,6 +226,18 @@ enum RustFloatMathIntrinsic {
     AtanF64,
     CbrtF32,
     CbrtF64,
+    SinhF32,
+    SinhF64,
+    CoshF32,
+    CoshF64,
+    TanhF32,
+    TanhF64,
+    Expm1F32,
+    Expm1F64,
+    Log1pF32,
+    Log1pF64,
+    HypotF32,
+    HypotF64,
     FaddFast,
     FsubFast,
     FmulFast,
@@ -290,6 +302,18 @@ impl RustFloatMathIntrinsic {
             rust_intrinsics::CALLEE_ATAN_F64 => Some(Self::AtanF64),
             rust_intrinsics::CALLEE_CBRT_F32 => Some(Self::CbrtF32),
             rust_intrinsics::CALLEE_CBRT_F64 => Some(Self::CbrtF64),
+            rust_intrinsics::CALLEE_SINH_F32 => Some(Self::SinhF32),
+            rust_intrinsics::CALLEE_SINH_F64 => Some(Self::SinhF64),
+            rust_intrinsics::CALLEE_COSH_F32 => Some(Self::CoshF32),
+            rust_intrinsics::CALLEE_COSH_F64 => Some(Self::CoshF64),
+            rust_intrinsics::CALLEE_TANH_F32 => Some(Self::TanhF32),
+            rust_intrinsics::CALLEE_TANH_F64 => Some(Self::TanhF64),
+            rust_intrinsics::CALLEE_EXPM1_F32 => Some(Self::Expm1F32),
+            rust_intrinsics::CALLEE_EXPM1_F64 => Some(Self::Expm1F64),
+            rust_intrinsics::CALLEE_LOG1P_F32 => Some(Self::Log1pF32),
+            rust_intrinsics::CALLEE_LOG1P_F64 => Some(Self::Log1pF64),
+            rust_intrinsics::CALLEE_HYPOT_F32 => Some(Self::HypotF32),
+            rust_intrinsics::CALLEE_HYPOT_F64 => Some(Self::HypotF64),
             rust_intrinsics::CALLEE_FADD_FAST => Some(Self::FaddFast),
             rust_intrinsics::CALLEE_FSUB_FAST => Some(Self::FsubFast),
             rust_intrinsics::CALLEE_FMUL_FAST => Some(Self::FmulFast),
@@ -365,6 +389,18 @@ impl RustFloatMathIntrinsic {
             Self::AtanF64 => Ok("__nv_atan"),
             Self::CbrtF32 => Ok("__nv_cbrtf"),
             Self::CbrtF64 => Ok("__nv_cbrt"),
+            Self::SinhF32 => Ok("__nv_sinhf"),
+            Self::SinhF64 => Ok("__nv_sinh"),
+            Self::CoshF32 => Ok("__nv_coshf"),
+            Self::CoshF64 => Ok("__nv_cosh"),
+            Self::TanhF32 => Ok("__nv_tanhf"),
+            Self::TanhF64 => Ok("__nv_tanh"),
+            Self::Expm1F32 => Ok("__nv_expm1f"),
+            Self::Expm1F64 => Ok("__nv_expm1"),
+            Self::Log1pF32 => Ok("__nv_log1pf"),
+            Self::Log1pF64 => Ok("__nv_log1p"),
+            Self::HypotF32 => Ok("__nv_hypotf"),
+            Self::HypotF64 => Ok("__nv_hypot"),
             Self::FaddFast | Self::FsubFast | Self::FmulFast | Self::FdivFast | Self::FremFast => {
                 // The `f*_fast` intrinsics lower directly to LLVM `fadd`/`fsub`/
                 // `fmul`/`fdiv`/`frem` with fast-math flags, not to a libdevice
@@ -394,6 +430,8 @@ impl RustFloatMathIntrinsic {
             | Self::MinNumNszF64
             | Self::Atan2F32
             | Self::Atan2F64
+            | Self::HypotF32
+            | Self::HypotF64
             | Self::FaddFast
             | Self::FsubFast
             | Self::FmulFast

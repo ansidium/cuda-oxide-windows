@@ -25,6 +25,7 @@ cargo oxide new my_project          # scaffold a new cuda-oxide project
 cargo oxide new my_project --async  # scaffold with async template (tokio + cuda-async)
 cargo oxide run vecadd              # build + run an example
 cargo oxide build vecadd            # compile only (no run)
+cargo oxide emit-ltoir vecadd --arch sm_100  # device code -> .ltoir (Tile/SIMT interop)
 cargo oxide pipeline vecadd         # verbose pipeline dump
                                     # (MIR -> dialect-mir -> LLVM dialect -> LLVM IR -> PTX)
 cargo oxide debug vecadd --tui      # build + launch cuda-gdb
@@ -36,17 +37,21 @@ cargo oxide setup                   # explicitly build the codegen backend
 
 ### Flags
 
-| Flag              | Applies to           | Description                                     |
-|-------------------|----------------------|-------------------------------------------------|
-| `--emit-nvvm-ir`  | run, build, pipeline | Generate NVVM IR for libNVVM                    |
-| `--arch <sm_XX>`  | run, build, pipeline | Target architecture override                    |
-| `--features <F>`  | run, build           | Comma-separated cargo features to enable        |
-| `-v, --verbose`   | run, build           | Show detailed compilation output                |
-| `--no-fmad`       | run, build, pipeline | Disable FMA contraction (keep separate mul+add) |
-| `--async`         | new                  | Use the async template                          |
-| `--cgdb`          | debug                | Use cgdb instead of cuda-gdb                    |
-| `--tui`           | debug                | Use GDB's TUI interface                         |
-| `--check`         | fmt                  | Check formatting only                           |
+| Flag               | Applies to                       | Description                                     |
+|--------------------|----------------------------------|-------------------------------------------------|
+| `--emit-nvvm-ir`   | run, build, pipeline             | Generate NVVM IR for libNVVM                    |
+| `--arch <sm_XX>`   | run, build, pipeline, emit-ltoir | Target arch override                            |
+| `--features <F>`   | run, build, emit-ltoir           | Comma-separated cargo features to enable        |
+| `-o, --output <P>` | emit-ltoir                       | Output path for the `.ltoir` artifact           |
+| `-v, --verbose`    | run, build, emit-ltoir           | Show detailed compilation output                |
+| `--no-fmad`        | run, build, pipeline             | Disable FMA contraction (keep separate mul+add) |
+| `--async`          | new                              | Use the async template                          |
+| `--cgdb`           | debug                            | Use cgdb instead of cuda-gdb                    |
+| `--tui`            | debug                            | Use GDB's TUI interface                         |
+| `--check`          | fmt                              | Check formatting only                           |
+
+`--arch` is required for `emit-ltoir` (LTOIR is architecture-specific); for all other
+commands it is optional and defaults to host GPU auto-detection.
 
 `--no-fmad` disables FMA contraction for kernels that rely on two separate
 roundings (e.g. Dekker's algorithm, 2Sum). Equivalent to `CUDA_OXIDE_NO_FMA=1`.
@@ -89,6 +94,30 @@ Same as `run` but stops after compilation. Useful for examples that require hard
 cargo oxide build htens          # compiles PTX, doesn't try to run on GPU
 cargo oxide build tcgen05        # sm_100a only, but PTX generation works anywhere
 ```
+
+### `cargo oxide emit-ltoir <crate>`
+
+Compiles a crate's device code to a binary LTOIR artifact in one step, for the
+Tile-to-SIMT interop workflow ([#96](https://github.com/NVlabs/cuda-oxide/issues/96)):
+cuda-oxide is the SIMT participant, producing LTOIR that a tile or CUDA C++ kernel
+links against. It builds the crate in NVVM IR mode, then runs the emitted
+`<crate>.ll` through libNVVM `-gen-lto`, writing `<crate>.ltoir`.
+
+`--arch` is required, since LTOIR is architecture-specific. It accepts `sm_XX`,
+`compute_XX`, or a bare `XX`. The default output path is `<crate-dir>/<crate>.ltoir`;
+`-o/--output` overrides it.
+
+```bash
+cargo oxide emit-ltoir standalone_device_fn --arch sm_100
+cargo oxide emit-ltoir my_simt_crate --arch sm_120 -o build/simt.ltoir
+```
+
+cuda-oxide currently exports NVVM IR 2.0 (opaque pointers), which libNVVM only
+accepts for `compute_100` and newer (Blackwell+). Targeting an older architecture
+fails in libNVVM while parsing types; `emit-ltoir` detects this and points at the
+typed-pointer export work tracked in
+[#98](https://github.com/NVlabs/cuda-oxide/issues/98). Use `--arch sm_100` or
+newer until that lands.
 
 ### `cargo oxide pipeline <example>`
 

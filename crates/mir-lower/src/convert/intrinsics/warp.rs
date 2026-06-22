@@ -343,3 +343,68 @@ pub(crate) fn convert_match_all(
     rewriter.replace_operation_with_values(ctx, op, vec![mask_result]);
     Ok(())
 }
+
+/// Convert an `elect.sync` op to inline PTX.
+///
+/// `elect.sync` is Hopper-only (sm_90+). LLVM declares the
+/// `@llvm.nvvm.elect.sync` intrinsic but the NVPTX backend ships **no
+/// instruction-selection pattern** for it (llc dies with "Cannot select:
+/// intrinsic %llvm.nvvm.elect.sync" even with `-mcpu=sm_90`), so we emit the
+/// instruction directly as convergent inline PTX instead — the same approach
+/// the tcgen05 ops use to dodge missing intrinsic lowerings.
+///
+/// PTX `elect.sync d|p, membermask;` writes the leader lane id into `d` and the
+/// per-lane "I am the leader" predicate into `p`. Inline asm can't yield a
+/// `.pred` directly, so we `selp.b32` it into a 0/1 register and truncate to i1.
+/// The op has two results — leader (i32) and is_elected (i1) — bound to the two
+/// asm outputs. The single operand (the membermask) is the asm input; either
+/// result may be unused at the call site and is then removed by LLVM DCE.
+pub(crate) fn convert_elect_sync(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    use llvm_export::ops::ExtractValueOp;
+
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 1 {
+        return pliron::input_err_noloc!("elect.sync requires 1 operand [mask]");
+    }
+    let mask = operands[0];
+
+    // Two register outputs: $0 = leader lane id, $1 = predicate materialized as
+    // 0/1; $2 = membermask input. The `.pred p` is scoped to the asm block.
+    let asm_template = "{ .reg .pred p; elect.sync $0|p, $2; selp.b32 $1, 1, 0, p; }";
+    let struct_ty = llvm_types::StructType::get_unnamed(ctx, vec![i32_ty.into(), i32_ty.into()]);
+    let asm_op = inline_asm_convergent(
+        ctx,
+        rewriter,
+        struct_ty.into(),
+        vec![mask],
+        asm_template,
+        "=r,=r,r",
+    );
+    let struct_result = asm_op.deref(ctx).get_result(0);
+
+    // Field 0 → leader lane id (result 0). Field 1 → predicate as 0/1 i32,
+    // truncated to the i1 is_elected result (result 1).
+    let leader = {
+        let extract_op = ExtractValueOp::new(ctx, struct_result, vec![0])
+            .map_err(|e| pliron::input_error_noloc!("elect.sync extractvalue: {}", e))?;
+        rewriter.insert_operation(ctx, extract_op.get_operation());
+        extract_op.get_operation().deref(ctx).get_result(0)
+    };
+    let elected_i32 = {
+        let extract_op = ExtractValueOp::new(ctx, struct_result, vec![1])
+            .map_err(|e| pliron::input_error_noloc!("elect.sync extractvalue: {}", e))?;
+        rewriter.insert_operation(ctx, extract_op.get_operation());
+        extract_op.get_operation().deref(ctx).get_result(0)
+    };
+    let is_elected = trunc_to_i1(ctx, rewriter, elected_i32);
+
+    rewriter.replace_operation_with_values(ctx, op, vec![leader, is_elected]);
+    Ok(())
+}

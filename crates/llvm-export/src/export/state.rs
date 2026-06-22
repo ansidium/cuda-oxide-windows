@@ -224,9 +224,17 @@ mod tests {
     #[test]
     fn non_collective_intrinsics_are_not_convergent() {
         // Plain ALU/special-register intrinsics must NOT be flagged convergent.
+        // The lane-position masks are read-only sregs (dotted names produced by
+        // lowering `lanemask_*`: underscores -> dots on export), so despite
+        // being warp-related they carry no convergence constraint.
         for name in [
             "llvm.nvvm.read.ptx.sreg.tid.x",
             "llvm.nvvm.read.ptx.sreg.laneid",
+            "llvm.nvvm.read.ptx.sreg.lanemask.lt",
+            "llvm.nvvm.read.ptx.sreg.lanemask.le",
+            "llvm.nvvm.read.ptx.sreg.lanemask.eq",
+            "llvm.nvvm.read.ptx.sreg.lanemask.ge",
+            "llvm.nvvm.read.ptx.sreg.lanemask.gt",
         ] {
             assert!(
                 !ModuleExportState::is_convergent_intrinsic(name),
@@ -242,10 +250,23 @@ mod tests {
         assert!(ModuleExportState::is_convergent_intrinsic(
             "llvm.nvvm.redux.sync.add"
         ));
-        // The whole redux.sync family is a warp collective (future min/max/etc.).
-        assert!(ModuleExportState::is_convergent_intrinsic(
-            "llvm.nvvm.redux.sync.umin"
-        ));
+        // The whole redux.sync integer family is a warp collective and must be
+        // flagged convergent (the `llvm.nvvm.redux` prefix covers every name
+        // lowered by the redux ops).
+        for name in [
+            "llvm.nvvm.redux.sync.umin",
+            "llvm.nvvm.redux.sync.min",
+            "llvm.nvvm.redux.sync.umax",
+            "llvm.nvvm.redux.sync.max",
+            "llvm.nvvm.redux.sync.and",
+            "llvm.nvvm.redux.sync.or",
+            "llvm.nvvm.redux.sync.xor",
+        ] {
+            assert!(
+                ModuleExportState::is_convergent_intrinsic(name),
+                "{name} should be convergent"
+            );
+        }
         // A plain ALU/sreg intrinsic must NOT be flagged convergent.
         assert!(!ModuleExportState::is_convergent_intrinsic(
             "llvm.nvvm.read.ptx.sreg.tid.x"

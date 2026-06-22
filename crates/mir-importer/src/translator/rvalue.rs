@@ -2587,13 +2587,25 @@ pub fn translate_operand(
     }
 }
 
-/// Translate a MIR [`Place`](mir::Place) to its corresponding pliron IR SSA [`Value`].
+/// Translate MIR [`Place`](mir::Place) reads to pliron IR SSA [`Value`]s.
 ///
-/// For a simple local with no projections this is a lookup in `value_map`.
-/// For projections (`field`, `index`, `deref`, `downcast`) the function
-/// creates the necessary pliron IR operations and inserts them after `prev_op`.
+/// Reads for `Copy(place)` and `Move(place)` first ask a side-effect-free
+/// classifier whether the place has a real final load address. Addressable
+/// reads use the same
+/// `translate_place_address` walker as refs, raw addresses, and writes, then
+/// emit one `mir.load` at the end.
 ///
-/// # Ghost locals
+/// Places that are not representable as one final load address use the explicit
+/// value fallback below. The fallback handles value-only projections such as
+/// enum payload extraction, tuple field extraction, ZST reads, and no-slot
+/// locals.
+///
+/// A bare slot-backed local is the trivial addressable case: it reads by
+/// loading the local's alloca slot once. Projected reads compose address
+/// operations for `field`, `index`, and `deref` when the whole projection
+/// chain stays addressable.
+///
+/// # Value fallback and ghost locals
 ///
 /// A local may have no backing slot in `value_map` if rustc optimised away its
 /// assignment, or if the local is ZST and has no runtime footprint.
@@ -2611,6 +2623,277 @@ pub fn translate_operand(
 /// `(value, last_inserted_op)` -- the pliron IR value for the place and the last
 /// operation inserted into the block (for op-ordering bookkeeping).
 pub fn translate_place(
+    ctx: &mut Context,
+    body: &mir::Body,
+    place: &mir::Place,
+    value_map: &ValueMap,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    match classify_place_read_strategy(ctx, place, value_map)? {
+        PlaceReadStrategy::Address => {
+            if let Some((value, last_op)) = translate_place_load_from_address(
+                ctx,
+                body,
+                place,
+                value_map,
+                block_ptr,
+                prev_op,
+                loc.clone(),
+            )? {
+                return Ok((value, last_op));
+            }
+
+            input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "place read {:?} was classified as addressable but did not lower to a \
+                     final load address",
+                    place.projection
+                ))
+            )
+        }
+        PlaceReadStrategy::ValueFallback => {
+            translate_place_value_fallback(ctx, body, place, value_map, block_ptr, prev_op, loc)
+        }
+    }
+}
+
+// ============================================================================
+// Place Read Strategy and Address Path
+// ============================================================================
+
+enum PlaceReadStrategy {
+    /// Read the place by walking to its in-memory address and loading once.
+    Address,
+    /// Read the place through value projection because it is not representable
+    /// as one final load address.
+    ValueFallback,
+}
+
+/// Choose how to lower MIR place reads.
+///
+/// This deliberately does not emit IR. The address walker may create several
+/// operations before discovering an unsupported projection, so read lowering
+/// must not call it speculatively and then fall back to value projections.
+///
+/// Conservative fallback is part of the design. Enum payload addressing,
+/// unsupported slice forms, ZST results, and computed/no-slot values remain on
+/// the value path until they have dedicated address-lowering support.
+fn classify_place_read_strategy(
+    ctx: &mut Context,
+    place: &mir::Place,
+    value_map: &ValueMap,
+) -> TranslationResult<PlaceReadStrategy> {
+    let Some(slot) = value_map.get_slot(place.local) else {
+        return Ok(PlaceReadStrategy::ValueFallback);
+    };
+
+    if place.projection.is_empty() {
+        let Some(final_pointee) = mir_ptr_pointee(ctx, slot.get_type(ctx)) else {
+            return Ok(PlaceReadStrategy::ValueFallback);
+        };
+        if types::is_zst_type(ctx, final_pointee) {
+            return Ok(PlaceReadStrategy::ValueFallback);
+        }
+        return Ok(PlaceReadStrategy::Address);
+    };
+
+    let mut current_ptr_ty = slot.get_type(ctx);
+    let mut current_is_slice_data = false;
+
+    for (proj_idx, elem) in place.projection.iter().enumerate() {
+        let entered_as_slice_data = current_is_slice_data;
+        current_is_slice_data = false;
+
+        match elem {
+            mir::ProjectionElem::Deref => {
+                let Some(place_ty) = mir_ptr_pointee(ctx, current_ptr_ty) else {
+                    return Ok(PlaceReadStrategy::ValueFallback);
+                };
+
+                if is_empty_tuple_type(ctx, place_ty) {
+                    continue;
+                }
+
+                if let Some(elem_ty) = slice_like_element_type(ctx, place_ty) {
+                    let is_last = proj_idx + 1 == place.projection.len();
+                    if is_last {
+                        // The address walker returns a loaded fat value for a
+                        // trailing slice-shaped deref. This helper handles only
+                        // paths whose final result is an address to load from.
+                        return Ok(PlaceReadStrategy::ValueFallback);
+                    }
+
+                    match &place.projection[proj_idx + 1] {
+                        mir::ProjectionElem::Field(_, field_rust_ty) => {
+                            if rust_ty_is_slice(field_rust_ty) {
+                                // Borrow/read of an unsized tail constructs a
+                                // fat value, not a thin final address.
+                                return Ok(PlaceReadStrategy::ValueFallback);
+                            }
+                            current_ptr_ty = dialect_mir::types::MirPtrType::get_generic(
+                                ctx, elem_ty, /* is_mutable */ false,
+                            )
+                            .into();
+                        }
+                        mir::ProjectionElem::Index(_)
+                        | mir::ProjectionElem::ConstantIndex {
+                            from_end: false, ..
+                        } => {
+                            current_ptr_ty = dialect_mir::types::MirPtrType::get_generic(
+                                ctx, elem_ty, /* is_mutable */ false,
+                            )
+                            .into();
+                            current_is_slice_data = true;
+                        }
+                        _ => return Ok(PlaceReadStrategy::ValueFallback),
+                    }
+                } else if place_ty.deref(ctx).is::<dialect_mir::types::MirPtrType>() {
+                    current_ptr_ty = place_ty;
+                } else {
+                    return Ok(PlaceReadStrategy::ValueFallback);
+                }
+            }
+
+            mir::ProjectionElem::Field(_, field_ty) => {
+                let Some(pointee) = mir_ptr_pointee(ctx, current_ptr_ty) else {
+                    return Ok(PlaceReadStrategy::ValueFallback);
+                };
+                if !pointee.deref(ctx).is::<dialect_mir::types::MirStructType>() {
+                    // `mir.field_addr` currently verifies only struct
+                    // pointees. Tuple field reads stay on the value path,
+                    // where `mir.extract_field` supports tuple values.
+                    return Ok(PlaceReadStrategy::ValueFallback);
+                }
+                let field_type = types::translate_type(ctx, field_ty)?;
+                current_ptr_ty = dialect_mir::types::MirPtrType::get_generic(
+                    ctx, field_type, /* is_mutable */ false,
+                )
+                .into();
+            }
+
+            mir::ProjectionElem::Index(_) => {
+                let Some((mut pointee_kind, addr_space)) =
+                    pointer_type_pointee_kind(ctx, current_ptr_ty)
+                else {
+                    return Ok(PlaceReadStrategy::ValueFallback);
+                };
+                if entered_as_slice_data {
+                    pointee_kind = PointeeKind::Direct;
+                }
+                current_ptr_ty = indexed_element_ptr_type(
+                    ctx,
+                    current_ptr_ty,
+                    pointee_kind,
+                    addr_space,
+                    /* is_mutable */ false,
+                );
+            }
+
+            mir::ProjectionElem::ConstantIndex { from_end, .. } => {
+                if *from_end {
+                    return Ok(PlaceReadStrategy::ValueFallback);
+                }
+                let Some((mut pointee_kind, addr_space)) =
+                    pointer_type_pointee_kind(ctx, current_ptr_ty)
+                else {
+                    return Ok(PlaceReadStrategy::ValueFallback);
+                };
+                if entered_as_slice_data {
+                    pointee_kind = PointeeKind::Direct;
+                }
+                current_ptr_ty = indexed_element_ptr_type(
+                    ctx,
+                    current_ptr_ty,
+                    pointee_kind,
+                    addr_space,
+                    /* is_mutable */ false,
+                );
+            }
+
+            // Enum payload addressing and subslices are value projections, not
+            // final load addresses.
+            mir::ProjectionElem::Downcast(_) => return Ok(PlaceReadStrategy::ValueFallback),
+            _ => return Ok(PlaceReadStrategy::ValueFallback),
+        }
+    }
+
+    let Some(final_pointee) = mir_ptr_pointee(ctx, current_ptr_ty) else {
+        return Ok(PlaceReadStrategy::ValueFallback);
+    };
+    if types::is_zst_type(ctx, final_pointee) {
+        return Ok(PlaceReadStrategy::ValueFallback);
+    }
+
+    Ok(PlaceReadStrategy::Address)
+}
+
+/// Lower an addressable place read by computing its in-memory address, then
+/// emitting one final `mir.load` from that address.
+///
+/// Returning `None` means the address walker did not produce a final load
+/// address. `translate_place` treats that as a checker/walker divergence when
+/// the classifier selected the address path.
+#[allow(clippy::too_many_arguments)]
+fn translate_place_load_from_address(
+    ctx: &mut Context,
+    body: &mir::Body,
+    place: &mir::Place,
+    value_map: &ValueMap,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<Option<(Value, Option<Ptr<Operation>>)>> {
+    let Some((addr, addr_prev_op)) = translate_place_address(
+        ctx,
+        body,
+        value_map,
+        place,
+        /* is_mutable */ false,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let Some(pointee) = mir_ptr_pointee(ctx, addr.get_type(ctx)) else {
+        return Ok(None);
+    };
+    if types::is_zst_type(ctx, pointee) {
+        return Ok(None);
+    }
+
+    let load_op = Operation::new(
+        ctx,
+        MirLoadOp::get_concrete_op_info(),
+        vec![pointee],
+        vec![addr],
+        vec![],
+        0,
+    );
+    load_op.deref_mut(ctx).set_loc(loc);
+    match addr_prev_op.or(prev_op) {
+        Some(prev) => load_op.insert_after(ctx, prev),
+        None => load_op.insert_at_front(block_ptr, ctx),
+    }
+
+    let value = load_op.deref(ctx).get_result(0);
+    Ok(Some((value, Some(load_op))))
+}
+
+// ============================================================================
+// Place Read Value Fallback
+// ============================================================================
+
+/// Explicit value-projection fallback for place reads that are not addressable.
+///
+/// Handles value-only reads, including enum downcast/payload extraction, tuple
+/// field extraction, no-slot ghost locals, and ZST synthesis.
+fn translate_place_value_fallback(
     ctx: &mut Context,
     body: &mir::Body,
     place: &mir::Place,
@@ -2660,29 +2943,6 @@ pub fn translate_place(
             ))
         )
     } else {
-        if projected_place_read_is_addressable(ctx, place, value_map)? {
-            if let Some((value, last_op)) = translate_place_load_from_address(
-                ctx,
-                body,
-                place,
-                value_map,
-                block_ptr,
-                prev_op,
-                loc.clone(),
-            )? {
-                return Ok((value, last_op));
-            }
-
-            return input_err!(
-                loc,
-                TranslationErr::unsupported(format!(
-                    "projected place {:?} was classified as addressable but did not lower to a \
-                     final load address",
-                    place.projection
-                ))
-            );
-        }
-
         // Handle projections (place.field, place[index], etc.)
         // For now, handle tuple field projections (_3.0, _3.1, etc.)
         if place.projection.len() == 1 {
@@ -3131,199 +3391,6 @@ pub fn translate_place(
             translate_place_iterative(ctx, body, place, value_map, block_ptr, prev_op, loc)
         }
     }
-}
-
-/// Return true when a projected place read can be lowered as:
-///
-/// 1. compute the place's in-memory address with `translate_place_address`,
-/// 2. emit one final `mir.load` from that address.
-///
-/// This deliberately does not emit IR. The address walker may create several
-/// operations before discovering an unsupported projection, so read lowering
-/// must not call it speculatively and then fall back to value projections.
-fn projected_place_read_is_addressable(
-    ctx: &mut Context,
-    place: &mir::Place,
-    value_map: &ValueMap,
-) -> TranslationResult<bool> {
-    if place.projection.is_empty() {
-        return Ok(false);
-    }
-
-    let Some(slot) = value_map.get_slot(place.local) else {
-        return Ok(false);
-    };
-
-    let mut current_ptr_ty = slot.get_type(ctx);
-    let mut current_is_slice_data = false;
-
-    for (proj_idx, elem) in place.projection.iter().enumerate() {
-        let entered_as_slice_data = current_is_slice_data;
-        current_is_slice_data = false;
-
-        match elem {
-            mir::ProjectionElem::Deref => {
-                let Some(place_ty) = mir_ptr_pointee(ctx, current_ptr_ty) else {
-                    return Ok(false);
-                };
-
-                if is_empty_tuple_type(ctx, place_ty) {
-                    continue;
-                }
-
-                if let Some(elem_ty) = slice_like_element_type(ctx, place_ty) {
-                    let is_last = proj_idx + 1 == place.projection.len();
-                    if is_last {
-                        // The address walker returns a loaded fat value for a
-                        // trailing slice-shaped deref. This helper handles only
-                        // paths whose final result is an address to load from.
-                        return Ok(false);
-                    }
-
-                    match &place.projection[proj_idx + 1] {
-                        mir::ProjectionElem::Field(_, field_rust_ty) => {
-                            if rust_ty_is_slice(field_rust_ty) {
-                                // Borrow/read of an unsized tail constructs a
-                                // fat value, not a thin final address.
-                                return Ok(false);
-                            }
-                            current_ptr_ty = dialect_mir::types::MirPtrType::get_generic(
-                                ctx, elem_ty, /* is_mutable */ false,
-                            )
-                            .into();
-                        }
-                        mir::ProjectionElem::Index(_)
-                        | mir::ProjectionElem::ConstantIndex {
-                            from_end: false, ..
-                        } => {
-                            current_ptr_ty = dialect_mir::types::MirPtrType::get_generic(
-                                ctx, elem_ty, /* is_mutable */ false,
-                            )
-                            .into();
-                            current_is_slice_data = true;
-                        }
-                        _ => return Ok(false),
-                    }
-                } else if place_ty.deref(ctx).is::<dialect_mir::types::MirPtrType>() {
-                    current_ptr_ty = place_ty;
-                } else {
-                    return Ok(false);
-                }
-            }
-
-            mir::ProjectionElem::Field(_, field_ty) => {
-                let Some(pointee) = mir_ptr_pointee(ctx, current_ptr_ty) else {
-                    return Ok(false);
-                };
-                if !pointee.deref(ctx).is::<dialect_mir::types::MirStructType>() {
-                    return Ok(false);
-                }
-                let field_type = types::translate_type(ctx, field_ty)?;
-                current_ptr_ty = dialect_mir::types::MirPtrType::get_generic(
-                    ctx, field_type, /* is_mutable */ false,
-                )
-                .into();
-            }
-
-            mir::ProjectionElem::Index(_) => {
-                let Some((mut pointee_kind, addr_space)) =
-                    pointer_type_pointee_kind(ctx, current_ptr_ty)
-                else {
-                    return Ok(false);
-                };
-                if entered_as_slice_data {
-                    pointee_kind = PointeeKind::Direct;
-                }
-                current_ptr_ty = indexed_element_ptr_type(
-                    ctx,
-                    current_ptr_ty,
-                    pointee_kind,
-                    addr_space,
-                    /* is_mutable */ false,
-                );
-            }
-
-            mir::ProjectionElem::ConstantIndex { from_end, .. } => {
-                if *from_end {
-                    return Ok(false);
-                }
-                let Some((mut pointee_kind, addr_space)) =
-                    pointer_type_pointee_kind(ctx, current_ptr_ty)
-                else {
-                    return Ok(false);
-                };
-                if entered_as_slice_data {
-                    pointee_kind = PointeeKind::Direct;
-                }
-                current_ptr_ty = indexed_element_ptr_type(
-                    ctx,
-                    current_ptr_ty,
-                    pointee_kind,
-                    addr_space,
-                    /* is_mutable */ false,
-                );
-            }
-
-            // Enum payload addressing and subslices still belong to the
-            // existing value-projection fallback.
-            mir::ProjectionElem::Downcast(_) => return Ok(false),
-            _ => return Ok(false),
-        }
-    }
-
-    let Some(final_pointee) = mir_ptr_pointee(ctx, current_ptr_ty) else {
-        return Ok(false);
-    };
-    Ok(!types::is_zst_type(ctx, final_pointee))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn translate_place_load_from_address(
-    ctx: &mut Context,
-    body: &mir::Body,
-    place: &mir::Place,
-    value_map: &ValueMap,
-    block_ptr: Ptr<BasicBlock>,
-    prev_op: Option<Ptr<Operation>>,
-    loc: Location,
-) -> TranslationResult<Option<(Value, Option<Ptr<Operation>>)>> {
-    let Some((addr, addr_prev_op)) = translate_place_address(
-        ctx,
-        body,
-        value_map,
-        place,
-        /* is_mutable */ false,
-        block_ptr,
-        prev_op,
-        loc.clone(),
-    )?
-    else {
-        return Ok(None);
-    };
-
-    let Some(pointee) = mir_ptr_pointee(ctx, addr.get_type(ctx)) else {
-        return Ok(None);
-    };
-    if types::is_zst_type(ctx, pointee) {
-        return Ok(None);
-    }
-
-    let load_op = Operation::new(
-        ctx,
-        MirLoadOp::get_concrete_op_info(),
-        vec![pointee],
-        vec![addr],
-        vec![],
-        0,
-    );
-    load_op.deref_mut(ctx).set_loc(loc);
-    match addr_prev_op.or(prev_op) {
-        Some(prev) => load_op.insert_after(ctx, prev),
-        None => load_op.insert_at_front(block_ptr, ctx),
-    }
-
-    let value = load_op.deref(ctx).get_result(0);
-    Ok(Some((value, Some(load_op))))
 }
 
 // ============================================================================
