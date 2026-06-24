@@ -43,26 +43,28 @@ use dialect_nvvm::ops::{
     CpAsyncBulkTensorG2sTile3dOp, CpAsyncBulkTensorG2sTile4dOp, CpAsyncBulkTensorG2sTile5dOp,
     CpAsyncBulkTensorS2gTile1dOp, CpAsyncBulkTensorS2gTile2dOp, CpAsyncBulkTensorS2gTile3dOp,
     CpAsyncBulkTensorS2gTile4dOp, CpAsyncBulkTensorS2gTile5dOp, CpAsyncBulkWaitGroupOp,
-    CpAsyncBulkWaitGroupReadOp, CvtF16x2F32Op, CvtF32x2Bf16x2Op, DsmemReadU32Op, ElectSyncOp,
-    FenceProxyAsyncSharedCtaOp, FmaBf16x2Op, InlinePtxOp, MapaSharedClusterOp, MatchAllSyncI32Op,
-    MatchAllSyncI64Op, MatchAnySyncI32Op, MatchAnySyncI64Op, MbarrierArriveClusterOp,
-    MbarrierArriveExpectTxSharedOp, MbarrierArriveSharedOp, MbarrierInitSharedOp,
-    MbarrierInvalSharedOp, MbarrierTestWaitSharedOp, MbarrierTryWaitParitySharedOp,
-    MbarrierTryWaitSharedOp, NanosleepOp, NvvmAtomicCmpxchgOp, NvvmAtomicLoadOp, NvvmAtomicRmwOp,
-    NvvmAtomicStoreOp, PmEventOp, ReadPtxSregClock64Op, ReadPtxSregClockOp,
-    ReadPtxSregClusterCtaidXOp, ReadPtxSregClusterCtaidYOp, ReadPtxSregClusterCtaidZOp,
-    ReadPtxSregClusterIdxOp, ReadPtxSregClusterNctaidXOp, ReadPtxSregClusterNctaidYOp,
-    ReadPtxSregClusterNctaidZOp, ReadPtxSregCtaidXOp, ReadPtxSregCtaidYOp, ReadPtxSregCtaidZOp,
-    ReadPtxSregEnvReg1Op, ReadPtxSregEnvReg2Op, ReadPtxSregGlobaltimerOp, ReadPtxSregLaneIdOp,
-    ReadPtxSregLanemaskEqOp, ReadPtxSregLanemaskGeOp, ReadPtxSregLanemaskGtOp,
-    ReadPtxSregLanemaskLeOp, ReadPtxSregLanemaskLtOp, ReadPtxSregNclusterIdOp,
-    ReadPtxSregNctaidXOp, ReadPtxSregNctaidYOp, ReadPtxSregNctaidZOp, ReadPtxSregNtidXOp,
-    ReadPtxSregNtidYOp, ReadPtxSregNtidZOp, ReadPtxSregTidXOp, ReadPtxSregTidYOp,
-    ReadPtxSregTidZOp, ReduxSyncAddOp, ReduxSyncAndOp, ReduxSyncMaxOp, ReduxSyncMinOp,
-    ReduxSyncOrOp, ReduxSyncUmaxOp, ReduxSyncUminOp, ReduxSyncXorOp, ShflSyncBflyF32Op,
-    ShflSyncBflyI32Op, ShflSyncDownF32Op, ShflSyncDownI32Op, ShflSyncIdxF32Op, ShflSyncIdxI32Op,
-    ShflSyncUpF32Op, ShflSyncUpI32Op, StmatrixM8n8X2Op, StmatrixM8n8X2TransOp, StmatrixM8n8X4Op,
-    StmatrixM8n8X4TransOp, Tcgen05AllocCg2Op, Tcgen05AllocOp, Tcgen05CommitCg2Op,
+    CpAsyncBulkWaitGroupReadOp, CvtF16x2F32Op, CvtF32x2Bf16x2Op, CvtRnReluBf16x2F32Op,
+    CvtRnReluF16x2F32Op, CvtRzBf16x2F32Op, CvtRzF16x2F32Op, Dp2aS32Op, Dp2aU32Op, Dp4aS32Op,
+    Dp4aU32Op, DsmemReadU32Op, ElectSyncOp, FenceProxyAsyncSharedCtaOp, FmaBf16x2Op, InlinePtxOp,
+    MapaSharedClusterOp, MatchAllSyncI32Op, MatchAllSyncI64Op, MatchAnySyncI32Op,
+    MatchAnySyncI64Op, MbarrierArriveClusterOp, MbarrierArriveExpectTxSharedOp,
+    MbarrierArriveSharedOp, MbarrierInitSharedOp, MbarrierInvalSharedOp, MbarrierTestWaitSharedOp,
+    MbarrierTryWaitParitySharedOp, MbarrierTryWaitSharedOp, NanosleepOp, NvvmAtomicCmpxchgOp,
+    NvvmAtomicLoadOp, NvvmAtomicRmwOp, NvvmAtomicStoreOp, PmEventOp, ReadPtxSregClock64Op,
+    ReadPtxSregClockOp, ReadPtxSregClusterCtaidXOp, ReadPtxSregClusterCtaidYOp,
+    ReadPtxSregClusterCtaidZOp, ReadPtxSregClusterIdxOp, ReadPtxSregClusterNctaidXOp,
+    ReadPtxSregClusterNctaidYOp, ReadPtxSregClusterNctaidZOp, ReadPtxSregCtaidXOp,
+    ReadPtxSregCtaidYOp, ReadPtxSregCtaidZOp, ReadPtxSregEnvReg1Op, ReadPtxSregEnvReg2Op,
+    ReadPtxSregGlobaltimerOp, ReadPtxSregLaneIdOp, ReadPtxSregLanemaskEqOp,
+    ReadPtxSregLanemaskGeOp, ReadPtxSregLanemaskGtOp, ReadPtxSregLanemaskLeOp,
+    ReadPtxSregLanemaskLtOp, ReadPtxSregNclusterIdOp, ReadPtxSregNctaidXOp, ReadPtxSregNctaidYOp,
+    ReadPtxSregNctaidZOp, ReadPtxSregNtidXOp, ReadPtxSregNtidYOp, ReadPtxSregNtidZOp,
+    ReadPtxSregTidXOp, ReadPtxSregTidYOp, ReadPtxSregTidZOp, ReduxSyncAddOp, ReduxSyncAndOp,
+    ReduxSyncMaxOp, ReduxSyncMinOp, ReduxSyncOrOp, ReduxSyncUmaxOp, ReduxSyncUminOp,
+    ReduxSyncXorOp, ShflSyncBflyF32Op, ShflSyncBflyI32Op, ShflSyncBflyI64Op, ShflSyncDownF32Op,
+    ShflSyncDownI32Op, ShflSyncDownI64Op, ShflSyncIdxF32Op, ShflSyncIdxI32Op, ShflSyncIdxI64Op,
+    ShflSyncUpF32Op, ShflSyncUpI32Op, ShflSyncUpI64Op, StmatrixM8n8X2Op, StmatrixM8n8X2TransOp,
+    StmatrixM8n8X4Op, StmatrixM8n8X4TransOp, Tcgen05AllocCg2Op, Tcgen05AllocOp, Tcgen05CommitCg2Op,
     Tcgen05CommitMulticastCg2Op, Tcgen05CommitOp, Tcgen05CommitSharedClusterCg2Op,
     Tcgen05CommitSharedClusterOp, Tcgen05CpSmemToTmemCg2Op, Tcgen05CpSmemToTmemOp,
     Tcgen05DeallocCg2Op, Tcgen05DeallocOp, Tcgen05FenceAfterThreadSyncOp,
@@ -1777,6 +1779,82 @@ impl MirToLlvmConversion for ShflSyncUpF32Op {
 }
 
 #[op_interface_impl]
+impl MirToLlvmConversion for ShflSyncIdxI64Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::warp::convert_shuffle_i64(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+            "idx",
+            31,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for ShflSyncBflyI64Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::warp::convert_shuffle_i64(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+            "bfly",
+            31,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for ShflSyncDownI64Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::warp::convert_shuffle_i64(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+            "down",
+            31,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for ShflSyncUpI64Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::warp::convert_shuffle_i64(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+            "up",
+            0,
+        )
+    }
+}
+
+#[op_interface_impl]
 impl MirToLlvmConversion for VoteSyncAllOp {
     fn convert(
         &self,
@@ -2384,6 +2462,74 @@ impl MirToLlvmConversion for CvtF16x2F32Op {
     }
 }
 
+#[op_interface_impl]
+impl MirToLlvmConversion for CvtRzF16x2F32Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::convert::convert_cvt_rz_f16x2_f32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for CvtRnReluF16x2F32Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::convert::convert_cvt_rn_relu_f16x2_f32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for CvtRnReluBf16x2F32Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::convert::convert_cvt_rn_relu_bf16x2_f32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for CvtRzBf16x2F32Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::convert::convert_cvt_rz_bf16x2_f32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
 // ---- NVVM Tcgen05 ops ------------------------------------------------------
 
 #[op_interface_impl]
@@ -2653,6 +2799,74 @@ impl MirToLlvmConversion for FmaBf16x2Op {
         operands_info: &OperandsInfo,
     ) -> Result<()> {
         super::intrinsics::bf16x2::convert_fma_bf16x2(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for Dp4aS32Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::dotprod::convert_dp4a_s32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for Dp4aU32Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::dotprod::convert_dp4a_u32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for Dp2aS32Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::dotprod::convert_dp2a_s32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for Dp2aU32Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::dotprod::convert_dp2a_u32(
             ctx,
             rewriter,
             self.get_operation(),

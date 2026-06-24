@@ -2390,6 +2390,62 @@ fn try_dispatch_intrinsic(
             block_map,
             loc,
         )?)),
+        "cuda_device::convert::cvt_rz_f16x2_f32" => {
+            Ok(Some(intrinsics::convert::emit_cvt_rz_f16x2_f32(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
+        "cuda_device::convert::cvt_rn_relu_f16x2_f32" => {
+            Ok(Some(intrinsics::convert::emit_cvt_rn_relu_f16x2_f32(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
+        "cuda_device::convert::cvt_rn_relu_bf16x2_f32" => {
+            Ok(Some(intrinsics::convert::emit_cvt_rn_relu_bf16x2_f32(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
+        "cuda_device::convert::cvt_rz_bf16x2_f32" => {
+            Ok(Some(intrinsics::convert::emit_cvt_rz_bf16x2_f32(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
 
         // =================================================================
         // Debug & Profiling (from intrinsics::debug)
@@ -2848,6 +2904,64 @@ fn try_dispatch_intrinsic(
                 ctx,
                 body,
                 dialect_nvvm::ops::ShflSyncBflyF32Op::get_concrete_op_info(),
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
+        "cuda_device::warp::shuffle_u64_sync" => Ok(Some(intrinsics::warp::emit_warp_shuffle_i64(
+            ctx,
+            body,
+            dialect_nvvm::ops::ShflSyncIdxI64Op::get_concrete_op_info(),
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
+        "cuda_device::warp::shuffle_up_u64_sync" => {
+            Ok(Some(intrinsics::warp::emit_warp_shuffle_i64(
+                ctx,
+                body,
+                dialect_nvvm::ops::ShflSyncUpI64Op::get_concrete_op_info(),
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
+        "cuda_device::warp::shuffle_down_u64_sync" => {
+            Ok(Some(intrinsics::warp::emit_warp_shuffle_i64(
+                ctx,
+                body,
+                dialect_nvvm::ops::ShflSyncDownI64Op::get_concrete_op_info(),
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
+        "cuda_device::warp::shuffle_xor_u64_sync" => {
+            Ok(Some(intrinsics::warp::emit_warp_shuffle_i64(
+                ctx,
+                body,
+                dialect_nvvm::ops::ShflSyncBflyI64Op::get_concrete_op_info(),
                 args,
                 destination,
                 target,
@@ -3360,6 +3474,57 @@ fn try_dispatch_intrinsic(
         // bf16x2 packed arithmetic (from intrinsics::bf16x2)
         // =================================================================
         "cuda_device::bf16x2::fma_bf16x2" => Ok(Some(intrinsics::bf16x2::emit_fma_bf16x2(
+            ctx,
+            body,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
+        // =================================================================
+        // Integer dot products (from intrinsics::dotprod)
+        // =================================================================
+        "cuda_device::dotprod::dp4a_s32" => Ok(Some(intrinsics::dotprod::emit_dp4a_s32(
+            ctx,
+            body,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
+        "cuda_device::dotprod::dp4a_u32" => Ok(Some(intrinsics::dotprod::emit_dp4a_u32(
+            ctx,
+            body,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
+        "cuda_device::dotprod::dp2a_s32" => Ok(Some(intrinsics::dotprod::emit_dp2a_s32(
+            ctx,
+            body,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
+        "cuda_device::dotprod::dp2a_u32" => Ok(Some(intrinsics::dotprod::emit_dp2a_u32(
             ctx,
             body,
             args,
