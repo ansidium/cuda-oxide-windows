@@ -3359,13 +3359,25 @@ mod kernels {
                 // correct (each CTA computed its own rank's 128 rows at the wrong tile).
                 let cluster_base_id = thread::blockIdx_x() - my_rank;
                 let tile_idx = cluster_base_id / 2;
-                // CACHE-BLOCKING SWIZZLE (CUTLASS-style threadblock rasterization).
-                // Group tile_n columns into bands of width SWIZZLE_G; within a band,
-                // consecutive linear indices sweep the band's columns for each tile_m
-                // before advancing tile_m, so near-in-time tiles reuse 1 A-block + G
-                // adjacent B-blocks -> higher L2 hit rate. Pure index->(m,n) bijection;
-                // the epilogue addresses C from TILE_INFO, so every tile is still
-                // computed exactly once and the result is bit-identical.
+                // L2 CACHE-BLOCKING SWIZZLE (CUTLASS-style tile ordering).
+                //
+                // Change the order in which output tiles are assigned to clusters. Split
+                // the N direction into bands of at most SWIZZLE_G columns, visit every M
+                // row in one band, and then move to the next band.
+                //
+                // For SWIZZLE_G = 3, the first band is visited in this order:
+                //
+                //   tile_idx:  0      1      2      3      4      5
+                //   C tile:   (0,0)  (0,1)  (0,2)  (1,0)  (1,1)  (1,2)  ...
+                //
+                // Within each M row, these tiles reuse the same A tile while reading
+                // neighboring B tiles. The same small set of B tiles is then revisited for
+                // the next M row, so the data is more likely to still be in the L2 cache.
+                //
+                // This changes only the visit order. The mapping from tile_idx to
+                // (tile_m, tile_n) is one-to-one, and TILE_INFO tells the epilogue where to
+                // write C. Every output tile is still computed exactly once with the same
+                // result.
                 let tiles_n = _tiles_n;
                 let group_tiles = SWIZZLE_G * tiles_m;
                 let group = tile_idx / group_tiles;
