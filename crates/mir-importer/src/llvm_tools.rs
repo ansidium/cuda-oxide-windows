@@ -339,6 +339,10 @@ fn sysroot_tool(tool: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn path_in_dir(dir: &str, file: &str) -> String {
+        Path::new(dir).join(file).to_string_lossy().into_owned()
+    }
+
     fn tool(path: &str, major: Option<u32>) -> OptTool {
         OptTool {
             path: path.to_string(),
@@ -368,11 +372,14 @@ mod tests {
     fn sibling_candidates_mirror_the_llc_name() {
         assert_eq!(
             sibling_opt_candidates("/usr/bin/llc-21"),
-            ["/usr/bin/opt-21", "/usr/bin/opt"]
+            [
+                path_in_dir("/usr/bin", "opt-21"),
+                path_in_dir("/usr/bin", "opt")
+            ]
         );
         assert_eq!(
             sibling_opt_candidates("/usr/lib/llvm/21/bin/llc"),
-            ["/usr/lib/llvm/21/bin/opt"]
+            [path_in_dir("/usr/lib/llvm/21/bin", "opt")]
         );
         // Bare PATH names stay bare so they resolve through PATH.
         assert_eq!(sibling_opt_candidates("llc-22"), ["opt-22", "opt"]);
