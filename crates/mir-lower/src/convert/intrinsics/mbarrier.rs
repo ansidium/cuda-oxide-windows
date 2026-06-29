@@ -122,6 +122,35 @@ pub(crate) fn convert_arrive_expect_tx(
     Ok(())
 }
 
+/// mbarrier.arrive.expect_tx.relaxed.cluster.shared::cta: (ptr, bytes) -> i64
+pub(crate) fn convert_arrive_expect_tx_cluster(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 2 {
+        return pliron::input_err_noloc!("mbarrier_arrive_expect_tx_cluster requires 2 operands");
+    }
+    let bar_ptr = cast_to_shared_addrspace(ctx, rewriter, operands[0]);
+    let bytes = operands[1];
+
+    let asm_template = "mbarrier.arrive.expect_tx.relaxed.cluster.shared::cta.b64 $0, [$1], $2;";
+    let asm_op = inline_asm_convergent(
+        ctx,
+        rewriter,
+        i64_ty.into(),
+        vec![bar_ptr, bytes],
+        asm_template,
+        "=l,l,r,~{memory}",
+    );
+    rewriter.replace_operation(ctx, op, asm_op);
+    Ok(())
+}
+
 /// mbarrier.arrive.release.cluster.shared::cluster.b64: (addr: u64) -> void
 pub(crate) fn convert_arrive_cluster(
     ctx: &mut Context,
@@ -258,6 +287,41 @@ pub(crate) fn convert_try_wait_parity(
     Ok(())
 }
 
+/// mbarrier.try_wait.parity.acquire.cluster.shared::cta: (ptr, parity) -> i1
+pub(crate) fn convert_try_wait_parity_cluster(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 2 {
+        return pliron::input_err_noloc!("mbarrier_try_wait_parity_cluster requires 2 operands");
+    }
+    let bar_ptr = cast_to_shared_addrspace(ctx, rewriter, operands[0]);
+    let parity = operands[1];
+
+    let asm_template = "{ .reg .pred p; mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$1], $2; selp.b32 $0, 1, 0, p; }";
+    let asm_op = inline_asm_convergent(
+        ctx,
+        rewriter,
+        i32_ty.into(),
+        vec![bar_ptr, parity],
+        asm_template,
+        "=r,l,r,~{memory}",
+    );
+    let i32_result = asm_op.deref(ctx).get_result(0);
+    let trunc_val = trunc_to_i1(ctx, rewriter, i32_result);
+    let trunc_def_op = match trunc_val.defining_entity() {
+        DefiningEntity::Op(def_op) => def_op,
+        _ => unreachable!(),
+    };
+    rewriter.replace_operation(ctx, op, trunc_def_op);
+    Ok(())
+}
+
 /// mbarrier.inval: (ptr) -> void
 pub(crate) fn convert_inval(
     ctx: &mut Context,
@@ -304,6 +368,60 @@ pub(crate) fn convert_fence_proxy_async(
     );
     // NOTE: The caller (interface_impls.rs) is responsible for erasing the original op
     // since this function does not receive it.
+    Ok(())
+}
+
+/// fence.mbarrier_init.release.cluster
+pub(crate) fn convert_fence_mbarrier_init_release_cluster(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let void_ty = llvm_types::VoidType::get(ctx);
+    inline_asm_convergent(
+        ctx,
+        rewriter,
+        void_ty.into(),
+        vec![],
+        "fence.mbarrier_init.release.cluster;",
+        "~{memory}",
+    );
+    Ok(())
+}
+
+/// fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster
+pub(crate) fn convert_fence_proxy_async_generic_release_shared_cta_cluster(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let void_ty = llvm_types::VoidType::get(ctx);
+    inline_asm_convergent(
+        ctx,
+        rewriter,
+        void_ty.into(),
+        vec![],
+        "fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;",
+        "~{memory}",
+    );
+    Ok(())
+}
+
+/// fence.proxy.async::generic.acquire.sync_restrict::shared::cluster.cluster
+pub(crate) fn convert_fence_proxy_async_generic_acquire_shared_cluster_cluster(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let void_ty = llvm_types::VoidType::get(ctx);
+    inline_asm_convergent(
+        ctx,
+        rewriter,
+        void_ty.into(),
+        vec![],
+        "fence.proxy.async::generic.acquire.sync_restrict::shared::cluster.cluster;",
+        "~{memory}",
+    );
     Ok(())
 }
 

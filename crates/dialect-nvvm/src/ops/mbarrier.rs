@@ -171,6 +171,33 @@ impl MbarrierArriveExpectTxSharedOp {
     }
 }
 
+/// Arrive at a CTA-shared mbarrier with cluster-scope expected transaction bytes.
+///
+/// PTX: `mbarrier.arrive.expect_tx.relaxed.cluster.shared::cta.b64`
+///
+/// # Operands
+///
+/// - `bar_ptr` (ptr addrspace(3)): pointer to barrier in CTA shared memory
+/// - `bytes` (i32): expected transaction byte count
+///
+/// # Results
+///
+/// - `token` (i64): phase token for wait operations
+#[pliron_op(
+    name = "nvvm.mbarrier_arrive_expect_tx_cluster",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],
+)]
+pub struct MbarrierArriveExpectTxClusterOp;
+
+impl MbarrierArriveExpectTxClusterOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        MbarrierArriveExpectTxClusterOp { op }
+    }
+}
+
 /// Arrive at a barrier in another CTA's shared memory via cluster addressing.
 ///
 /// Used for cross-CTA synchronization in TMA multicast patterns. Each CTA's
@@ -299,6 +326,33 @@ impl MbarrierTryWaitParitySharedOp {
     }
 }
 
+/// Try wait with parity and cluster-scope acquire semantics.
+///
+/// PTX: `mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64`
+///
+/// # Operands
+///
+/// - `bar_ptr` (ptr addrspace(3)): pointer to barrier in CTA shared memory
+/// - `parity` (i32): expected parity (0 or 1)
+///
+/// # Results
+///
+/// - `complete` (i1): true if the phase with given parity is complete
+#[pliron_op(
+    name = "nvvm.mbarrier_try_wait_parity_cluster",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],
+)]
+pub struct MbarrierTryWaitParityClusterOp;
+
+impl MbarrierTryWaitParityClusterOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        MbarrierTryWaitParityClusterOp { op }
+    }
+}
+
 // =============================================================================
 // Memory Fence Operations
 // =============================================================================
@@ -345,6 +399,60 @@ impl FenceProxyAsyncSharedCtaOp {
     }
 }
 
+/// Release prior mbarrier initialization at cluster scope.
+///
+/// PTX: `fence.mbarrier_init.release.cluster;`
+#[pliron_op(
+    name = "nvvm.fence_mbarrier_init_release_cluster",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<0>, NResultsInterface<0>],
+)]
+pub struct FenceMbarrierInitReleaseClusterOp;
+
+impl FenceMbarrierInitReleaseClusterOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        FenceMbarrierInitReleaseClusterOp { op }
+    }
+}
+
+/// Release generic-proxy writes to the async proxy for CTA shared memory at cluster scope.
+///
+/// PTX: `fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;`
+#[pliron_op(
+    name = "nvvm.fence_proxy_async_generic_release_shared_cta_cluster",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<0>, NResultsInterface<0>],
+)]
+pub struct FenceProxyAsyncGenericReleaseSharedCtaClusterOp;
+
+impl FenceProxyAsyncGenericReleaseSharedCtaClusterOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        FenceProxyAsyncGenericReleaseSharedCtaClusterOp { op }
+    }
+}
+
+/// Acquire async-proxy writes through the generic proxy for cluster shared memory.
+///
+/// PTX: `fence.proxy.async::generic.acquire.sync_restrict::shared::cluster.cluster;`
+#[pliron_op(
+    name = "nvvm.fence_proxy_async_generic_acquire_shared_cluster_cluster",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<0>, NResultsInterface<0>],
+)]
+pub struct FenceProxyAsyncGenericAcquireSharedClusterClusterOp;
+
+impl FenceProxyAsyncGenericAcquireSharedClusterClusterOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        FenceProxyAsyncGenericAcquireSharedClusterClusterOp { op }
+    }
+}
+
 // =============================================================================
 // Thread Scheduling Hints
 // =============================================================================
@@ -383,11 +491,16 @@ pub(super) fn register(ctx: &mut Context) {
     MbarrierInitSharedOp::register(ctx);
     MbarrierArriveSharedOp::register(ctx);
     MbarrierArriveExpectTxSharedOp::register(ctx);
+    MbarrierArriveExpectTxClusterOp::register(ctx);
     MbarrierArriveClusterOp::register(ctx);
     MbarrierTestWaitSharedOp::register(ctx);
     MbarrierTryWaitSharedOp::register(ctx);
     MbarrierTryWaitParitySharedOp::register(ctx);
+    MbarrierTryWaitParityClusterOp::register(ctx);
     MbarrierInvalSharedOp::register(ctx);
     FenceProxyAsyncSharedCtaOp::register(ctx);
+    FenceMbarrierInitReleaseClusterOp::register(ctx);
+    FenceProxyAsyncGenericReleaseSharedCtaClusterOp::register(ctx);
+    FenceProxyAsyncGenericAcquireSharedClusterClusterOp::register(ctx);
     NanosleepOp::register(ctx);
 }

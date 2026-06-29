@@ -2626,6 +2626,20 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
+        "cuda_device::barrier::mbarrier_arrive_expect_tx_cluster" => Ok(Some(
+            intrinsics::sync::emit_mbarrier_arrive_expect_tx_cluster(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?,
+        )),
         "cuda_device::barrier::mbarrier_arrive_cluster" => {
             Ok(Some(intrinsics::sync::emit_mbarrier_arrive_cluster(
                 ctx,
@@ -2694,6 +2708,20 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
+        "cuda_device::barrier::mbarrier_try_wait_parity_cluster" => Ok(Some(
+            intrinsics::sync::emit_mbarrier_try_wait_parity_cluster(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?,
+        )),
         "cuda_device::barrier::mbarrier_inval" => Ok(Some(intrinsics::sync::emit_mbarrier_inval(
             ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
         )?)),
@@ -2701,6 +2729,23 @@ fn try_dispatch_intrinsic(
             Ok(Some(intrinsics::sync::emit_fence_proxy_async_shared_cta(
                 ctx, args, target, block_ptr, prev_op, block_map, loc,
             )?))
+        }
+        "cuda_device::barrier::fence_mbarrier_init_release_cluster" => Ok(Some(
+            intrinsics::sync::emit_fence_mbarrier_init_release_cluster(
+                ctx, args, target, block_ptr, prev_op, block_map, loc,
+            )?,
+        )),
+        "cuda_device::barrier::fence_proxy_async_generic_release_shared_cta_cluster" => Ok(Some(
+            intrinsics::sync::emit_fence_proxy_async_generic_release_shared_cta_cluster(
+                ctx, args, target, block_ptr, prev_op, block_map, loc,
+            )?,
+        )),
+        "cuda_device::barrier::fence_proxy_async_generic_acquire_shared_cluster_cluster" => {
+            Ok(Some(
+                intrinsics::sync::emit_fence_proxy_async_generic_acquire_shared_cluster_cluster(
+                    ctx, args, target, block_ptr, prev_op, block_map, loc,
+                )?,
+            ))
         }
 
         // =================================================================

@@ -1348,6 +1348,144 @@ fn append_return(ctx: &mut Context, block: pliron::context::Ptr<pliron::basic_bl
 }
 
 #[test]
+fn test_cluster_mbarrier_and_fences_lower_to_exact_inline_ptx() -> Result<(), anyhow::Error> {
+    use dialect_mir::types::MirPtrType;
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let i1_ty = IntegerType::get(&ctx, 1, Signedness::Signless);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
+    let bar_ptr_ty = MirPtrType::get_shared(&mut ctx, i64_ty.into(), false);
+    let (module_ptr, entry) = build_test_kernel(&mut ctx, vec![bar_ptr_ty.into(), i32_ty.into()]);
+
+    let bar_ptr = entry.deref(&ctx).get_argument(0);
+    let bytes_or_parity = entry.deref(&ctx).get_argument(1);
+
+    let arrive = Operation::new(
+        &mut ctx,
+        nvvm::MbarrierArriveExpectTxClusterOp::get_concrete_op_info(),
+        vec![i64_ty.into()],
+        vec![bar_ptr, bytes_or_parity],
+        vec![],
+        0,
+    );
+    arrive.insert_at_back(entry, &ctx);
+
+    let try_wait = Operation::new(
+        &mut ctx,
+        nvvm::MbarrierTryWaitParityClusterOp::get_concrete_op_info(),
+        vec![i1_ty.into()],
+        vec![bar_ptr, bytes_or_parity],
+        vec![],
+        0,
+    );
+    try_wait.insert_at_back(entry, &ctx);
+
+    let mbarrier_fence = Operation::new(
+        &mut ctx,
+        nvvm::FenceMbarrierInitReleaseClusterOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    mbarrier_fence.insert_at_back(entry, &ctx);
+
+    let proxy_release_fence = Operation::new(
+        &mut ctx,
+        nvvm::FenceProxyAsyncGenericReleaseSharedCtaClusterOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    proxy_release_fence.insert_at_back(entry, &ctx);
+
+    let proxy_acquire_fence = Operation::new(
+        &mut ctx,
+        nvvm::FenceProxyAsyncGenericAcquireSharedClusterClusterOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    proxy_acquire_fence.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let expected = [
+        (
+            "mbarrier.arrive.expect_tx.relaxed.cluster.shared::cta.b64 $0, [$1], $2;",
+            "=l,l,r,~{memory}",
+        ),
+        (
+            "{ .reg .pred p; mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$1], $2; selp.b32 $0, 1, 0, p; }",
+            "=r,l,r,~{memory}",
+        ),
+        ("fence.mbarrier_init.release.cluster;", "~{memory}"),
+        (
+            "fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;",
+            "~{memory}",
+        ),
+        (
+            "fence.proxy.async::generic.acquire.sync_restrict::shared::cluster.cluster;",
+            "~{memory}",
+        ),
+    ];
+    let mut matches = [0usize; 5];
+
+    let module_region = module_ptr.deref(&ctx).get_region(0);
+    let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+    for op in module_block.deref(&ctx).iter(&ctx) {
+        let Some(func_op) = Operation::get_op::<llvm::FuncOp>(op, &ctx) else {
+            continue;
+        };
+        if func_op.get_symbol_name(&ctx).to_string() != "kernel_func" {
+            continue;
+        }
+
+        let func_region = func_op.get_operation().deref(&ctx).get_region(0);
+        for func_block in func_region.deref(&ctx).iter(&ctx) {
+            for body_op in func_block.deref(&ctx).iter(&ctx) {
+                let Some(inline_asm) = Operation::get_op::<llvm::InlineAsmOp>(body_op, &ctx) else {
+                    continue;
+                };
+                let template = inline_asm
+                    .get_attr_inline_asm_template(&ctx)
+                    .map(|value| String::from((*value).clone()));
+                let Some(index) = expected.iter().position(|(expected_template, _)| {
+                    template.as_deref() == Some(*expected_template)
+                }) else {
+                    continue;
+                };
+
+                matches[index] += 1;
+                assert_eq!(
+                    inline_asm
+                        .get_attr_inline_asm_constraints(&ctx)
+                        .map(|value| String::from((*value).clone()))
+                        .as_deref(),
+                    Some(expected[index].1)
+                );
+                assert_eq!(
+                    llvm::asm_kind_opt(&ctx, &inline_asm),
+                    Some(llvm::AsmKind::Convergent)
+                );
+            }
+        }
+    }
+
+    assert_eq!(
+        matches, [1; 5],
+        "each cluster barrier/fence must lower to its exact PTX template once"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_fast_float_intrinsics_lower_to_explicit_fast_binops() -> Result<(), anyhow::Error> {
     use dialect_mir::rust_intrinsics;
     use llvm_export::attributes::{FastmathFlags, FastmathFlagsAttr};

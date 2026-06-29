@@ -16,10 +16,12 @@ use crate::translator::rvalue;
 use crate::translator::types;
 use crate::translator::values::ValueMap;
 use dialect_nvvm::ops::{
-    FenceProxyAsyncSharedCtaOp, MbarrierArriveClusterOp, MbarrierArriveExpectTxSharedOp,
+    FenceMbarrierInitReleaseClusterOp, FenceProxyAsyncGenericAcquireSharedClusterClusterOp,
+    FenceProxyAsyncGenericReleaseSharedCtaClusterOp, FenceProxyAsyncSharedCtaOp,
+    MbarrierArriveClusterOp, MbarrierArriveExpectTxClusterOp, MbarrierArriveExpectTxSharedOp,
     MbarrierArriveSharedOp, MbarrierInitSharedOp, MbarrierInvalSharedOp, MbarrierTestWaitSharedOp,
-    MbarrierTryWaitParitySharedOp, MbarrierTryWaitSharedOp, NanosleepOp, ThreadfenceBlockOp,
-    ThreadfenceOp, ThreadfenceSystemOp,
+    MbarrierTryWaitParityClusterOp, MbarrierTryWaitParitySharedOp, MbarrierTryWaitSharedOp,
+    NanosleepOp, ThreadfenceBlockOp, ThreadfenceOp, ThreadfenceSystemOp,
 };
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::types::{IntegerType, Signedness};
@@ -464,6 +466,90 @@ pub fn emit_mbarrier_arrive_expect_tx(
     )
 }
 
+/// Emit cluster-scope mbarrier_arrive_expect_tx.
+///
+/// Args:
+/// - `args[0]`: *const Barrier (pointer to barrier in CTA shared memory)
+/// - `args[1]`: u32 (tx_count - unused, kept for API compatibility)
+/// - `args[2]`: u32 (bytes - expected transaction byte count)
+///
+/// Returns: u64 (phase token)
+pub fn emit_mbarrier_arrive_expect_tx_cluster(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    if args.len() != 3 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "mbarrier_arrive_expect_tx_cluster expects 3 arguments (bar, tx_count, bytes), got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let (bar_ptr, mut last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+
+    // tx_count (arg 1) is retained by the device API but is not a PTX operand.
+    let (bytes, last_op_after) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[2],
+        value_map,
+        block_ptr,
+        last_op,
+        loc.clone(),
+    )?;
+    last_op = last_op_after;
+
+    let i64_type = IntegerType::get(ctx, 64, Signedness::Unsigned);
+    let arrive_op = Operation::new(
+        ctx,
+        MbarrierArriveExpectTxClusterOp::get_concrete_op_info(),
+        vec![i64_type.to_handle()],
+        vec![bar_ptr, bytes],
+        vec![],
+        0,
+    );
+    arrive_op.deref_mut(ctx).set_loc(loc.clone());
+
+    if let Some(prev) = last_op {
+        arrive_op.insert_after(ctx, prev);
+    } else {
+        arrive_op.insert_at_front(block_ptr, ctx);
+    }
+
+    let result_value = arrive_op.deref(ctx).get_result(0);
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        result_value,
+        target,
+        block_ptr,
+        arrive_op,
+        value_map,
+        block_map,
+        loc,
+        "mbarrier_arrive_expect_tx_cluster call without target block",
+    )
+}
+
 /// Emit mbarrier_arrive_cluster: arrive at a barrier in another CTA's shared memory.
 ///
 /// Takes a raw u64 address (from map_shared_rank cast to integer) to avoid
@@ -863,6 +949,86 @@ pub fn emit_mbarrier_try_wait_parity(
     )
 }
 
+/// Emit cluster-scope parity wait for a CTA-shared barrier.
+///
+/// Args:
+/// - `args[0]`: *const Barrier (ptr to barrier in CTA shared memory)
+/// - `args[1]`: u32 parity
+///
+/// Returns: bool
+pub fn emit_mbarrier_try_wait_parity_cluster(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    if args.len() != 2 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "mbarrier_try_wait_parity_cluster expects 2 arguments, got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let (bar_ptr, last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let (parity, last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[1],
+        value_map,
+        block_ptr,
+        last_op,
+        loc.clone(),
+    )?;
+
+    let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+    let op_ptr = Operation::new(
+        ctx,
+        MbarrierTryWaitParityClusterOp::get_concrete_op_info(),
+        vec![i1_ty.into()],
+        vec![bar_ptr, parity],
+        vec![],
+        0,
+    );
+    op_ptr.deref_mut(ctx).set_loc(loc.clone());
+
+    if let Some(prev) = last_op {
+        op_ptr.insert_after(ctx, prev);
+    } else {
+        op_ptr.insert_at_front(block_ptr, ctx);
+    }
+
+    let result_value = op_ptr.deref(ctx).get_result(0);
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        result_value,
+        target,
+        block_ptr,
+        op_ptr,
+        value_map,
+        block_map,
+        loc,
+        "mbarrier_try_wait_parity_cluster call without target block",
+    )
+}
+
 /// Emit mbarrier_inval: invalidate a barrier.
 ///
 /// Args:
@@ -982,6 +1148,161 @@ pub fn emit_fence_proxy_async_shared_cta(
             loc.clone(),
             TranslationErr::unsupported(
                 "fence_proxy_async_shared_cta call without target block".to_string(),
+            )
+        )
+    }
+}
+
+/// Emit `fence.mbarrier_init.release.cluster`.
+///
+/// Args: none
+/// Returns: void
+pub fn emit_fence_mbarrier_init_release_cluster(
+    ctx: &mut Context,
+    args: &[mir::Operand],
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    if !args.is_empty() {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "fence_mbarrier_init_release_cluster expects 0 arguments, got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let fence_op = Operation::new(
+        ctx,
+        FenceMbarrierInitReleaseClusterOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    fence_op.deref_mut(ctx).set_loc(loc.clone());
+
+    if let Some(prev) = prev_op {
+        fence_op.insert_after(ctx, prev);
+    } else {
+        fence_op.insert_at_front(block_ptr, ctx);
+    }
+
+    if let Some(target_idx) = target {
+        Ok(emit_goto(ctx, *target_idx, fence_op, block_map, loc))
+    } else {
+        input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(
+                "fence_mbarrier_init_release_cluster call without target block".to_string(),
+            )
+        )
+    }
+}
+
+/// Emit the cluster-scope generic-to-async proxy release fence.
+///
+/// Args: none
+/// Returns: void
+pub fn emit_fence_proxy_async_generic_release_shared_cta_cluster(
+    ctx: &mut Context,
+    args: &[mir::Operand],
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    if !args.is_empty() {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "fence_proxy_async_generic_release_shared_cta_cluster expects 0 arguments, got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let fence_op = Operation::new(
+        ctx,
+        FenceProxyAsyncGenericReleaseSharedCtaClusterOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    fence_op.deref_mut(ctx).set_loc(loc.clone());
+
+    if let Some(prev) = prev_op {
+        fence_op.insert_after(ctx, prev);
+    } else {
+        fence_op.insert_at_front(block_ptr, ctx);
+    }
+
+    if let Some(target_idx) = target {
+        Ok(emit_goto(ctx, *target_idx, fence_op, block_map, loc))
+    } else {
+        input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(
+                "fence_proxy_async_generic_release_shared_cta_cluster call without target block"
+                    .to_string(),
+            )
+        )
+    }
+}
+
+/// Emit the cluster-scope async-to-generic proxy acquire fence.
+///
+/// Args: none
+/// Returns: void
+pub fn emit_fence_proxy_async_generic_acquire_shared_cluster_cluster(
+    ctx: &mut Context,
+    args: &[mir::Operand],
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    if !args.is_empty() {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "fence_proxy_async_generic_acquire_shared_cluster_cluster expects 0 arguments, got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let fence_op = Operation::new(
+        ctx,
+        FenceProxyAsyncGenericAcquireSharedClusterClusterOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    fence_op.deref_mut(ctx).set_loc(loc.clone());
+
+    if let Some(prev) = prev_op {
+        fence_op.insert_after(ctx, prev);
+    } else {
+        fence_op.insert_at_front(block_ptr, ctx);
+    }
+
+    if let Some(target_idx) = target {
+        Ok(emit_goto(ctx, *target_idx, fence_op, block_map, loc))
+    } else {
+        input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(
+                "fence_proxy_async_generic_acquire_shared_cluster_cluster call without target block"
+                    .to_string(),
             )
         )
     }

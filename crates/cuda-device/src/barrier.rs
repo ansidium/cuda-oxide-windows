@@ -310,6 +310,27 @@ pub unsafe fn mbarrier_try_wait_parity(bar: *const Barrier, parity: u32) -> bool
     unreachable!("mbarrier_try_wait_parity called outside CUDA kernel context")
 }
 
+/// Try to wait for barrier completion using cluster-scope acquire semantics.
+///
+/// This parity-based variant is used by cluster launch-control response reuse,
+/// where completion must acquire writes made at cluster scope.
+///
+/// # PTX
+///
+/// ```ptx
+/// mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 pred, [addr], parity;
+/// ```
+///
+/// # Safety
+///
+/// - `bar` must be a valid pointer to an initialized barrier in CTA shared memory
+/// - Must be called from within a cluster launch context
+#[inline(never)]
+pub unsafe fn mbarrier_try_wait_parity_cluster(bar: *const Barrier, parity: u32) -> bool {
+    let _ = (bar, parity);
+    unreachable!("mbarrier_try_wait_parity_cluster called outside CUDA kernel context")
+}
+
 /// Wait for barrier phase to complete (blocking).
 ///
 /// Blocks until all expected arrivals have occurred for the given phase.
@@ -396,6 +417,32 @@ pub unsafe fn mbarrier_arrive_expect_tx(bar: *const Barrier, _tx_count: u32, byt
     // Note: LLVM 20 may not have this intrinsic - may need inline PTX
     // Lowered to inline PTX: mbarrier.arrive.expect_tx.shared.b64 %rd, [%bar], %bytes;
     unreachable!("mbarrier_arrive_expect_tx called outside CUDA kernel context")
+}
+
+/// Arrive at a CTA-shared barrier with cluster-scope expected transaction bytes.
+///
+/// This relaxed arrival is paired with a cluster-scope acquire wait when a
+/// barrier protects state reused across CTAs in a cluster.
+///
+/// # PTX
+///
+/// ```ptx
+/// mbarrier.arrive.expect_tx.relaxed.cluster.shared::cta.b64 token, [addr], bytes;
+/// ```
+///
+/// # Safety
+///
+/// - `bar` must point to an initialized barrier in CTA shared memory
+/// - `bytes` must match the asynchronous transaction byte count
+/// - Must be called from within a cluster launch context
+#[inline(never)]
+pub unsafe fn mbarrier_arrive_expect_tx_cluster(
+    bar: *const Barrier,
+    _tx_count: u32,
+    bytes: u32,
+) -> u64 {
+    let _ = (bar, bytes);
+    unreachable!("mbarrier_arrive_expect_tx_cluster called outside CUDA kernel context")
 }
 
 // =============================================================================
@@ -527,6 +574,58 @@ pub unsafe fn mbarrier_inval(bar: *mut Barrier) {
 pub unsafe fn fence_proxy_async_shared_cta() {
     // Lowered to inline PTX: fence.proxy.async.shared::cta;
     unreachable!("fence_proxy_async_shared_cta called outside CUDA kernel context")
+}
+
+/// Release prior mbarrier initialization at cluster scope.
+///
+/// # PTX
+///
+/// ```ptx
+/// fence.mbarrier_init.release.cluster;
+/// ```
+///
+/// # Safety
+///
+/// Must be called from within a cluster launch context.
+#[inline(never)]
+pub unsafe fn fence_mbarrier_init_release_cluster() {
+    unreachable!("fence_mbarrier_init_release_cluster called outside CUDA kernel context")
+}
+
+/// Release generic-proxy writes to the async proxy for CTA shared memory at cluster scope.
+///
+/// # PTX
+///
+/// ```ptx
+/// fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;
+/// ```
+///
+/// # Safety
+///
+/// Must be called from within a cluster launch context.
+#[inline(never)]
+pub unsafe fn fence_proxy_async_generic_release_shared_cta_cluster() {
+    unreachable!(
+        "fence_proxy_async_generic_release_shared_cta_cluster called outside CUDA kernel context"
+    )
+}
+
+/// Acquire async-proxy writes through the generic proxy for cluster shared memory.
+///
+/// # PTX
+///
+/// ```ptx
+/// fence.proxy.async::generic.acquire.sync_restrict::shared::cluster.cluster;
+/// ```
+///
+/// # Safety
+///
+/// Must be called from within a cluster launch context.
+#[inline(never)]
+pub unsafe fn fence_proxy_async_generic_acquire_shared_cluster_cluster() {
+    unreachable!(
+        "fence_proxy_async_generic_acquire_shared_cluster_cluster called outside CUDA kernel context"
+    )
 }
 
 // =============================================================================

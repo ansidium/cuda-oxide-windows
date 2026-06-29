@@ -26,8 +26,8 @@
 //! │       │                                                 │
 //! │       │ query_cancel                                    │
 //! │       ▼                                                 │
-//! │  is_canceled? → if no: use ctaid as next tile           │
-//! │               → if yes: exit (no more work)             │
+//! │  is_canceled? → if yes: use ctaid as next tile          │
+//! │               → if no: exit (no more work)              │
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -65,7 +65,7 @@
 //! let lo = unsafe { CLC_RESPONSE[0] };
 //! let hi = unsafe { CLC_RESPONSE[1] };
 //! let canceled = unsafe { clc_query_is_canceled(lo, hi) };
-//! if canceled == 0 {
+//! if canceled != 0 {
 //!     // Work available — get tile coordinates
 //!     let tile_x = unsafe { clc_query_get_first_ctaid_x(lo, hi) };
 //!     let tile_y = unsafe { clc_query_get_first_ctaid_y(lo, hi) };
@@ -167,7 +167,7 @@ pub unsafe fn clc_query_is_canceled(resp_lo: u64, resp_hi: u64) -> u32 {
 
 /// Get the X coordinate of the canceled CTA's grid position.
 ///
-/// Only valid when `clc_query_is_canceled` returned 0 (work available).
+/// Only valid when `clc_query_is_canceled` returned 1 (work available).
 ///
 /// # Safety
 ///
@@ -187,7 +187,7 @@ pub unsafe fn clc_query_get_first_ctaid_x(resp_lo: u64, resp_hi: u64) -> u32 {
 
 /// Get the Y coordinate of the canceled CTA's grid position.
 ///
-/// Only valid when `clc_query_is_canceled` returned 0 (work available).
+/// Only valid when `clc_query_is_canceled` returned 1 (work available).
 ///
 /// # Safety
 ///
@@ -207,7 +207,7 @@ pub unsafe fn clc_query_get_first_ctaid_y(resp_lo: u64, resp_hi: u64) -> u32 {
 
 /// Get the Z coordinate of the canceled CTA's grid position.
 ///
-/// Only valid when `clc_query_is_canceled` returned 0 (work available).
+/// Only valid when `clc_query_is_canceled` returned 1 (work available).
 ///
 /// # Safety
 ///
