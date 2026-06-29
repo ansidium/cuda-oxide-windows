@@ -197,7 +197,7 @@ the variable may honestly print as `<optimized out>` because it has not been
 loaded into a register yet. For variable checks, prefer a source line after the
 value is used:
 
-```gdb
+```text
 break src/main.rs:412
 run
 info args
@@ -258,6 +258,7 @@ and describe it with `llvm.dbg.declare`, the way every debug build does
 So `CUDA_OXIDE_DEBUG=full` is a `-G`-style build. It automatically:
 
 - keeps every source local in its stack slot (skips Pliron `mem2reg`),
+- skips annotated loop unrolling, which requires `mem2reg`'s SSA form,
 - skips LLVM `opt -O2`, and
 - runs `llc` at `-O0`,
 

@@ -30,6 +30,7 @@ pub fn dylib_filename(crate_name: &str, target: &str) -> String {
 }
 
 /// Object-file extension used by `target`.
+#[allow(dead_code)]
 pub fn object_extension(target: &str) -> &'static str {
     if is_windows_target(target) {
         "obj"

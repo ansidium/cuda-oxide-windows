@@ -10,6 +10,8 @@ members = [
     "crates/dialect-nvvm",
     "crates/mir-importer",
     "crates/mir-lower",
+    "crates/mir-transforms",
+    "crates/nvvm-transforms",
     "crates/cargo-oxide",
     "crates/oxide-artifacts",
     # FFI bindings
@@ -44,9 +46,9 @@ repository = "https://github.com/NVlabs/cuda-oxide.git"
 # cuda-oxide consumes the dialect modeling only, not the FFI bridge.
 # `crates/rustc-codegen-cuda/Cargo.toml` MUST stay on this same rev, or pliron
 # resolves to two distinct crates and types stop unifying.
-pliron = { git = "https://github.com/pliron-org/pliron", rev = "847561916b34649ba944d4eb7db50d02cf9ddf30" }
-pliron-derive = { git = "https://github.com/pliron-org/pliron", rev = "847561916b34649ba944d4eb7db50d02cf9ddf30" }
-pliron-llvm = { git = "https://github.com/pliron-org/pliron", rev = "847561916b34649ba944d4eb7db50d02cf9ddf30", default-features = false }
+pliron = { git = "https://github.com/pliron-org/pliron", rev = "222dd962a124cba8ec5f119ae6e0ecf202630854" }
+pliron-derive = { git = "https://github.com/pliron-org/pliron", rev = "222dd962a124cba8ec5f119ae6e0ecf202630854" }
+pliron-llvm = { git = "https://github.com/pliron-org/pliron", rev = "222dd962a124cba8ec5f119ae6e0ecf202630854", default-features = false }
 
 # Internal crates
 llvm-export = { path = "crates/llvm-export" }
@@ -54,6 +56,8 @@ dialect-mir = { path = "crates/dialect-mir" }
 dialect-nvvm = { path = "crates/dialect-nvvm" }
 mir-lower = { path = "crates/mir-lower" }
 mir-importer = { path = "crates/mir-importer" }
+mir-transforms = { path = "crates/mir-transforms" }
+nvvm-transforms = { path = "crates/nvvm-transforms" }
 cuda-device = { path = "crates/cuda-device" }
 cuda-host = { path = "crates/cuda-host" }
 cuda-macros = { path = "crates/cuda-macros" }
@@ -77,6 +81,7 @@ combine = "4.6"
 log = "0.4"
 half = "2.7"
 libloading = "0.8"
+sha2 = "0.10"
 
 # llvm-export deps
 rustc-hash = "2.0"

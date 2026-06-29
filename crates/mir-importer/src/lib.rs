@@ -26,7 +26,8 @@
 //! │  │     MIR      │   │  dialect-mir (alloca)                       │   │
 //! │  │      ──▶     │   │    ──▶ mem2reg                              │   │
 //! │  │  dialect-mir │   │    ──▶ dialect-mir (SSA)                    │   │
-//! │  │   (alloca)   │   │    ──▶ LLVM dialect  (via mir-lower)        │   │
+//! │  │   (alloca)   │   │    ──▶ annotated loop unroll                │   │
+//! │  │              │   │    ──▶ LLVM dialect  (via mir-lower)        │   │
 //! │  │              │   │    ──▶ LLVM IR ──▶ PTX  (via llc)           │   │
 //! │  └──────────────┘   └─────────────────────────────────────────────┘   │
 //! │                                                                       │
@@ -38,7 +39,7 @@
 //! | Module         | Purpose                                                     |
 //! |----------------|-------------------------------------------------------------|
 //! | [`translator`] | MIR → `dialect-mir` (alloca + load/store)                   |
-//! | [`pipeline`]   | `mem2reg`, lower to LLVM dialect, export LLVM IR, run llc   |
+//! | [`pipeline`]   | `mem2reg`, unroll, lower, export LLVM IR, run llc           |
 //! | [`error`]      | Error types integrated with pliron's error system           |
 //!
 //! Note: Function collection is handled by `rustc-codegen-cuda/src/collector.rs`
@@ -85,5 +86,5 @@ pub mod translator;
 pub use error::{TranslationErr, TranslationResult};
 pub use pipeline::{
     CollectedFunction, CompilationArtifactKind, CompilationResult, DeviceExternAttrs,
-    DeviceExternDecl, PipelineConfig, PipelineError, run_pipeline,
+    DeviceExternDecl, DeviceExternType, PipelineConfig, PipelineError, run_pipeline,
 };

@@ -26,8 +26,7 @@ jobs:
         # GPU-only `tests/vmm_p2p.rs` integration test.
         #
         # Crates intentionally not in this matrix:
-        #   * `cuda-bindings`, `libnvvm-sys`, `nvjitlink-sys` — sys binding
-        #     shells with no `#[test]` functions; covered transitively.
+        #   * `cuda-bindings` — generated sys bindings covered transitively.
         #   * `fuzzer` — differential-testing infra with no unit tests.
         #   * `rustc-codegen-cuda` — its own [workspace] that links against
         #     `rustc-private` dylibs; covered by the dedicated clippy job.
@@ -37,6 +36,8 @@ jobs:
           - package: dialect-nvvm
           - package: mir-importer
           - package: mir-lower
+          - package: mir-transforms
+          - package: nvvm-transforms
           - package: oxide-artifacts
           - package: reserved-oxide-symbols
           # launch_requires_unsafe trybuild fixture dev-depends on
@@ -45,6 +46,10 @@ jobs:
             needs_cuda: true
           # trybuild compile-fail suite for ThreadIndex / DisjointSlice safety
           - package: cuda-device
+          # Runtime CUDA compiler/linker discovery and file-identity checks;
+          # live-toolkit tests remain explicitly ignored on stock runners.
+          - package: libnvvm-sys
+          - package: nvjitlink-sys
           # pure-Rust kernel-launch helpers + tcgen05 tiling tables
           - package: cuda-host
             needs_cuda: true

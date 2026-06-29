@@ -123,13 +123,33 @@ operation. Generated borrowed async methods encode that requirement as Rust
 borrows, and generated owned async methods move buffers into the operation for
 spawned tasks.
 
-`#[cuda_module]` owns launch ergonomics, not target-selection policy. It loads
-whatever embedded payload the compiler produced for the current crate. PTX and
-cubin payloads load directly; embedded NVVM IR/LTOIR is built to a cubin with
-the same libNVVM/nvJitLink path used by the sidecar loader. Fatbin or
-multi-architecture packaging decisions belong in the compiler and artifact
-layers, so the typed launch API does not need to change when those payload
-formats evolve.
+`#[cuda_module]` loads the artifact produced by the compiler. PTX and cubin
+payloads load directly. NVVM IR and LTOIR normally compile for the target
+recorded with the artifact. A module built for a standard pre-Blackwell target,
+such as `sm_86`, can also be converted to PTX and JIT-compiled by the CUDA
+driver on Blackwell. This forward path is not available for suffixed targets,
+such as `sm_90a`, and artifacts built for newer GPUs cannot run on older GPUs.
+Because this path JIT-compiles PTX, the installed driver must support the PTX
+version produced by the selected CUDA toolkit.
+
+Pre-Blackwell targets use typed-pointer NVVM IR. Blackwell and newer targets
+use opaque-pointer NVVM IR. The compiler records the selected target in the
+embedded bundle and in the `<module>.target` file used by the lower-level
+loader.
+
+Older artifacts without a recorded target must be rebuilt or loaded with
+`CUDA_OXIDE_TARGET` set to their original target.
+
+File-backed NVVM IR and LTOIR cache native cubins below
+`.oxide-artifacts/ltoir-cubin-cache/v1`. A cache entry is reused only when the
+source, target, module names, ordered options, libdevice, and exact loaded
+libNVVM/nvJitLink binaries all match. The cubin and optional LTOIR are verified
+and published together, so a stopped or concurrent build cannot mix outputs.
+If either CUDA library cannot be identified exactly, cuda-oxide rebuilds. PTX
+selection and the pre-Blackwell to Blackwell PTX bridge do not use this cache.
+The first compiler/linker handles are retained for the process lifetime;
+restart the process to select another toolkit or after replacing one in place.
+Remove the `.oxide-artifacts` directory to clear all cached entries.
 
 ## Tiling Utilities (tcgen05)
 

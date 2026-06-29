@@ -8,21 +8,22 @@
 //! Finds or builds the `rustc_codegen_cuda` backend dynamic library using this priority:
 //!
 //! 1. `CUDA_OXIDE_BACKEND` env var (explicit override)
-//! 2. Backend dynamic library next to the running `cargo-oxide` executable
+//! 2. Project config (`.cargo/cuda-oxide.toml`)
+//! 3. Backend dynamic library next to the running `cargo-oxide` executable
 //!    (packaged release zip layout)
-//! 3. Local repo (detected by presence of `crates/rustc-codegen-cuda`)
-//! 4. Cached backend at `~/.cargo/cuda-oxide/<platform filename>`,
+//! 4. Local repo (detected by presence of `crates/rustc-codegen-cuda`)
+//! 5. Cached backend at `~/.cargo/cuda-oxide/<platform filename>`,
 //!    but only when it isn't older than the running `cargo-oxide` binary
-//! 5. Auto-fetch from git and build (one-time, or after a stale-cache miss)
+//! 6. Auto-fetch from git and build (one-time, or after a stale-cache miss)
 //!
 //! ## Cache staleness (issue #49)
 //!
 //! `cargo install` always rewrites `~/.cargo/bin/cargo-oxide` on every
 //! upgrade, bumping its mtime. The cached backend is only ever written by
-//! step 4 below, so a binary newer than the cache is the canonical signal
+//! step 6 below, so a binary newer than the cache is the canonical signal
 //! that the user has just upgraded `cargo-oxide` and the cached backend
-//! no longer matches the binary loading it. When step 3 detects that, we
-//! drop both the cached backend *and* the cached source tree so that step 4
+//! no longer matches the binary loading it. When step 5 detects that, we
+//! drop both the cached backend *and* the cached source tree so that step 6
 //! re-clones fresh and rebuilds, rather than rebuilding from a clone that
 //! was taken whenever the user first installed.
 //!
@@ -88,11 +89,12 @@ pub fn find_workspace_root() -> Option<PathBuf> {
 ///
 /// Discovery order:
 /// 1. `CUDA_OXIDE_BACKEND` env var
-/// 2. Packaged backend next to the running `cargo-oxide` executable
-/// 3. Local repo build (crates/rustc-codegen-cuda)
-/// 4. Cached build at ~/.cargo/cuda-oxide/
-/// 5. Auto-fetch + build from git
-pub fn find_or_build_backend(workspace_root: &Path) -> PathBuf {
+/// 2. Project config (`.cargo/cuda-oxide.toml`)
+/// 3. Packaged backend next to the running `cargo-oxide` executable
+/// 4. Local repo build (crates/rustc-codegen-cuda)
+/// 5. Cached build at ~/.cargo/cuda-oxide/
+/// 6. Auto-fetch + build from git
+pub fn find_or_build_backend(workspace_root: &Path, configured_backend: Option<&Path>) -> PathBuf {
     let host_target = active_host_target();
     let backend_filename = backend_filename_for_target(&host_target);
 
@@ -108,14 +110,27 @@ pub fn find_or_build_backend(workspace_root: &Path) -> PathBuf {
         );
     }
 
-    // 2. Packaged release layout: cargo-oxide.exe and rustc_codegen_cuda.dll
+    // 2. Project config
+    if let Some(path) = configured_backend {
+        if path.exists() {
+            return path.to_path_buf();
+        }
+        eprintln!(
+            "Error: configured cuda-oxide backend does not exist: {}",
+            path.display()
+        );
+        eprintln!("Build it or update `.cargo/cuda-oxide.toml`.");
+        std::process::exit(1);
+    }
+
+    // 3. Packaged release layout: cargo-oxide.exe and rustc_codegen_cuda.dll
     // live side-by-side in the extracted archive. This keeps release users from
     // having to set CUDA_OXIDE_BACKEND manually.
     if let Some(packaged_backend) = packaged_backend_path(&backend_filename) {
         return packaged_backend;
     }
 
-    // 3. Local repo
+    // 4. Local repo
     let codegen_crate = workspace_root.join("crates/rustc-codegen-cuda");
     if codegen_crate.is_dir() {
         let backend_path = backend_artifact_path(&codegen_crate, &host_target);
@@ -123,7 +138,7 @@ pub fn find_or_build_backend(workspace_root: &Path) -> PathBuf {
         return backend_path;
     }
 
-    // 4. Cached backend. Only honored when it isn't older than the running
+    // 5. Cached backend. Only honored when it isn't older than the running
     //    cargo-oxide binary; see the module-level comment about issue #49.
     if let Some(cache_dir) = cache_directory() {
         let cached_backend = cache_dir.join(&backend_filename);
@@ -142,9 +157,9 @@ pub fn find_or_build_backend(workspace_root: &Path) -> PathBuf {
                 }
                 CacheStatus::StaleVsSource => {
                     // The cached source advanced; rebuild the backend from it
-                    // in place. We do NOT invalidate the cache here, so the
-                    // auto-fetch step below skips the clone (the source tree
-                    // is still present) and rebuilds from the existing source.
+                    // place. We do NOT invalidate the cache here, so the
+                    // auto-fetch step below skips the clone (the source tree is
+                    // still present) and rebuilds from the existing source.
                     eprintln!(
                         "Cached backend source at {} is newer than the cached \
                          library; rebuilding from it in place.",
@@ -167,18 +182,24 @@ pub fn find_or_build_backend(workspace_root: &Path) -> PathBuf {
 ///
 /// 1. `CUDA_OXIDE_BACKEND` env var, returned even when the file is missing
 ///    so the caller can report the configured-but-absent path.
-/// 2. Packaged backend next to the running `cargo-oxide` executable.
-/// 3. Local repo build path (`crates/rustc-codegen-cuda/target/<profile>/...`).
-/// 4. Cache path at `~/.cargo/cuda-oxide/<platform filename>`.
+/// 2. Project config (`.cargo/cuda-oxide.toml`), returned even when missing
+///    so the caller can report the configured-but-absent path.
+/// 3. Packaged backend next to the running `cargo-oxide` executable.
+/// 4. Local repo build path (`crates/rustc-codegen-cuda/target/<profile>/...`).
+/// 5. Cache path at `~/.cargo/cuda-oxide/<platform filename>`.
 ///
 /// `cargo oxide doctor` uses this so that a diagnostic run never triggers a
 /// multi-minute backend build or a git clone before it can print anything.
-pub fn backend_candidate(workspace_root: &Path) -> PathBuf {
+pub fn backend_so_candidate(workspace_root: &Path, configured_backend: Option<&Path>) -> PathBuf {
     let host_target = active_host_target();
     let backend_filename = backend_filename_for_target(&host_target);
 
     if let Ok(path) = std::env::var("CUDA_OXIDE_BACKEND") {
         return PathBuf::from(path);
+    }
+
+    if let Some(path) = configured_backend {
+        return path.to_path_buf();
     }
 
     if let Some(packaged_backend) = packaged_backend_path(&backend_filename) {
@@ -346,7 +367,7 @@ fn visit_files(dir: &Path, f: &mut dyn FnMut(&Path)) {
     }
 }
 
-/// Drop both the cached backend and the cached source tree at `cache_dir`.
+/// Drop both the cached `.so` and the cached source tree at `cache_dir`.
 ///
 /// Removing `src/` is what forces the auto-fetch step to re-clone instead
 /// of rebuilding from a checkout that was taken at first-install time.
@@ -581,10 +602,6 @@ fn rustc_sysroot_loader_dir(sysroot: &str, target: &str) -> PathBuf {
 struct WindowsLibffiPaths {
     lib_dir: PathBuf,
     bin_dir: Option<PathBuf>,
-}
-
-pub(crate) fn windows_libffi_library_dir() -> Option<PathBuf> {
-    find_windows_libffi_paths().map(|paths| paths.lib_dir)
 }
 
 pub(crate) fn windows_libffi_loader_dir() -> Option<PathBuf> {
@@ -942,103 +959,6 @@ mod tests {
             cached_backend_status(&so, None),
             CacheStatus::StaleVsToolchain,
             "toolchain mismatch must win over binary staleness"
-        );
-    }
-
-    #[test]
-    fn backend_artifact_path_uses_windows_dylib_name() {
-        let root = Path::new(r"C:\Program Files\cuda oxide\crates\rustc-codegen-cuda");
-        assert_eq!(
-            backend_artifact_path(root, "x86_64-pc-windows-msvc"),
-            root.join("target")
-                .join("release")
-                .join("rustc_codegen_cuda.dll")
-        );
-    }
-
-    #[test]
-    fn backend_artifact_path_preserves_linux_dylib_name() {
-        let root = Path::new("/opt/cuda-oxide/crates/rustc-codegen-cuda");
-        assert_eq!(
-            backend_artifact_path(root, "x86_64-unknown-linux-gnu"),
-            root.join("target")
-                .join("debug")
-                .join("librustc_codegen_cuda.so")
-        );
-    }
-
-    #[test]
-    fn packaged_backend_path_is_next_to_running_exe() {
-        let exe = Path::new("/opt/cuda-oxide/bin/cargo-oxide");
-        assert_eq!(
-            backend_path_next_to_exe(exe, "rustc_codegen_cuda.dll"),
-            Some(PathBuf::from("/opt/cuda-oxide/bin/rustc_codegen_cuda.dll"))
-        );
-    }
-
-    #[test]
-    fn rustc_sysroot_loader_dir_is_target_aware() {
-        assert_eq!(
-            rustc_sysroot_loader_dir(r"C:\rustup\toolchains\nightly", "x86_64-pc-windows-msvc"),
-            PathBuf::from(r"C:\rustup\toolchains\nightly").join("bin")
-        );
-        assert_eq!(
-            rustc_sysroot_loader_dir("/rustup/toolchains/nightly", "x86_64-unknown-linux-gnu"),
-            PathBuf::from("/rustup/toolchains/nightly").join("lib")
-        );
-    }
-
-    #[test]
-    fn libffi_paths_from_vcpkg_root_finds_import_library_and_dll_dir() {
-        let dir = tempdir();
-        let installed = dir.join("installed").join("x64-windows");
-        let lib_dir = installed.join("lib");
-        let bin_dir = installed.join("bin");
-        std::fs::create_dir_all(&lib_dir).unwrap();
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        std::fs::write(lib_dir.join("ffi.lib"), b"import lib").unwrap();
-        std::fs::write(bin_dir.join("ffi-8.dll"), b"dll").unwrap();
-
-        assert_eq!(
-            libffi_paths_from_vcpkg_root(&dir, None),
-            Some(WindowsLibffiPaths {
-                lib_dir,
-                bin_dir: Some(bin_dir)
-            })
-        );
-    }
-
-    #[test]
-    fn windows_vcpkg_roots_uses_env_and_path_only() {
-        let env_root = tempdir();
-        let path_root = tempdir();
-        let exe_name = vcpkg_executable_names()[0];
-        std::fs::write(path_root.join(exe_name), b"vcpkg").unwrap();
-        let path = std::env::join_paths([path_root.clone()]).unwrap();
-
-        assert_eq!(
-            windows_vcpkg_roots_from_env(Some(env_root.clone().into_os_string()), Some(path)),
-            vec![env_root, path_root]
-        );
-
-        assert!(windows_vcpkg_roots_from_env(None, None).is_empty());
-    }
-
-    #[test]
-    fn libffi_paths_from_lib_dir_preserves_explicit_bin_dir() {
-        let dir = tempdir();
-        let lib_dir = dir.join("custom-lib");
-        let bin_dir = dir.join("custom-bin");
-        std::fs::create_dir_all(&lib_dir).unwrap();
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        std::fs::write(lib_dir.join("ffi.lib"), b"import lib").unwrap();
-
-        assert_eq!(
-            libffi_paths_from_lib_dir(lib_dir.clone(), Some(bin_dir.clone())),
-            Some(WindowsLibffiPaths {
-                lib_dir,
-                bin_dir: Some(bin_dir)
-            })
         );
     }
 

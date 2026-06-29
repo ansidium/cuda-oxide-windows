@@ -61,6 +61,23 @@ pub struct FieldIndexAttr(pub u32);
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
 pub struct VariantIndexAttr(pub u32);
 
+/// The unroll factor carried by a [`MirUnrollHintOp`](crate::ops::MirUnrollHintOp).
+///
+/// `#[unroll]` / `#[unroll(N)]` written on a loop makes the frontend plant a
+/// `mir.unroll_hint` op inside that loop's body; this attribute is the factor it
+/// carries, and the loop-unroll pass reads it to decide how to unroll that one
+/// loop:
+///
+/// * `0` -- **full unroll**: if the loop's trip count is a compile-time
+///   constant, unroll it completely, so the induction variable becomes a literal
+///   in each copy (this is what lets index arithmetic such as `i & 3` fold to a
+///   constant).
+/// * `n >= 2` -- **unroll by `n`**: do `n` copies of the body per trip, leaving
+///   a remainder loop when `n` does not divide the trip count.
+#[pliron_attr(name = "mir.unroll", format = "$0", verifier = "succ")]
+#[derive(PartialEq, Eq, Clone, Debug, Hash)]
+pub struct UnrollAttr(pub u32);
+
 /// Niche encoding for a `Cast(Transmute)` whose destination is a
 /// niche-optimised enum.
 ///
@@ -154,6 +171,7 @@ pub fn register(ctx: &mut Context) {
     MutabilityAttr::register(ctx);
     FieldIndexAttr::register(ctx);
     VariantIndexAttr::register(ctx);
+    UnrollAttr::register(ctx);
     NicheEncodingAttr::register(ctx);
     MirFP16Attr::register(ctx);
 }

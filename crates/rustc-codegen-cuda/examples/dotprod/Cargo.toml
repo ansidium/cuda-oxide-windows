@@ -1,5 +1,5 @@
 [package]
-name = "issue98_repro"
+name = "dotprod"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -7,13 +7,16 @@ license = "Apache-2.0"
 # Mark as standalone crate (not part of parent workspace)
 [workspace]
 
-# Repro for issue #98: libdevice calls (__nv_expf) auto-switch the device
-# pipeline into NVVM IR mode; the emitted opaque-pointer NVVM IR is rejected
-# by libNVVM with "parse expected type" for pre-Blackwell archs (sm_86 etc).
+# End-to-end test for integer dot product intrinsics (dp4a, dp2a).
 # Build with:
-#   cargo oxide build issue98_repro --arch sm_90 -v
+#   cargo oxide run dotprod --arch sm_61
 
 [dependencies]
+# Device-side intrinsics (dotprod::dp4a_*, dotprod::dp2a_*, thread indexing)
 cuda-device = { path = "../../../cuda-device" }
+
+# Host-side utilities (CudaKernel trait, etc.)
 cuda-host = { path = "../../../cuda-host" }
+
+# Host-side CUDA runtime
 cuda-core = { path = "../../../cuda-core" }

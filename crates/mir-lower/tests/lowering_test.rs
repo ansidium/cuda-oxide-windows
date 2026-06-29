@@ -26,7 +26,7 @@ fn test_intrinsic_insertion() -> Result<(), anyhow::Error> {
 
     // Create MirFunc
     let func_name = "kernel_func";
-    let func_ty = pliron::builtin::types::FunctionType::get(&mut ctx, vec![], vec![]);
+    let func_ty = pliron::builtin::types::FunctionType::get(&ctx, vec![], vec![]);
 
     // Manual construction of MirFuncOp
     let func_op_ptr = Operation::new(
@@ -53,7 +53,7 @@ fn test_intrinsic_insertion() -> Result<(), anyhow::Error> {
 
     // Add ReadPtxSregTidXOp
     let int32_ty = pliron::builtin::types::IntegerType::get(
-        &mut ctx,
+        &ctx,
         32,
         pliron::builtin::types::Signedness::Signless,
     );
@@ -151,7 +151,7 @@ fn test_globaltimer_lowers_to_intrinsic_call() -> Result<(), anyhow::Error> {
     let module_ptr = module.get_operation();
 
     let func_name = "kernel_func";
-    let func_ty = pliron::builtin::types::FunctionType::get(&mut ctx, vec![], vec![]);
+    let func_ty = pliron::builtin::types::FunctionType::get(&ctx, vec![], vec![]);
 
     let func_op_ptr = Operation::new(
         &mut ctx,
@@ -173,7 +173,7 @@ fn test_globaltimer_lowers_to_intrinsic_call() -> Result<(), anyhow::Error> {
     };
 
     let i64_ty = pliron::builtin::types::IntegerType::get(
-        &mut ctx,
+        &ctx,
         64,
         pliron::builtin::types::Signedness::Signless,
     );
@@ -283,7 +283,7 @@ fn assert_sreg_i32_lowers_to_intrinsic(
     let module_ptr = module.get_operation();
 
     let func_name = "kernel_func";
-    let func_ty = pliron::builtin::types::FunctionType::get(&mut ctx, vec![], vec![]);
+    let func_ty = pliron::builtin::types::FunctionType::get(&ctx, vec![], vec![]);
 
     let func_op_ptr = Operation::new(
         &mut ctx,
@@ -305,7 +305,7 @@ fn assert_sreg_i32_lowers_to_intrinsic(
     };
 
     let i32_ty = pliron::builtin::types::IntegerType::get(
-        &mut ctx,
+        &ctx,
         32,
         pliron::builtin::types::Signedness::Signless,
     );
@@ -411,7 +411,7 @@ fn test_threadfence_system_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     let module_ptr = module.get_operation();
 
     let func_name = "kernel_func";
-    let func_ty = pliron::builtin::types::FunctionType::get(&mut ctx, vec![], vec![]);
+    let func_ty = pliron::builtin::types::FunctionType::get(&ctx, vec![], vec![]);
 
     let func_op_ptr = Operation::new(
         &mut ctx,
@@ -516,8 +516,8 @@ fn test_elect_sync_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     use pliron::builtin::types::{IntegerType, Signedness};
 
     let mut ctx = make_test_ctx();
-    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
-    let i1_ty = IntegerType::get(&mut ctx, 1, Signedness::Signless);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let i1_ty = IntegerType::get(&ctx, 1, Signedness::Signless);
     let (module_ptr, entry) = build_test_kernel(&mut ctx, vec![i32_ty.into()]);
     let mask = entry.deref(&ctx).get_argument(0);
 
@@ -749,12 +749,12 @@ fn addrspace_coercion_inserts_addrspacecast_at_call_site() -> Result<(), anyhow:
     let module_region = module_ptr.deref(&ctx).get_region(0);
     let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
 
-    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
     let shared_ptr_ty = MirPtrType::get_shared(&mut ctx, i32_ty.into(), true);
     let generic_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), true);
 
     // Callee: takes a *mut i32 in addrspace(3), returns ().
-    let callee_func_ty = FunctionType::get(&mut ctx, vec![shared_ptr_ty.into()], vec![]);
+    let callee_func_ty = FunctionType::get(&ctx, vec![shared_ptr_ty.into()], vec![]);
     let callee_func_op = Operation::new(
         &mut ctx,
         mir::MirFuncOp::get_concrete_op_info(),
@@ -791,7 +791,7 @@ fn addrspace_coercion_inserts_addrspacecast_at_call_site() -> Result<(), anyhow:
     // Caller: takes a *mut i32 in addrspace(0), calls `callee` with that
     // pointer. The lowerer is responsible for inserting an addrspacecast
     // since the callee's declared addrspace differs.
-    let caller_func_ty = FunctionType::get(&mut ctx, vec![generic_ptr_ty.into()], vec![]);
+    let caller_func_ty = FunctionType::get(&ctx, vec![generic_ptr_ty.into()], vec![]);
     let caller_func_op = Operation::new(
         &mut ctx,
         mir::MirFuncOp::get_concrete_op_info(),
@@ -868,6 +868,173 @@ fn addrspace_coercion_inserts_addrspacecast_at_call_site() -> Result<(), anyhow:
     Ok(())
 }
 
+/// A zero-sized MIR result is erased from the NVPTX function ABI, but its
+/// typed value can remain live inside MIR (for example, when one ZST-returning
+/// function returns the result of another). Lowering must keep the void call
+/// for side effects and replace only its value result with a typed LLVM undef.
+#[test]
+fn zst_union_call_result_keeps_void_call_and_replaces_live_uses() -> Result<(), anyhow::Error> {
+    use dialect_mir::types::{MirTupleType, MirUnionType};
+    use pliron::basic_block::BasicBlock;
+    use pliron::builtin::attributes::{StringAttr, TypeAttr};
+    use pliron::builtin::types::FunctionType;
+    use pliron::r#type::{TypeHandle, Typed};
+
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+    dialect_nvvm::register(&mut ctx);
+    mir_lower::register(&mut ctx);
+
+    let unit_ty: TypeHandle = MirTupleType::get(&mut ctx, vec![]).into();
+    let union_ty: TypeHandle = MirUnionType::get(
+        &mut ctx,
+        "AlignedZeroUnion".into(),
+        vec!["unit".into()],
+        vec![unit_ty],
+        0,
+        16,
+    )
+    .into();
+
+    let module = ModuleOp::new(&mut ctx, "test_zst_union_call".try_into().unwrap());
+    let module_ptr = module.get_operation();
+    let module_region = module_ptr.deref(&ctx).get_region(0);
+    let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+
+    let callee_ty = FunctionType::get(&ctx, vec![], vec![union_ty]);
+    let callee_ptr = Operation::new(
+        &mut ctx,
+        mir::MirFuncOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        1,
+    );
+    let callee = mir::MirFuncOp::new(&mut ctx, callee_ptr, TypeAttr::new(callee_ty.into()));
+    callee.set_symbol_name(&mut ctx, "make_zero".try_into().unwrap());
+    {
+        let region = callee.get_operation().deref(&ctx).get_region(0);
+        let block = BasicBlock::new(&mut ctx, None, vec![]);
+        block.insert_at_back(region, &ctx);
+
+        let undef = mir::MirUndefOp::new(&mut ctx, union_ty);
+        undef.get_operation().insert_at_back(block, &ctx);
+        let value = undef.get_operation().deref(&ctx).get_result(0);
+
+        let ret = Operation::new(
+            &mut ctx,
+            mir::MirReturnOp::get_concrete_op_info(),
+            vec![],
+            vec![value],
+            vec![],
+            0,
+        );
+        ret.insert_at_back(block, &ctx);
+    }
+    callee.get_operation().insert_at_back(module_block, &ctx);
+
+    let caller_ty = FunctionType::get(&ctx, vec![], vec![union_ty]);
+    let caller_ptr = Operation::new(
+        &mut ctx,
+        mir::MirFuncOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        1,
+    );
+    let caller = mir::MirFuncOp::new(&mut ctx, caller_ptr, TypeAttr::new(caller_ty.into()));
+    caller.set_symbol_name(&mut ctx, "return_called_zero".try_into().unwrap());
+    {
+        let region = caller.get_operation().deref(&ctx).get_region(0);
+        let block = BasicBlock::new(&mut ctx, None, vec![]);
+        block.insert_at_back(region, &ctx);
+
+        let call_ptr = Operation::new(
+            &mut ctx,
+            mir::MirCallOp::get_concrete_op_info(),
+            vec![union_ty],
+            vec![],
+            vec![],
+            0,
+        );
+        let call = mir::MirCallOp::new(call_ptr);
+        call.set_attr_callee(&ctx, StringAttr::new("make_zero".to_string()));
+        call_ptr.insert_at_back(block, &ctx);
+        let value = call_ptr.deref(&ctx).get_result(0);
+
+        let ret = Operation::new(
+            &mut ctx,
+            mir::MirReturnOp::get_concrete_op_info(),
+            vec![],
+            vec![value],
+            vec![],
+            0,
+        );
+        ret.insert_at_back(block, &ctx);
+    }
+    caller.get_operation().insert_at_back(module_block, &ctx);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut found_void_call = false;
+    let mut caller_undefs = 0;
+    let mut found_void_return = false;
+    for op in module_block.deref(&ctx).iter(&ctx) {
+        let Some(func) = Operation::get_op::<llvm::FuncOp>(op, &ctx) else {
+            continue;
+        };
+        if func.get_symbol_name(&ctx).to_string() != "return_called_zero" {
+            continue;
+        }
+        let region = func.get_operation().deref(&ctx).get_region(0);
+        for block in region.deref(&ctx).iter(&ctx) {
+            for body_op in block.deref(&ctx).iter(&ctx) {
+                if let Some(call) = Operation::get_op::<llvm::CallOp>(body_op, &ctx)
+                    && let CallOpCallable::Direct(callee) = call.callee(&ctx)
+                    && callee.to_string() == "make_zero"
+                {
+                    let call_op = call.get_operation().deref(&ctx);
+                    assert_eq!(call_op.get_num_results(), 1);
+                    assert!(
+                        call_op
+                            .get_result(0)
+                            .get_type(&ctx)
+                            .deref(&ctx)
+                            .is::<llvm_export::types::VoidType>(),
+                        "the ZST-returning call must use the void ABI"
+                    );
+                    found_void_call = true;
+                }
+                if Operation::get_op::<llvm::UndefOp>(body_op, &ctx).is_some() {
+                    caller_undefs += 1;
+                }
+                if let Some(ret) = Operation::get_op::<llvm::ReturnOp>(body_op, &ctx) {
+                    assert_eq!(
+                        ret.get_operation().deref(&ctx).get_num_operands(),
+                        0,
+                        "the caller's ZST return must also use the void ABI"
+                    );
+                    found_void_return = true;
+                }
+            }
+        }
+    }
+
+    assert!(
+        found_void_call,
+        "the LLVM call must be retained because the callee may have side effects"
+    );
+    assert_eq!(
+        caller_undefs, 1,
+        "the live MIR result must be replaced by one typed LLVM undef"
+    );
+    assert!(
+        found_void_return,
+        "the caller must retain its return terminator"
+    );
+    Ok(())
+}
+
 /// Lock the comparison-predicate lowering table to the rustc_codegen_ssa
 /// reference (`bin_op_to_fcmp_predicate` / `bin_op_to_icmp_predicate`):
 ///
@@ -903,17 +1070,17 @@ fn test_cmp_predicate_lowering() -> Result<(), anyhow::Error> {
 
     let f32_ty = pliron::builtin::types::FP32Type::get(&ctx);
     let i32_signed = pliron::builtin::types::IntegerType::get(
-        &mut ctx,
+        &ctx,
         32,
         pliron::builtin::types::Signedness::Signed,
     );
     let u32_unsigned = pliron::builtin::types::IntegerType::get(
-        &mut ctx,
+        &ctx,
         32,
         pliron::builtin::types::Signedness::Unsigned,
     );
     let bool_ty = pliron::builtin::types::IntegerType::get(
-        &mut ctx,
+        &ctx,
         1,
         pliron::builtin::types::Signedness::Signless,
     );
@@ -927,7 +1094,7 @@ fn test_cmp_predicate_lowering() -> Result<(), anyhow::Error> {
         u32_unsigned.into(),
     ];
     let func_name = "cmp_func";
-    let func_ty = pliron::builtin::types::FunctionType::get(&mut ctx, arg_tys.clone(), vec![]);
+    let func_ty = pliron::builtin::types::FunctionType::get(&ctx, arg_tys.clone(), vec![]);
 
     let func_op_ptr = Operation::new(
         &mut ctx,
@@ -1369,7 +1536,7 @@ fn test_cvt_f16x2_f32_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
 
     let mut ctx = make_test_ctx();
     let f32_ty = FP32Type::get(&ctx);
-    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
     let (module_ptr, entry) = build_test_kernel(&mut ctx, vec![f32_ty.into(), f32_ty.into()]);
 
     let lo_val = entry.deref(&ctx).get_argument(0);
@@ -1499,7 +1666,7 @@ fn test_inline_ptx_op_lowers_to_inline_asm_attrs() -> Result<(), anyhow::Error> 
     use pliron::builtin::types::{IntegerType, Signedness};
 
     let mut ctx = make_test_ctx();
-    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
     let (module_ptr, entry) = build_test_kernel(&mut ctx, vec![i32_ty.into()]);
     let input = entry.deref(&ctx).get_argument(0);
 
@@ -1673,11 +1840,11 @@ fn test_bool_phi_cmp_lowers_to_unsigned_i1_icmp() -> Result<(), anyhow::Error> {
     let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
     let module_ptr = module.get_operation();
 
-    let bool_ty = IntegerType::get(&mut ctx, 1, Signedness::Signless);
+    let bool_ty = IntegerType::get(&ctx, 1, Signedness::Signless);
     let arg_tys: Vec<pliron::r#type::TypeHandle> =
         vec![bool_ty.into(), bool_ty.into(), bool_ty.into()];
     let func_name = "bool_phi_cmp";
-    let func_ty = FunctionType::get(&mut ctx, arg_tys.clone(), vec![]);
+    let func_ty = FunctionType::get(&ctx, arg_tys.clone(), vec![]);
 
     let func_op_ptr = Operation::new(
         &mut ctx,
@@ -1904,4 +2071,481 @@ fn test_dp2a_u32_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     append_return(&mut ctx, entry);
 
     assert_inline_asm_lowering(&mut ctx, module_ptr, "dp2a.lo.u32.u32")
+}
+
+// =============================================================================
+// cp.async lowering tests
+// =============================================================================
+
+#[test]
+fn test_cp_async_ca_4_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
+    use dialect_mir::types::MirPtrType;
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let dst_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), true);
+    let src_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), false);
+    let (module_ptr, entry) = build_test_kernel(&mut ctx, vec![dst_ty.into(), src_ty.into()]);
+
+    let dst = entry.deref(&ctx).get_argument(0);
+    let src = entry.deref(&ctx).get_argument(1);
+
+    let op = Operation::new(
+        &mut ctx,
+        nvvm::CpAsyncCa4Op::get_concrete_op_info(),
+        vec![],
+        vec![dst, src],
+        vec![],
+        0,
+    );
+    op.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    assert_cp_async_inline_asm_lowering(&mut ctx, module_ptr, 4)
+}
+
+#[test]
+fn test_cp_async_ca_8_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
+    use dialect_mir::types::MirPtrType;
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let dst_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), true);
+    let src_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), false);
+    let (module_ptr, entry) = build_test_kernel(&mut ctx, vec![dst_ty.into(), src_ty.into()]);
+
+    let dst = entry.deref(&ctx).get_argument(0);
+    let src = entry.deref(&ctx).get_argument(1);
+
+    let op = Operation::new(
+        &mut ctx,
+        nvvm::CpAsyncCa8Op::get_concrete_op_info(),
+        vec![],
+        vec![dst, src],
+        vec![],
+        0,
+    );
+    op.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    assert_cp_async_inline_asm_lowering(&mut ctx, module_ptr, 8)
+}
+
+fn assert_cp_async_inline_asm_lowering(
+    ctx: &mut Context,
+    module_ptr: pliron::context::Ptr<Operation>,
+    copy_size: u32,
+) -> Result<(), anyhow::Error> {
+    use pliron::r#type::Typed;
+
+    mir_lower::lower_mir_to_llvm(ctx, module_ptr).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let expected_template = format!(
+        "{{ .reg .u64 %smem64; .reg .u32 %smem32; .reg .u64 %gmem64; \
+         cvta.to.shared.u64 %smem64, $0; cvt.u32.u64 %smem32, %smem64; \
+         cvta.to.global.u64 %gmem64, $1; \
+         cp.async.ca.shared.global [%smem32], [%gmem64], {copy_size}; }}"
+    );
+    let mut matches = 0;
+    let module_region = module_ptr.deref(ctx).get_region(0);
+    let module_block = module_region.deref(ctx).iter(ctx).next().unwrap();
+
+    for op in module_block.deref(ctx).iter(ctx) {
+        let Some(func_op) = Operation::get_op::<llvm::FuncOp>(op, ctx) else {
+            continue;
+        };
+        if func_op.get_symbol_name(ctx).to_string() != "kernel_func" {
+            continue;
+        }
+
+        let func_region = func_op.get_operation().deref(ctx).get_region(0);
+        for func_block in func_region.deref(ctx).iter(ctx) {
+            for body_op in func_block.deref(ctx).iter(ctx) {
+                let Some(inline_asm) = Operation::get_op::<llvm::InlineAsmOp>(body_op, ctx) else {
+                    continue;
+                };
+                let template = inline_asm
+                    .get_attr_inline_asm_template(ctx)
+                    .map(|s| String::from((*s).clone()));
+                if template.as_deref() != Some(expected_template.as_str()) {
+                    continue;
+                }
+
+                matches += 1;
+                assert_eq!(
+                    inline_asm
+                        .get_attr_inline_asm_constraints(ctx)
+                        .map(|s| String::from((*s).clone()))
+                        .as_deref(),
+                    Some("l,l,~{memory}")
+                );
+                assert_eq!(llvm::asm_kind(ctx, &inline_asm), llvm::AsmKind::SideEffect);
+                assert!(
+                    inline_asm
+                        .get_attr_inline_asm_convergent(ctx)
+                        .is_some_and(|value| !bool::from((*value).clone()))
+                );
+
+                let operands: Vec<_> = inline_asm.get_operation().deref(ctx).operands().collect();
+                assert_eq!(operands.len(), 2);
+                for operand in operands {
+                    let ty = operand.get_type(ctx);
+                    let ty = ty.deref(ctx);
+                    let ptr_ty = ty
+                        .downcast_ref::<llvm_export::types::PointerType>()
+                        .expect("cp.async operands must lower to LLVM pointers");
+                    assert_eq!(ptr_ty.address_space(), 0);
+                }
+            }
+        }
+    }
+
+    assert_eq!(matches, 1, "missing exact {copy_size}-byte cp.async asm");
+    Ok(())
+}
+
+// =============================================================================
+// cp.async zero-fill lowering tests
+// =============================================================================
+
+#[test]
+fn test_cp_async_ca_zfill_4_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
+    use dialect_mir::types::MirPtrType;
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Signless);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let dst_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), true);
+    let src_ty = MirPtrType::get_generic(&mut ctx, i8_ty.into(), false);
+    let (module_ptr, entry) =
+        build_test_kernel(&mut ctx, vec![dst_ty.into(), src_ty.into(), i32_ty.into()]);
+
+    let dst = entry.deref(&ctx).get_argument(0);
+    let src = entry.deref(&ctx).get_argument(1);
+    let src_size = entry.deref(&ctx).get_argument(2);
+
+    let op = Operation::new(
+        &mut ctx,
+        nvvm::CpAsyncCaZfill4Op::get_concrete_op_info(),
+        vec![],
+        vec![dst, src, src_size],
+        vec![],
+        0,
+    );
+    op.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    assert_cp_async_zfill_inline_asm_lowering(&mut ctx, module_ptr, 4)
+}
+
+#[test]
+fn test_cp_async_ca_zfill_8_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
+    use dialect_mir::types::MirPtrType;
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Signless);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let dst_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), true);
+    let src_ty = MirPtrType::get_generic(&mut ctx, i8_ty.into(), false);
+    let (module_ptr, entry) =
+        build_test_kernel(&mut ctx, vec![dst_ty.into(), src_ty.into(), i32_ty.into()]);
+
+    let dst = entry.deref(&ctx).get_argument(0);
+    let src = entry.deref(&ctx).get_argument(1);
+    let src_size = entry.deref(&ctx).get_argument(2);
+
+    let op = Operation::new(
+        &mut ctx,
+        nvvm::CpAsyncCaZfill8Op::get_concrete_op_info(),
+        vec![],
+        vec![dst, src, src_size],
+        vec![],
+        0,
+    );
+    op.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    assert_cp_async_zfill_inline_asm_lowering(&mut ctx, module_ptr, 8)
+}
+
+#[test]
+fn test_cp_async_ca_zfill_16_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
+    use dialect_mir::types::MirPtrType;
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Signless);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let dst_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), true);
+    let src_ty = MirPtrType::get_generic(&mut ctx, i8_ty.into(), false);
+    let (module_ptr, entry) =
+        build_test_kernel(&mut ctx, vec![dst_ty.into(), src_ty.into(), i32_ty.into()]);
+
+    let dst = entry.deref(&ctx).get_argument(0);
+    let src = entry.deref(&ctx).get_argument(1);
+    let src_size = entry.deref(&ctx).get_argument(2);
+
+    let op = Operation::new(
+        &mut ctx,
+        nvvm::CpAsyncCaZfill16Op::get_concrete_op_info(),
+        vec![],
+        vec![dst, src, src_size],
+        vec![],
+        0,
+    );
+    op.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    assert_cp_async_zfill_inline_asm_lowering(&mut ctx, module_ptr, 16)
+}
+
+fn assert_cp_async_zfill_inline_asm_lowering(
+    ctx: &mut Context,
+    module_ptr: pliron::context::Ptr<Operation>,
+    copy_size: u32,
+) -> Result<(), anyhow::Error> {
+    use pliron::builtin::types::IntegerType;
+    use pliron::r#type::Typed;
+
+    mir_lower::lower_mir_to_llvm(ctx, module_ptr).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let expected_template = format!(
+        "{{ .reg .u64 %smem64; .reg .u32 %smem32; .reg .u64 %gmem64; \
+         cvta.to.shared.u64 %smem64, $0; cvt.u32.u64 %smem32, %smem64; \
+         cvta.to.global.u64 %gmem64, $1; \
+         cp.async.ca.shared.global [%smem32], [%gmem64], {copy_size}, $2; }}"
+    );
+    let mut matches = 0;
+    let module_region = module_ptr.deref(ctx).get_region(0);
+    let module_block = module_region.deref(ctx).iter(ctx).next().unwrap();
+
+    for op in module_block.deref(ctx).iter(ctx) {
+        let Some(func_op) = Operation::get_op::<llvm::FuncOp>(op, ctx) else {
+            continue;
+        };
+        if func_op.get_symbol_name(ctx).to_string() != "kernel_func" {
+            continue;
+        }
+
+        let func_region = func_op.get_operation().deref(ctx).get_region(0);
+        for func_block in func_region.deref(ctx).iter(ctx) {
+            for body_op in func_block.deref(ctx).iter(ctx) {
+                let Some(inline_asm) = Operation::get_op::<llvm::InlineAsmOp>(body_op, ctx) else {
+                    continue;
+                };
+                let template = inline_asm
+                    .get_attr_inline_asm_template(ctx)
+                    .map(|s| String::from((*s).clone()));
+                if template.as_deref() != Some(expected_template.as_str()) {
+                    continue;
+                }
+
+                matches += 1;
+                assert_eq!(
+                    inline_asm
+                        .get_attr_inline_asm_constraints(ctx)
+                        .map(|s| String::from((*s).clone()))
+                        .as_deref(),
+                    Some("l,l,r,~{memory}")
+                );
+                assert_eq!(llvm::asm_kind(ctx, &inline_asm), llvm::AsmKind::SideEffect);
+                assert!(
+                    inline_asm
+                        .get_attr_inline_asm_convergent(ctx)
+                        .is_some_and(|value| !bool::from((*value).clone()))
+                );
+
+                let operands: Vec<_> = inline_asm.get_operation().deref(ctx).operands().collect();
+                assert_eq!(operands.len(), 3);
+                for operand in &operands[..2] {
+                    let ty = operand.get_type(ctx);
+                    let ty = ty.deref(ctx);
+                    let ptr_ty = ty
+                        .downcast_ref::<llvm_export::types::PointerType>()
+                        .expect("cp.async pointer operands must lower to LLVM pointers");
+                    assert_eq!(ptr_ty.address_space(), 0);
+                }
+
+                let src_size_ty = operands[2].get_type(ctx);
+                let src_size_ty = src_size_ty.deref(ctx);
+                let src_size_ty = src_size_ty
+                    .downcast_ref::<IntegerType>()
+                    .expect("cp.async src_size must lower to an integer");
+                assert_eq!(src_size_ty.width(), 32);
+            }
+        }
+    }
+
+    assert_eq!(
+        matches, 1,
+        "missing exact {copy_size}-byte zero-fill cp.async asm"
+    );
+    Ok(())
+}
+
+// =============================================================================
+// Packed bf16x2 arithmetic lowering tests
+// =============================================================================
+
+#[test]
+fn test_bf16x2_arithmetic_lowers_to_exact_pure_inline_asm() -> Result<(), anyhow::Error> {
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let (module_ptr, entry) =
+        build_test_kernel(&mut ctx, vec![i32_ty.into(), i32_ty.into(), i32_ty.into()]);
+
+    type OpInfo = (
+        fn(pliron::context::Ptr<Operation>) -> pliron::op::OpObj,
+        std::any::TypeId,
+    );
+    let cases: [(OpInfo, usize, &str, &str); 9] = [
+        (
+            nvvm::FmaBf16x2Op::get_concrete_op_info(),
+            3,
+            "fma.rn.bf16x2 $0, $1, $2, $3;",
+            "=r,r,r,r",
+        ),
+        (
+            nvvm::FmaReluBf16x2Op::get_concrete_op_info(),
+            3,
+            "fma.rn.relu.bf16x2 $0, $1, $2, $3;",
+            "=r,r,r,r",
+        ),
+        (
+            nvvm::AddBf16x2Op::get_concrete_op_info(),
+            2,
+            "add.rn.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+        ),
+        (
+            nvvm::SubBf16x2Op::get_concrete_op_info(),
+            2,
+            "sub.rn.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+        ),
+        (
+            nvvm::MulBf16x2Op::get_concrete_op_info(),
+            2,
+            "mul.rn.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+        ),
+        (
+            nvvm::MinBf16x2Op::get_concrete_op_info(),
+            2,
+            "min.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+        ),
+        (
+            nvvm::MaxBf16x2Op::get_concrete_op_info(),
+            2,
+            "max.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+        ),
+        (
+            nvvm::NegBf16x2Op::get_concrete_op_info(),
+            1,
+            "neg.bf16x2 $0, $1;",
+            "=r,r",
+        ),
+        (
+            nvvm::AbsBf16x2Op::get_concrete_op_info(),
+            1,
+            "abs.bf16x2 $0, $1;",
+            "=r,r",
+        ),
+    ];
+
+    let operands = [
+        entry.deref(&ctx).get_argument(0),
+        entry.deref(&ctx).get_argument(1),
+        entry.deref(&ctx).get_argument(2),
+    ];
+    for &(op_info, operand_count, _, _) in &cases {
+        let op = Operation::new(
+            &mut ctx,
+            op_info,
+            vec![i32_ty.into()],
+            operands[..operand_count].to_vec(),
+            vec![],
+            0,
+        );
+        op.insert_at_back(entry, &ctx);
+    }
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let mut lowered = Vec::new();
+    let module_op = module_ptr.deref(&ctx);
+    let region = module_op.get_region(0);
+    let block = region.deref(&ctx).iter(&ctx).next().unwrap();
+    for op in block.deref(&ctx).iter(&ctx) {
+        let Some(func_op) = Operation::get_op::<llvm::FuncOp>(op, &ctx) else {
+            continue;
+        };
+        if func_op.get_symbol_name(&ctx).to_string() != "kernel_func" {
+            continue;
+        }
+        let func_region = func_op.get_operation().deref(&ctx).get_region(0);
+        for func_block in func_region.deref(&ctx).iter(&ctx) {
+            for body_op in func_block.deref(&ctx).iter(&ctx) {
+                let Some(inline_asm) = Operation::get_op::<llvm::InlineAsmOp>(body_op, &ctx) else {
+                    continue;
+                };
+                let inline_asm_op = inline_asm.get_operation();
+                let operand_count = inline_asm_op.deref(&ctx).operands().count();
+                let result_count = inline_asm_op.deref(&ctx).get_num_results();
+                lowered.push((
+                    inline_asm
+                        .get_attr_inline_asm_template(&ctx)
+                        .map(|s| String::from((*s).clone()))
+                        .expect("bf16x2 inline asm must have a template"),
+                    inline_asm
+                        .get_attr_inline_asm_constraints(&ctx)
+                        .map(|s| String::from((*s).clone()))
+                        .expect("bf16x2 inline asm must have constraints"),
+                    llvm::asm_kind_opt(&ctx, &inline_asm),
+                    inline_asm
+                        .get_attr_inline_asm_convergent(&ctx)
+                        .map(|b| bool::from((*b).clone())),
+                    operand_count,
+                    result_count,
+                ));
+            }
+        }
+    }
+
+    assert_eq!(
+        lowered.len(),
+        cases.len(),
+        "each bf16x2 operation must lower to exactly one inline-asm op"
+    );
+    for &(_, expected_operand_count, expected_template, expected_constraints) in &cases {
+        let matches: Vec<_> = lowered
+            .iter()
+            .filter(|(template, _, _, _, _, _)| template == expected_template)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one exact `{expected_template}` lowering"
+        );
+        let (_, constraints, kind, convergent, operand_count, result_count) = matches[0];
+        assert_eq!(constraints, expected_constraints, "{expected_template}");
+        assert_eq!(*kind, Some(llvm::AsmKind::Pure), "{expected_template}");
+        assert_eq!(*convergent, Some(false), "{expected_template}");
+        assert_eq!(
+            *operand_count, expected_operand_count,
+            "{expected_template} input arity"
+        );
+        assert_eq!(*result_count, 1, "{expected_template} result arity");
+    }
+
+    Ok(())
 }

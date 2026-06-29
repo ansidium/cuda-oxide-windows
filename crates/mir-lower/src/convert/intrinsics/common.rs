@@ -166,6 +166,32 @@ pub fn inline_asm_convergent(
     inline_asm.get_operation()
 }
 
+/// Create an inline assembly operation with the sideeffect attribute (non-convergent).
+///
+/// Use this for operations that write to memory but are NOT warp-synchronous
+/// (e.g., `cp.async` copies). Unlike `inline_asm_convergent`, the emitted asm
+/// is marked `sideeffect` only, allowing LLVM to move or duplicate it across
+/// divergent control flow when legal.
+pub fn inline_asm_sideeffect(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    result_ty: pliron::r#type::TypeHandle,
+    inputs: Vec<Value>,
+    asm_template: &str,
+    constraints: &str,
+) -> Ptr<Operation> {
+    let inline_asm = llvm::InlineAsmOp::build(
+        ctx,
+        result_ty,
+        inputs,
+        asm_template,
+        constraints,
+        AsmKind::SideEffect,
+    );
+    rewriter.insert_operation(ctx, inline_asm.get_operation());
+    inline_asm.get_operation()
+}
+
 /// Truncate an i32 result to i1 (for predicate results).
 pub fn trunc_to_i1(
     ctx: &mut Context,
@@ -180,5 +206,493 @@ pub fn trunc_to_i1(
 
 #[cfg(test)]
 mod tests {
-    // TODO: Add tests for common intrinsic helpers
+    use super::*;
+    use dialect_mir::ops as mir;
+    use llvm_export::ops as llvm;
+    use pliron::basic_block::BasicBlock;
+    use pliron::builtin::attributes::{IntegerAttr, TypeAttr};
+    use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface, SymbolOpInterface};
+    use pliron::builtin::ops::ModuleOp;
+    use pliron::builtin::types::FunctionType;
+    use pliron::irbuild::dialect_conversion::{
+        DialectConversion, OperandsInfo, apply_dialect_conversion,
+    };
+    use pliron::irbuild::rewriter::Rewriter;
+    use pliron::linked_list::ContainsLinkedList;
+    use pliron::r#type::TypeHandle;
+
+    const TEST_FUNC_NAME: &str = "helper_func";
+    const TEST_INTRINSIC_NAME: &str = "llvm_test_intrinsic";
+
+    #[derive(Clone, Copy)]
+    enum HelperAction {
+        Constants,
+        SharedCast,
+        ClusterSharedCast,
+        CallIntrinsic,
+        InlineAsmConvergent,
+        InlineAsmSideEffect,
+        TruncToI1,
+    }
+
+    struct HelperConversion {
+        action: HelperAction,
+        returned_value: Option<Value>,
+    }
+
+    impl DialectConversion for HelperConversion {
+        fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
+            Operation::get_opid(op, ctx) == mir::MirStorageLiveOp::get_opid_static()
+        }
+
+        fn can_convert_type(&self, _ctx: &Context, _ty: TypeHandle) -> bool {
+            false
+        }
+
+        fn convert_type(&mut self, _ctx: &mut Context, ty: TypeHandle) -> Result<TypeHandle> {
+            Ok(ty)
+        }
+
+        fn rewrite(
+            &mut self,
+            ctx: &mut Context,
+            rewriter: &mut DialectConversionRewriter,
+            op: Ptr<Operation>,
+            _operands_info: &OperandsInfo,
+        ) -> Result<()> {
+            let block = op
+                .deref(ctx)
+                .get_parent_block()
+                .expect("test trigger must be inside a block");
+
+            self.returned_value = match self.action {
+                HelperAction::Constants => {
+                    create_i1_const(ctx, rewriter, false);
+                    create_i1_const(ctx, rewriter, true);
+                    create_i32_const(ctx, rewriter, -7);
+                    create_i64_const(ctx, rewriter, 42);
+                    None
+                }
+                HelperAction::SharedCast => {
+                    let ptr = block.deref(ctx).get_argument(0);
+                    Some(cast_to_shared_addrspace(ctx, rewriter, ptr))
+                }
+                HelperAction::ClusterSharedCast => {
+                    let ptr = block.deref(ctx).get_argument(0);
+                    Some(cast_to_cluster_shared_addrspace(ctx, rewriter, ptr))
+                }
+                HelperAction::CallIntrinsic => {
+                    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+                    let func_ty = llvm_types::FuncType::get(ctx, i32_ty.into(), vec![], false);
+                    call_intrinsic(ctx, rewriter, op, TEST_INTRINSIC_NAME, func_ty, vec![])?;
+                    None
+                }
+                HelperAction::InlineAsmConvergent => {
+                    let void_ty = llvm_types::VoidType::get(ctx);
+                    inline_asm_convergent(
+                        ctx,
+                        rewriter,
+                        void_ty.into(),
+                        vec![],
+                        "bar.sync 0;",
+                        "~{memory}",
+                    );
+                    None
+                }
+                HelperAction::InlineAsmSideEffect => {
+                    let void_ty = llvm_types::VoidType::get(ctx);
+                    let dst = block.deref(ctx).get_argument(0);
+                    let value = block.deref(ctx).get_argument(1);
+                    inline_asm_sideeffect(
+                        ctx,
+                        rewriter,
+                        void_ty.into(),
+                        vec![dst, value],
+                        "st.global.u32 [$0], $1;",
+                        "l,r,~{memory}",
+                    );
+                    None
+                }
+                HelperAction::TruncToI1 => {
+                    let i32_val = block.deref(ctx).get_argument(0);
+                    Some(trunc_to_i1(ctx, rewriter, i32_val))
+                }
+            };
+
+            rewriter.erase_operation(ctx, op);
+            Ok(())
+        }
+    }
+
+    fn make_ctx() -> Context {
+        let mut ctx = Context::new();
+        dialect_mir::register(&mut ctx);
+        dialect_nvvm::register(&mut ctx);
+        crate::register(&mut ctx);
+        ctx
+    }
+
+    fn build_test_func(
+        ctx: &mut Context,
+        arg_tys: Vec<TypeHandle>,
+    ) -> (Ptr<Operation>, Ptr<BasicBlock>) {
+        let module = ModuleOp::new(ctx, "test_module".try_into().unwrap());
+        let module_ptr = module.get_operation();
+
+        let func_ty = FunctionType::get(ctx, arg_tys.clone(), vec![]);
+        let func_op_ptr = Operation::new(
+            ctx,
+            mir::MirFuncOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            1,
+        );
+        let func = mir::MirFuncOp::new(ctx, func_op_ptr, TypeAttr::new(func_ty.into()));
+        func.set_symbol_name(ctx, TEST_FUNC_NAME.try_into().unwrap());
+
+        let region = func.get_operation().deref(ctx).get_region(0);
+        let entry = BasicBlock::new(ctx, None, arg_tys);
+        entry.insert_at_back(region, ctx);
+
+        let module_region = module_ptr.deref(ctx).get_region(0);
+        let module_block = module_region.deref(ctx).iter(ctx).next().unwrap();
+        func.get_operation().insert_at_back(module_block, ctx);
+
+        (module_ptr, entry)
+    }
+
+    fn append_trigger(ctx: &mut Context, block: Ptr<BasicBlock>) {
+        let trigger = Operation::new(
+            ctx,
+            mir::MirStorageLiveOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            0,
+        );
+        trigger.insert_at_back(block, ctx);
+    }
+
+    fn run_helper_action(
+        ctx: &mut Context,
+        module_ptr: Ptr<Operation>,
+        action: HelperAction,
+    ) -> Option<Value> {
+        let mut conversion = HelperConversion {
+            action,
+            returned_value: None,
+        };
+        apply_dialect_conversion(ctx, &mut conversion, module_ptr)
+            .expect("helper conversion failed");
+        conversion.returned_value
+    }
+
+    fn module_ops(ctx: &Context, module_ptr: Ptr<Operation>) -> Vec<Ptr<Operation>> {
+        let region = module_ptr.deref(ctx).get_region(0);
+        let block = region.deref(ctx).iter(ctx).next().unwrap();
+        block.deref(ctx).iter(ctx).collect()
+    }
+
+    fn body_ops(ctx: &Context, module_ptr: Ptr<Operation>) -> Vec<Ptr<Operation>> {
+        for op in module_ops(ctx, module_ptr) {
+            let Some(func) = Operation::get_op::<mir::MirFuncOp>(op, ctx) else {
+                continue;
+            };
+
+            if func.get_symbol_name(ctx).to_string() != TEST_FUNC_NAME {
+                continue;
+            }
+
+            let func_region = func.get_operation().deref(ctx).get_region(0);
+            return func_region
+                .deref(ctx)
+                .iter(ctx)
+                .flat_map(|block| block.deref(ctx).iter(ctx))
+                .collect();
+        }
+
+        panic!("{TEST_FUNC_NAME} not found");
+    }
+
+    fn find_body_ops<T: Op>(ctx: &Context, module_ptr: Ptr<Operation>) -> Vec<T> {
+        body_ops(ctx, module_ptr)
+            .into_iter()
+            .filter_map(|op| Operation::get_op::<T>(op, ctx))
+            .collect()
+    }
+
+    fn integer_constant_signature(
+        ctx: &Context,
+        constant: &llvm::ConstantOp,
+    ) -> (Signedness, u32, u64) {
+        let result_ty = constant
+            .get_operation()
+            .deref(ctx)
+            .get_result(0)
+            .get_type(ctx);
+        let result_ty_ref = result_ty.deref(ctx);
+        let result_integer_ty = result_ty_ref
+            .downcast_ref::<IntegerType>()
+            .expect("constant result must have an integer type");
+        let value_attr = constant.get_value(ctx);
+        let integer_attr = value_attr
+            .downcast_ref::<IntegerAttr>()
+            .expect("constant value must be an integer attribute");
+        let attr_ty: TypeHandle = integer_attr.get_type().into();
+        let value = integer_attr.value();
+
+        assert_eq!(result_ty, attr_ty, "result and attribute types must match");
+        assert_eq!(value.bw(), result_integer_ty.width() as usize);
+
+        (
+            result_integer_ty.signedness(),
+            result_integer_ty.width(),
+            value.to_u64(),
+        )
+    }
+
+    fn integer_width(ctx: &Context, ty: TypeHandle) -> u32 {
+        ty.deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .expect("expected integer type")
+            .width()
+    }
+
+    fn pointer_addr_space(ctx: &Context, ty: TypeHandle) -> u32 {
+        ty.deref(ctx)
+            .downcast_ref::<llvm_types::PointerType>()
+            .expect("expected LLVM pointer type")
+            .address_space()
+    }
+
+    #[test]
+    fn create_integer_constants_emit_expected_types_and_bit_patterns() {
+        let mut ctx = make_ctx();
+        let (module_ptr, entry) = build_test_func(&mut ctx, vec![]);
+        append_trigger(&mut ctx, entry);
+
+        assert!(run_helper_action(&mut ctx, module_ptr, HelperAction::Constants).is_none());
+
+        let constants: Vec<(Signedness, u32, u64)> =
+            find_body_ops::<llvm::ConstantOp>(&ctx, module_ptr)
+                .into_iter()
+                .map(|op| integer_constant_signature(&ctx, &op))
+                .collect();
+
+        assert_eq!(
+            constants,
+            vec![
+                (Signedness::Signless, 1, 0),
+                (Signedness::Signless, 1, 1),
+                (Signedness::Signless, 32, (-7_i32) as u32 as u64),
+                (Signedness::Signless, 64, 42),
+            ]
+        );
+    }
+
+    #[test]
+    fn cast_to_shared_addr_space_inserts_cast_to_addr_space_3() {
+        let mut ctx = make_ctx();
+        let generic_ptr_ty: TypeHandle = llvm_types::PointerType::get(&ctx, 0).into();
+        let (module_ptr, entry) = build_test_func(&mut ctx, vec![generic_ptr_ty]);
+        append_trigger(&mut ctx, entry);
+
+        let returned = run_helper_action(&mut ctx, module_ptr, HelperAction::SharedCast)
+            .expect("shared cast helper must return a value");
+
+        let casts = find_body_ops::<llvm::AddrSpaceCastOp>(&ctx, module_ptr);
+        assert_eq!(casts.len(), 1);
+
+        let result_ty = casts[0]
+            .get_operation()
+            .deref(&ctx)
+            .get_result(0)
+            .get_type(&ctx);
+        assert_eq!(returned, casts[0].get_operation().deref(&ctx).get_result(0));
+        assert_eq!(pointer_addr_space(&ctx, result_ty), 3);
+    }
+
+    #[test]
+    fn cast_to_shared_addr_space_skips_cast_when_already_shared() {
+        let mut ctx = make_ctx();
+        let shared_ptr_ty: TypeHandle = llvm_types::PointerType::get(&ctx, 3).into();
+        let (module_ptr, entry) = build_test_func(&mut ctx, vec![shared_ptr_ty]);
+        let input = entry.deref(&ctx).get_argument(0);
+        append_trigger(&mut ctx, entry);
+
+        let returned = run_helper_action(&mut ctx, module_ptr, HelperAction::SharedCast)
+            .expect("shared cast helper must return a value");
+
+        let casts = find_body_ops::<llvm::AddrSpaceCastOp>(&ctx, module_ptr);
+        assert!(casts.is_empty());
+        assert_eq!(returned, input);
+    }
+
+    #[test]
+    fn cast_to_cluster_shared_addr_space_inserts_cast_to_addr_space_7() {
+        let mut ctx = make_ctx();
+        let generic_ptr_ty: TypeHandle = llvm_types::PointerType::get(&ctx, 0).into();
+        let (module_ptr, entry) = build_test_func(&mut ctx, vec![generic_ptr_ty]);
+        append_trigger(&mut ctx, entry);
+
+        let returned = run_helper_action(&mut ctx, module_ptr, HelperAction::ClusterSharedCast)
+            .expect("cluster-shared cast helper must return a value");
+
+        let casts = find_body_ops::<llvm::AddrSpaceCastOp>(&ctx, module_ptr);
+        assert_eq!(casts.len(), 1);
+
+        let result_ty = casts[0]
+            .get_operation()
+            .deref(&ctx)
+            .get_result(0)
+            .get_type(&ctx);
+        assert_eq!(returned, casts[0].get_operation().deref(&ctx).get_result(0));
+        assert_eq!(pointer_addr_space(&ctx, result_ty), 7);
+    }
+
+    #[test]
+    fn cast_to_cluster_shared_addr_space_skips_cast_when_already_cluster_shared() {
+        let mut ctx = make_ctx();
+        let cluster_ptr_ty: TypeHandle = llvm_types::PointerType::get(&ctx, 7).into();
+        let (module_ptr, entry) = build_test_func(&mut ctx, vec![cluster_ptr_ty]);
+        let input = entry.deref(&ctx).get_argument(0);
+        append_trigger(&mut ctx, entry);
+
+        let returned = run_helper_action(&mut ctx, module_ptr, HelperAction::ClusterSharedCast)
+            .expect("cluster-shared cast helper must return a value");
+
+        let casts = find_body_ops::<llvm::AddrSpaceCastOp>(&ctx, module_ptr);
+        assert!(casts.is_empty());
+        assert_eq!(returned, input);
+    }
+
+    #[test]
+    fn call_intrinsic_declares_and_calls_direct_intrinsic() {
+        let mut ctx = make_ctx();
+        let (module_ptr, entry) = build_test_func(&mut ctx, vec![]);
+        append_trigger(&mut ctx, entry);
+
+        assert!(run_helper_action(&mut ctx, module_ptr, HelperAction::CallIntrinsic).is_none());
+
+        let found_decl = module_ops(&ctx, module_ptr)
+            .into_iter()
+            .filter_map(|op| Operation::get_op::<llvm::FuncOp>(op, &ctx))
+            .any(|func| func.get_symbol_name(&ctx).to_string() == TEST_INTRINSIC_NAME);
+
+        let found_call = find_body_ops::<llvm::CallOp>(&ctx, module_ptr)
+            .into_iter()
+            .any(|call| {
+                if let CallOpCallable::Direct(sym) = call.callee(&ctx) {
+                    sym.to_string() == TEST_INTRINSIC_NAME
+                } else {
+                    false
+                }
+            });
+
+        assert!(found_decl, "expected intrinsic declaration");
+        assert!(found_call, "expected direct intrinsic call");
+    }
+
+    #[test]
+    fn inline_asm_convergent_sets_template_constraints_and_convergent_attr() {
+        let mut ctx = make_ctx();
+        let (module_ptr, entry) = build_test_func(&mut ctx, vec![]);
+        append_trigger(&mut ctx, entry);
+
+        assert!(
+            run_helper_action(&mut ctx, module_ptr, HelperAction::InlineAsmConvergent).is_none()
+        );
+
+        let asms = find_body_ops::<llvm::InlineAsmOp>(&ctx, module_ptr);
+        assert_eq!(asms.len(), 1);
+
+        let asm = &asms[0];
+        assert_eq!(
+            asm.get_attr_inline_asm_template(&ctx)
+                .map(|s| String::from((*s).clone()))
+                .as_deref(),
+            Some("bar.sync 0;")
+        );
+        assert_eq!(
+            asm.get_attr_inline_asm_constraints(&ctx)
+                .map(|s| String::from((*s).clone()))
+                .as_deref(),
+            Some("~{memory}")
+        );
+        assert_eq!(llvm::asm_kind_opt(&ctx, asm), Some(AsmKind::Convergent));
+        assert!(
+            asm.get_attr_inline_asm_convergent(&ctx)
+                .is_some_and(|b| bool::from((*b).clone()))
+        );
+    }
+
+    #[test]
+    fn inline_asm_sideeffect_sets_template_constraints_and_sideeffect_kind() {
+        let mut ctx = make_ctx();
+        let global_ptr_ty: TypeHandle = llvm_types::PointerType::get(&ctx, 1).into();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let (module_ptr, entry) = build_test_func(&mut ctx, vec![global_ptr_ty, i32_ty]);
+        let dst = entry.deref(&ctx).get_argument(0);
+        let value = entry.deref(&ctx).get_argument(1);
+        append_trigger(&mut ctx, entry);
+
+        assert!(
+            run_helper_action(&mut ctx, module_ptr, HelperAction::InlineAsmSideEffect).is_none()
+        );
+
+        let asms = find_body_ops::<llvm::InlineAsmOp>(&ctx, module_ptr);
+        assert_eq!(asms.len(), 1);
+
+        let asm = &asms[0];
+        assert_eq!(
+            asm.get_attr_inline_asm_template(&ctx)
+                .map(|s| String::from((*s).clone()))
+                .as_deref(),
+            Some("st.global.u32 [$0], $1;")
+        );
+        assert_eq!(
+            asm.get_attr_inline_asm_constraints(&ctx)
+                .map(|s| String::from((*s).clone()))
+                .as_deref(),
+            Some("l,r,~{memory}")
+        );
+        assert_eq!(
+            asm.get_operation()
+                .deref(&ctx)
+                .operands()
+                .collect::<Vec<_>>(),
+            vec![dst, value]
+        );
+        assert_eq!(llvm::asm_kind_opt(&ctx, asm), Some(AsmKind::SideEffect));
+        assert!(
+            asm.get_attr_inline_asm_convergent(&ctx)
+                .is_some_and(|b| !bool::from((*b).clone()))
+        );
+    }
+
+    #[test]
+    fn trunc_to_i1_emits_i1_trunc_result() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let (module_ptr, entry) = build_test_func(&mut ctx, vec![i32_ty]);
+        append_trigger(&mut ctx, entry);
+
+        let returned = run_helper_action(&mut ctx, module_ptr, HelperAction::TruncToI1)
+            .expect("truncation helper must return a value");
+
+        let trunks = find_body_ops::<llvm::TruncOp>(&ctx, module_ptr);
+        assert_eq!(trunks.len(), 1);
+
+        let result_ty = trunks[0]
+            .get_operation()
+            .deref(&ctx)
+            .get_result(0)
+            .get_type(&ctx);
+        assert_eq!(
+            returned,
+            trunks[0].get_operation().deref(&ctx).get_result(0)
+        );
+        assert_eq!(integer_width(&ctx, result_ty), 1);
+    }
 }

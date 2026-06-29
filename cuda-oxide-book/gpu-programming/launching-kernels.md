@@ -155,9 +155,19 @@ packaging live in the compiler and artifact/runtime loader layers. Keeping that
 policy separate lets the generated Rust launch methods stay stable as payload
 formats evolve.
 
-PTX and cubin embedded payloads are loaded directly. Embedded NVVM IR/LTOIR is
-compiled or linked to a cubin through the same libNVVM/nvJitLink path used by
-the lower-level sidecar loader.
+PTX and cubin payloads load directly. NVVM IR records its target because
+pre-Blackwell GPUs use LLVM 7 typed pointers, while Blackwell and newer GPUs use
+opaque pointers. The loader uses that recorded target when invoking libNVVM.
+
+NVVM IR and LTOIR normally compile for their original target. For a standard
+pre-Blackwell target such as `sm_86`, the loader can instead produce PTX and let
+the CUDA driver JIT it on Blackwell. This is not supported for suffixed targets
+such as `sm_90a`, or for running newer-GPU artifacts on older GPUs.
+The driver must also support the PTX version produced by the selected toolkit.
+CUDA error 222 means the toolkit is too new for the driver's PTX JIT; select a
+compatible toolkit or upgrade the driver. The
+[installation guide](../getting-started/installation.md#installation-toolkit-driver-compatibility)
+explains why this can differ from the normal LLVM-to-PTX path.
 
 ## `LaunchConfig`
 
@@ -412,6 +422,7 @@ in doubt.
 | `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`   | Too much shared memory or too many registers per block | Reduce `shared_mem_bytes` or block size; use `#[launch_bounds]`      |
 | `CUDA_ERROR_ILLEGAL_INSTRUCTION`       | Kernel hit a trap (panic, assert failure, OOB)         | Debug with `cargo oxide debug` or `gpu_printf!`                      |
 | `CUDA_ERROR_NO_BINARY_FOR_GPU`         | PTX compiled for wrong architecture                    | Rebuild with `--arch` matching your GPU                              |
+| `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` (222) | Driver cannot compile the PTX version in the module | Select a compatible `CUDA_TOOLKIT_PATH` or upgrade the driver        |
 
 :::{seealso}
 The [Error Handling and Debugging](error-handling-and-debugging.md) chapter

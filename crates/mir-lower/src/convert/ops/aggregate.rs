@@ -36,14 +36,14 @@
 
 use crate::convert::types::{
     EnumSlotMap, StructLayoutInfo, StructSlotMap, build_enum_slot_map, build_struct_slot_map,
-    convert_type, is_zero_sized_type, make_slice_struct,
+    build_union_storage_type, convert_type, is_zero_sized_type, make_slice_struct,
 };
 use dialect_mir::ops::{
     MirConstructEnumOp, MirEnumPayloadOp, MirExtractFieldOp, MirFieldAddrOp, MirInsertFieldOp,
 };
 use dialect_mir::types::{
     MirArrayType, MirDisjointSliceType, MirEnumType, MirPtrType, MirSliceType, MirStructType,
-    MirTupleType,
+    MirTupleType, MirUnionType,
 };
 use llvm_export::ops as llvm;
 use pliron::builtin::types::{IntegerType, Signedness};
@@ -158,6 +158,26 @@ pub(crate) fn convert_extract_field(
 ) -> Result<()> {
     let aggregate = op.deref(ctx).get_operand(0);
 
+    let extract_op = MirExtractFieldOp::new(op);
+    let decl_index = match extract_op.get_attr_index(ctx) {
+        Some(attr) => attr.0 as usize,
+        None => return pliron::input_err_noloc!("Missing index attribute on extract_field"),
+    };
+
+    if operands_info
+        .lookup_most_recent_of_type::<MirUnionType>(ctx, aggregate)
+        .is_some()
+    {
+        return convert_extract_union_field(
+            ctx,
+            rewriter,
+            op,
+            aggregate,
+            decl_index,
+            operands_info,
+        );
+    }
+
     let is_scalar = aggregate
         .get_type(ctx)
         .deref(ctx)
@@ -168,12 +188,6 @@ pub(crate) fn convert_extract_field(
         rewriter.replace_operation_with_values(ctx, op, vec![aggregate]);
         return Ok(());
     }
-
-    let extract_op = MirExtractFieldOp::new(op);
-    let decl_index = match extract_op.get_attr_index(ctx) {
-        Some(attr) => attr.0 as usize,
-        None => return pliron::input_err_noloc!("Missing index attribute on extract_field"),
-    };
 
     let llvm_index = match resolve_aggregate_slots(ctx, operands_info, aggregate)? {
         AggregateSlots::Mapped(map) => match map.decl_to_llvm.get(decl_index) {
@@ -228,6 +242,21 @@ pub(crate) fn convert_insert_field(
         None => return pliron::input_err_noloc!("Missing insert_index attribute on insert_field"),
     };
 
+    if operands_info
+        .lookup_most_recent_of_type::<MirUnionType>(ctx, aggregate)
+        .is_some()
+    {
+        return convert_insert_union_field(
+            ctx,
+            rewriter,
+            op,
+            aggregate,
+            new_value,
+            decl_index,
+            operands_info,
+        );
+    }
+
     let llvm_index = match resolve_aggregate_slots(ctx, operands_info, aggregate)? {
         AggregateSlots::Mapped(map) => match map.decl_to_llvm.get(decl_index) {
             Some(Some(slot)) => *slot,
@@ -252,6 +281,96 @@ pub(crate) fn convert_insert_field(
     rewriter.insert_operation(ctx, llvm_insert.get_operation());
     rewriter.replace_operation(ctx, op, llvm_insert.get_operation());
 
+    Ok(())
+}
+
+fn union_type_of_operand(
+    ctx: &Context,
+    operands_info: &OperandsInfo,
+    value: Value,
+) -> Result<MirUnionType> {
+    operands_info
+        .lookup_most_recent_of_type::<MirUnionType>(ctx, value)
+        .map(|union_ty| union_ty.clone())
+        .ok_or_else(|| {
+            pliron::create_error!(
+                pliron::location::Location::Unknown,
+                pliron::result::ErrorKind::VerificationFailed,
+                pliron::result::StringError(
+                    "Expected MirUnionType conversion history for union value".to_string()
+                )
+            )
+        })
+}
+
+/// Read one typed view of a union's shared bytes.
+fn convert_extract_union_field(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    union_value: Value,
+    field_index: usize,
+    operands_info: &OperandsInfo,
+) -> Result<()> {
+    let union_ty = union_type_of_operand(ctx, operands_info, union_value)?;
+    let Some(field_mir_ty) = union_ty.get_field_type(field_index) else {
+        return pliron::input_err_noloc!(
+            "union field index {} is out of bounds for `{}`",
+            field_index,
+            union_ty.name()
+        );
+    };
+    let field_llvm_ty = convert_type(ctx, field_mir_ty).map_err(anyhow_to_pliron)?;
+    if is_zero_sized_type(ctx, field_llvm_ty) {
+        let undef = llvm::UndefOp::new(ctx, field_llvm_ty);
+        rewriter.insert_operation(ctx, undef.get_operation());
+        rewriter.replace_operation(ctx, op, undef.get_operation());
+        return Ok(());
+    }
+
+    let storage_ty = build_union_storage_type(ctx, &union_ty).map_err(anyhow_to_pliron)?;
+    let ptr = spill_enum_value(ctx, rewriter, union_value, storage_ty, union_ty.abi_align());
+    let load = llvm::LoadOp::new(ctx, ptr, field_llvm_ty);
+    llvm_export::ops::set_op_alignment(ctx, load.get_operation(), union_ty.abi_align() as u32);
+    rewriter.insert_operation(ctx, load.get_operation());
+    rewriter.replace_operation(ctx, op, load.get_operation());
+    Ok(())
+}
+
+/// Write one typed view at byte zero while preserving the rest of the union.
+fn convert_insert_union_field(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    union_value: Value,
+    new_value: Value,
+    field_index: usize,
+    operands_info: &OperandsInfo,
+) -> Result<()> {
+    let union_ty = union_type_of_operand(ctx, operands_info, union_value)?;
+    let Some(field_mir_ty) = union_ty.get_field_type(field_index) else {
+        return pliron::input_err_noloc!(
+            "union field index {} is out of bounds for `{}`",
+            field_index,
+            union_ty.name()
+        );
+    };
+    let field_llvm_ty = convert_type(ctx, field_mir_ty).map_err(anyhow_to_pliron)?;
+    if is_zero_sized_type(ctx, field_llvm_ty) {
+        rewriter.replace_operation_with_values(ctx, op, vec![union_value]);
+        return Ok(());
+    }
+
+    let storage_ty = build_union_storage_type(ctx, &union_ty).map_err(anyhow_to_pliron)?;
+    let ptr = spill_enum_value(ctx, rewriter, union_value, storage_ty, union_ty.abi_align());
+    let store = llvm::StoreOp::new(ctx, new_value, ptr);
+    llvm_export::ops::set_op_alignment(ctx, store.get_operation(), union_ty.abi_align() as u32);
+    rewriter.insert_operation(ctx, store.get_operation());
+
+    let load = llvm::LoadOp::new(ctx, ptr, storage_ty);
+    llvm_export::ops::set_op_alignment(ctx, load.get_operation(), union_ty.abi_align() as u32);
+    rewriter.insert_operation(ctx, load.get_operation());
+    rewriter.replace_operation(ctx, op, load.get_operation());
     Ok(())
 }
 
@@ -557,7 +676,7 @@ pub(crate) fn convert_extract_array_element(
 /// The alloca lands at the use site, same as
 /// [`convert_extract_array_element`]; the standard `opt -O2` run (SROA)
 /// removes it again. Hoisting these into the function's entry block is a
-/// known follow-up for the unoptimised (`CUDA_OXIDE_NO_OPT=1`) path.
+/// known follow-up for the unoptimized (`CUDA_OXIDE_NO_OPT=1`) path.
 fn spill_enum_value(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -942,21 +1061,46 @@ pub(crate) fn convert_field_addr(
         None => return pliron::input_err_noloc!("MirFieldAddrOp missing field_index attribute"),
     };
 
-    let layout = {
-        let mir_ptr_pointee =
-            match operands_info.lookup_most_recent_of_type::<MirPtrType>(ctx, ptr_operand) {
-                Some(r) => r.pointee,
-                None => {
-                    return pliron::input_err_noloc!("MirFieldAddrOp operand must be pointer type");
-                }
-            };
+    let mir_ptr_pointee =
+        match operands_info.lookup_most_recent_of_type::<MirPtrType>(ctx, ptr_operand) {
+            Some(r) => r.pointee,
+            None => {
+                return pliron::input_err_noloc!("MirFieldAddrOp operand must be pointer type");
+            }
+        };
 
+    let union_field_count = mir_ptr_pointee
+        .deref(ctx)
+        .downcast_ref::<MirUnionType>()
+        .map(MirUnionType::field_count);
+    if let Some(field_count) = union_field_count {
+        if field_index >= field_count {
+            return pliron::input_err_noloc!(
+                "field_addr index {} out of bounds for union with {} fields",
+                field_index,
+                field_count
+            );
+        }
+        // Every union field begins at byte zero. Emit an explicit zero-offset
+        // GEP instead of forwarding the base SSA value directly: the distinct
+        // result keeps dialect conversion's pointer-type history unambiguous
+        // for repeated field accesses and for `union.struct_field.inner`.
+        use llvm_export::ops::GepIndex;
+        let i8_ty: TypeHandle = IntegerType::get(ctx, 8, Signedness::Signless).into();
+        let gep = llvm::GetElementPtrOp::new(ctx, ptr_operand, vec![GepIndex::Constant(0)], i8_ty);
+        rewriter.insert_operation(ctx, gep.get_operation());
+        rewriter.replace_operation(ctx, op, gep.get_operation());
+        return Ok(());
+    }
+
+    let layout = {
         let pointee_ref = mir_ptr_pointee.deref(ctx);
         match pointee_ref.downcast_ref::<MirStructType>() {
             Some(struct_ty) => StructLayoutInfo::of_struct(struct_ty),
             None => {
                 return pliron::input_err_noloc!(
-                    "MirFieldAddrOp pointer must point to struct type"
+                    "MirFieldAddrOp pointer must point to struct or union type, got {}",
+                    mir_ptr_pointee.deref(ctx).disp(ctx)
                 );
             }
         }
@@ -1042,5 +1186,311 @@ pub(crate) fn convert_array_element_addr(
 
 #[cfg(test)]
 mod tests {
-    // TODO: Add unit tests for aggregate conversion
+    use super::*;
+    use crate::convert::ops::test_util::*;
+    use dialect_mir::attributes::{FieldIndexAttr, VariantIndexAttr};
+    use dialect_mir::ops as mir;
+    use dialect_mir::types::{EnumVariant, MirPtrType, MirSliceType, MirStructType};
+    use pliron::builtin::attributes::IntegerAttr;
+    use pliron::common_traits::Verify;
+
+    fn insert_indices(ctx: &Context, inserts: &[llvm::InsertValueOp]) -> Vec<Vec<u32>> {
+        inserts.iter().map(|op| op.indices(ctx)).collect()
+    }
+
+    fn empty_struct_ty(ctx: &mut Context, name: &str) -> TypeHandle {
+        MirStructType::get(ctx, name.to_string(), vec![], vec![]).into()
+    }
+
+    fn padded_struct_with_zst_ty(ctx: &mut Context) -> (TypeHandle, TypeHandle) {
+        let i8_ty: TypeHandle = IntegerType::get(ctx, 8, Signedness::Signless).into();
+        let i64_ty: TypeHandle = IntegerType::get(ctx, 64, Signedness::Signless).into();
+        let zst_ty = empty_struct_ty(ctx, "Marker");
+
+        let struct_ty = MirStructType::get_with_full_layout(
+            ctx,
+            "Padded".to_string(),
+            vec!["a".to_string(), "marker".to_string(), "b".to_string()],
+            vec![i8_ty, zst_ty, i64_ty],
+            vec![0, 1, 2],
+            vec![0, 1, 8],
+            16,
+            8,
+        );
+
+        (struct_ty.into(), zst_ty)
+    }
+
+    fn append_empty_struct_value(
+        ctx: &mut Context,
+        block: Ptr<pliron::basic_block::BasicBlock>,
+        zst_ty: TypeHandle,
+    ) -> Value {
+        let op = Operation::new(
+            ctx,
+            mir::MirConstructStructOp::get_concrete_op_info(),
+            vec![zst_ty],
+            vec![],
+            vec![],
+            0,
+        );
+        op.insert_at_back(block, ctx);
+        op.deref(ctx).get_result(0)
+    }
+
+    /// `mir.construct_slice` lowers to the canonical fat-pointer value:
+    /// `undef { ptr, i64 }`, then insert data pointer at slot 0 and length at slot 1.
+    #[test]
+    fn construct_slice_lowers_to_ptr_len_insert_values() {
+        let mut ctx = make_ctx();
+
+        let i8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let usize_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, i8_ty, false).into();
+        let slice_ty: TypeHandle = MirSliceType::get(&mut ctx, i8_ty).into();
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![ptr_ty, usize_ty], vec![]);
+        let data_ptr = block.deref(&ctx).get_argument(0);
+        let len = block.deref(&ctx).get_argument(1);
+
+        let op = Operation::new(
+            &mut ctx,
+            mir::MirConstructSliceOp::get_concrete_op_info(),
+            vec![slice_ty],
+            vec![data_ptr, len],
+            vec![],
+            0,
+        );
+        op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let inserts = find_all::<llvm::InsertValueOp>(&ctx, &body);
+
+        assert_eq!(
+            insert_indices(&ctx, &inserts),
+            vec![vec![0], vec![1]],
+            "slice construction must insert data pointer at slot 0 and length at slot 1"
+        );
+        let first_insert = inserts[0].get_operation();
+        let second_insert = inserts[1].get_operation();
+        assert_eq!(
+            first_insert.deref(&ctx).get_operand(1),
+            data_ptr,
+            "slice slot 0 must receive the original data pointer"
+        );
+        assert_eq!(
+            second_insert.deref(&ctx).get_operand(0),
+            first_insert.deref(&ctx).get_result(0),
+            "the length insertion must consume the aggregate produced by the pointer insertion"
+        );
+        assert_eq!(
+            second_insert.deref(&ctx).get_operand(1),
+            len,
+            "slice slot 1 must receive the original length"
+        );
+        assert!(
+            inserts.iter().all(|insert| insert.verify(&ctx).is_ok()),
+            "both slice insertions must satisfy LLVM dialect verification"
+        );
+        assert_eq!(
+            count_ops::<llvm::UndefOp>(&ctx, &body),
+            1,
+            "slice construction should start from one undef aggregate"
+        );
+    }
+
+    /// Explicit rustc layout must be respected: field `b` is at byte offset 8,
+    /// so the lowered LLVM struct has a padding slot between `a` and `b`.
+    /// The ZST marker field is stripped and receives no insert_value.
+    #[test]
+    fn construct_struct_uses_layout_slots_and_skips_zst() {
+        let mut ctx = make_ctx();
+
+        let i8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Signless).into();
+        let i64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Signless).into();
+        let (struct_ty, zst_ty) = padded_struct_with_zst_ty(&mut ctx);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![i8_ty, i64_ty], vec![]);
+        let a = block.deref(&ctx).get_argument(0);
+        let b = block.deref(&ctx).get_argument(1);
+        let marker = append_empty_struct_value(&mut ctx, block, zst_ty);
+
+        let op = Operation::new(
+            &mut ctx,
+            mir::MirConstructStructOp::get_concrete_op_info(),
+            vec![struct_ty],
+            vec![a, marker, b],
+            vec![],
+            0,
+        );
+        op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let inserts = find_all::<llvm::InsertValueOp>(&ctx, &body);
+
+        assert_eq!(
+            insert_indices(&ctx, &inserts),
+            vec![vec![0], vec![2]],
+            "non-ZST fields must be inserted at their layout slots, skipping padding and ZSTs"
+        );
+        let first_insert = inserts[0].get_operation();
+        let second_insert = inserts[1].get_operation();
+        assert_eq!(
+            first_insert.deref(&ctx).get_operand(1),
+            a,
+            "struct slot 0 must receive field `a`"
+        );
+        assert_eq!(
+            second_insert.deref(&ctx).get_operand(0),
+            first_insert.deref(&ctx).get_result(0),
+            "field `b` must be inserted into the aggregate containing field `a`"
+        );
+        assert_eq!(
+            second_insert.deref(&ctx).get_operand(1),
+            b,
+            "struct slot 2 must receive field `b`"
+        );
+        assert!(
+            inserts.iter().all(|insert| insert.verify(&ctx).is_ok()),
+            "both struct insertions must satisfy LLVM dialect verification"
+        );
+    }
+
+    /// Extracting a ZST field must not emit `extract_value`: the field has no
+    /// storage in the lowered LLVM struct, so lowering materializes an undef
+    /// zero-sized value instead.
+    #[test]
+    fn extract_zst_field_lowers_to_undef_without_extract_value() {
+        let mut ctx = make_ctx();
+
+        let i8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Signless).into();
+        let i64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Signless).into();
+        let (struct_ty, zst_ty) = padded_struct_with_zst_ty(&mut ctx);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![i8_ty, i64_ty], vec![]);
+        let a = block.deref(&ctx).get_argument(0);
+        let b = block.deref(&ctx).get_argument(1);
+        let marker = append_empty_struct_value(&mut ctx, block, zst_ty);
+
+        let construct = Operation::new(
+            &mut ctx,
+            mir::MirConstructStructOp::get_concrete_op_info(),
+            vec![struct_ty],
+            vec![a, marker, b],
+            vec![],
+            0,
+        );
+        construct.insert_at_back(block, &ctx);
+        let aggregate = construct.deref(&ctx).get_result(0);
+
+        let extract = Operation::new(
+            &mut ctx,
+            MirExtractFieldOp::get_concrete_op_info(),
+            vec![zst_ty],
+            vec![aggregate],
+            vec![],
+            0,
+        );
+        MirExtractFieldOp::new(extract).set_attr_index(&ctx, FieldIndexAttr(1));
+        extract.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+
+        assert_eq!(
+            count_ops::<llvm::ExtractValueOp>(&ctx, &body),
+            0,
+            "extracting a stripped ZST field must not emit llvm.extractvalue"
+        );
+
+        let zst_un_defs = find_all::<llvm::UndefOp>(&ctx, &body)
+            .into_iter()
+            .filter(|op| {
+                let result_ty = op.get_operation().deref(&ctx).get_result(0).get_type(&ctx);
+                is_zero_sized_type(&ctx, result_ty)
+            })
+            .count();
+
+        assert_eq!(
+            zst_un_defs, 2,
+            "one undef should build the ZST value and one should materialize the extracted ZST"
+        );
+    }
+
+    /// Enum construction must store the declared discriminant value, not the
+    /// variant index. This locks the `Ordering::Less = -1` style case as the
+    /// i8 bit-pattern `255`.
+    #[test]
+    fn construct_enum_uses_declared_discriminant_not_variant_index() {
+        let mut ctx = make_ctx();
+
+        let discr_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Signed).into();
+        let enum_ty: TypeHandle = MirEnumType::get(
+            &mut ctx,
+            "OrderingLike".to_string(),
+            discr_ty,
+            vec![255, 0, 1],
+            vec![
+                EnumVariant::unit("Less".to_string()),
+                EnumVariant::unit("Equal".to_string()),
+                EnumVariant::unit("Greater".to_string()),
+            ],
+        )
+        .into();
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+
+        let op = Operation::new(
+            &mut ctx,
+            MirConstructEnumOp::get_concrete_op_info(),
+            vec![enum_ty],
+            vec![],
+            vec![],
+            0,
+        );
+        MirConstructEnumOp::new(op)
+            .set_attr_construct_enum_variant_index(&ctx, VariantIndexAttr(0));
+        op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let inserts = find_all::<llvm::InsertValueOp>(&ctx, &body);
+
+        assert_eq!(
+            insert_indices(&ctx, &inserts),
+            vec![vec![0]],
+            "unit enum construction should insert only the discriminant tag"
+        );
+        let tag_insert = &inserts[0];
+        assert!(
+            tag_insert.verify(&ctx).is_ok(),
+            "the enum tag insertion must satisfy LLVM dialect verification"
+        );
+        let tag = tag_insert.get_operation().deref(&ctx).get_operand(1);
+        let tag_def = tag
+            .defining_op()
+            .expect("the inserted enum tag must have a defining operation");
+        let tag_constant = Operation::get_op::<llvm::ConstantOp>(tag_def, &ctx)
+            .expect("the inserted enum tag must be defined by llvm.constant");
+        let tag_attr = tag_constant.get_value(&ctx);
+        let tag_integer = tag_attr
+            .downcast_ref::<IntegerAttr>()
+            .expect("the inserted enum tag must be an integer constant");
+        assert_eq!(tag_integer.value().bw(), 8, "the enum tag must be 8-bit");
+        assert_eq!(
+            tag_integer.value().to_u64(),
+            255,
+            "Less must lower to its declared i8 bit-pattern 255, not variant index 0"
+        );
+    }
 }

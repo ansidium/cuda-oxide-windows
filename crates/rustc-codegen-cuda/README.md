@@ -34,7 +34,7 @@ fn main() {
       ▼
   rustc_codegen_cuda
       ├── collect #[kernel] functions + transitive callees
-      ├── device MIR  → dialect-mir → mem2reg → LLVM dialect → LLVM IR → PTX
+      ├── device MIR  → dialect-mir → mem2reg → unroll → LLVM dialect → LLVM IR → PTX
       └── host   MIR  → rustc_codegen_llvm (standard path)
       │
       ▼
@@ -44,7 +44,9 @@ fn main() {
 The backend implements rustc's `CodegenBackend` trait. When rustc calls `codegen_crate()`:
 
 1. **Collect** -- `collector.rs` scans codegen units for functions prefixed with `cuda_oxide_kernel_<hash>_` (set by the `#[kernel]` proc-macro -- the prefix is owned by `crates/reserved-oxide-symbols/`, the workspace-internal source of truth for the cuda-oxide naming contract). It then walks the MIR call graph to gather all transitively reachable device functions.
-2. **Compile device code** -- `device_codegen.rs` feeds the collected MIR through the cuda-oxide pipeline: `mir-importer` translates Rust MIR to `dialect-mir`, runs `mem2reg`, and calls `mir-lower` to produce the LLVM dialect, which is then exported to LLVM IR and compiled to PTX via `llc`.
+2. **Compile device code** -- `device_codegen.rs` feeds the collected MIR through
+   the cuda-oxide pipeline: translate to `dialect-mir`, run `mem2reg`, apply
+   annotated unrolling, lower and export to LLVM IR, then compile PTX with `llc`.
 3. **Compile host code** -- The standard `rustc_codegen_llvm` backend handles everything else.
 
 ## Usage
@@ -74,19 +76,24 @@ These are set automatically by `cargo oxide`. For manual invocations, all three 
 
 ### Environment Variables
 
-| Variable                    | Effect                         |
-|-----------------------------|--------------------------------|
-| `CUDA_OXIDE_VERBOSE`        | Verbose compilation output     |
-| `CUDA_OXIDE_PTX_DIR`        | Output directory for PTX files |
-| `CUDA_OXIDE_TARGET`         | GPU architecture override      |
-| `CUDA_OXIDE_LLC`            | Path to a specific `llc`       |
-| `CUDA_OXIDE_DUMP_MIR`       | Dump the `dialect-mir` module  |
-| `CUDA_OXIDE_DUMP_LLVM`      | Dump the LLVM dialect module   |
-| `CUDA_OXIDE_SHOW_RUSTC_MIR` | Dump raw rustc MIR             |
-| `CUDA_OXIDE_EMIT_NVVM_IR`   | Emit NVVM IR for libNVVM       |
+| Variable                             | Effect                                      |
+|--------------------------------------|---------------------------------------------|
+| `CUDA_OXIDE_VERBOSE`                 | Verbose compilation output                  |
+| `CUDA_OXIDE_PTX_DIR`                 | Output directory for PTX files              |
+| `CUDA_OXIDE_TARGET`                  | GPU architecture override                   |
+| `CUDA_OXIDE_LLC`                     | Path to a specific `llc`                    |
+| `CUDA_OXIDE_DUMP_MIR`                | Dump the `dialect-mir` module               |
+| `CUDA_OXIDE_DUMP_LLVM`               | Dump the LLVM dialect module                |
+| `CUDA_OXIDE_SHOW_RUSTC_MIR`          | Dump raw rustc MIR                          |
+| `CUDA_OXIDE_EMIT_NVVM_IR`            | Emit NVVM IR for libNVVM                    |
+| `CUDA_OXIDE_DEVICE_CODEGEN_CRATE`    | Comma-separated device owner crate filter   |
 
 `cargo oxide --arch <sm_XX>` sets `CUDA_OXIDE_TARGET`. When it is unset,
 PTX output auto-detects the required target from generated LLVM IR.
+Owner-filter names are normalized like Cargo crate names, so hyphens match
+underscores. Host LLVM codegen still runs for every crate. An excluded target
+must not call its generated module loader; the filter suppresses its device
+artifact but does not give sibling targets separate runtime bundle names.
 
 ## Source Layout
 
@@ -120,6 +127,8 @@ The `examples/` directory contains standalone kernel crates that exercise differ
 | `barrier`                    | `__syncthreads` and barrier semantics                      |
 | `atomics`                    | Atomic operations on device                                |
 | `atomic_f16`                 | Scalar f16 atomic correctness checks and microbenchmarks   |
+| `libdevice_math`             | Libdevice math on legacy and modern NVVM targets            |
+| `legacy_nvvm_pointer_shapes` | Legacy NVVM pointer shapes across control flow and memory   |
 | `printf`                     | Device-side `printf` via FFI                               |
 | `tma_copy`                   | Tensor Memory Accelerator copies (Hopper+)                 |
 | `tma_multicast`              | TMA with multicast across CTAs                             |

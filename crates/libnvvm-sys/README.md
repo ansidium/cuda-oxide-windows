@@ -5,7 +5,14 @@ Runtime (`dlopen`) bindings to NVIDIA's libNVVM. libNVVM is the front-end of NVI
 ## What this crate provides
 
 - `LibNvvm` — RAII wrapper around the loaded library + resolved function pointers.
-- `Program` — RAII wrapper around an `nvvmProgram` handle, with `add_module` / `compile` methods.
+- `Program` — RAII wrapper around an `nvvmProgram` handle, with
+  `add_module` / `verify` / `compile` methods.
+- `CudaArch` — strict target parser that renders `compute_*` for libNVVM and
+  `sm_*` for cubin-producing tools.
+- `LibNvvm::ir_version` — `nvvmIRVersion` query for the accepted NVVM IR and
+  debug-metadata versions.
+- `LibNvvm::llvm_version` — optional `nvvmLLVMVersion` query for target-specific
+  NVVM IR dialect selection on toolkits that expose it.
 - `NvvmError` — typed errors with the libNVVM error log captured.
 
 ## Build requirements
@@ -17,14 +24,10 @@ None. The library is loaded at runtime, so the CUDA Toolkit only needs to be pre
 `LibNvvm::load()` tries (in order):
 
 1. `LIBNVVM_PATH` env var, if set.
-2. Platform loader candidates:
-   - Linux: `libnvvm.so.4`, `libnvvm.so.3`, `libnvvm.so`.
-   - Windows: discovered `nvvm64_*.dll` files on the normal DLL search path.
-3. CUDA Toolkit roots from the shared toolkit discovery helper:
-   - Linux: `<root>/nvvm/lib64/libnvvm.so`.
-   - Windows: `<root>\nvvm\bin\x64\nvvm64_*.dll`.
+2. Platform loader names (`libnvvm.so.4`, `libnvvm.so.3`, `libnvvm.so` on Linux; discovered `nvvm64_*.dll` files on Windows).
+3. CUDA Toolkit roots from `cuda-toolkit-discovery`, including `<root>/nvvm/lib64/libnvvm.so` on Linux and `<root>/nvvm/bin/x64/nvvm64_*.dll` on Windows.
 
-libNVVM ships with the standard CUDA Toolkit. On Linux it is under `<cuda>/nvvm/lib64/`; on Windows it is typically a versioned DLL such as `nvvm64_40_0.dll` under `<cuda>\nvvm\bin\x64\`. Set `LIBNVVM_PATH` to a full library path when you need an explicit override.
+libNVVM ships with the standard CUDA Toolkit. No separate download.
 
 ## Usage
 
@@ -37,6 +40,7 @@ let nvvm = LibNvvm::load()?;
 let mut program = Program::new(&nvvm)?;
 program.add_module(&libdevice_bytes, "libdevice.10.bc")?;
 program.add_module(&kernel_ll_bytes, "kernel.ll")?;
+program.verify(&["-arch=compute_120"])?;
 let ltoir = program.compile(&["-arch=compute_120", "-gen-lto"])?;
 ```
 

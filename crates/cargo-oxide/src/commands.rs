@@ -9,11 +9,25 @@
 //! - Backend path resolved via discovery chain instead of hardcoded relative path
 //! - Workspace root resolved by walking up from CWD instead of assuming CWD
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::{backend, platform};
+
+/// Project-local cuda-oxide defaults loaded from `.cargo/cuda-oxide.toml`.
+#[derive(Debug, Clone, Default)]
+pub struct OxideConfig {
+    /// Explicit backend shared object path.
+    pub backend: Option<PathBuf>,
+    /// Default CUDA architecture for codegen commands.
+    pub default_arch: Option<String>,
+    /// Additional rustflags appended after cuda-oxide's required flags.
+    pub extra_rustflags: Vec<String>,
+    /// Environment variables applied to child Cargo invocations.
+    pub env: Vec<(String, String)>,
+}
 
 /// Pre-resolved context shared across all commands.
 ///
@@ -26,11 +40,13 @@ pub struct Context {
     pub codegen_crate: PathBuf,
     /// Path to `crates/rustc-codegen-cuda/examples/`.
     pub examples_dir: PathBuf,
-    /// Path to the built `rustc_codegen_cuda` backend dynamic library.
+    /// Path to the built `librustc_codegen_cuda.so` shared object.
     pub backend_so: PathBuf,
     /// True when running from inside the cuda-oxide workspace; false for
     /// standalone projects scaffolded by `cargo oxide new`.
     pub is_workspace: bool,
+    /// Project-local cuda-oxide defaults.
+    pub config: OxideConfig,
 }
 
 /// Resolve the workspace root and backend, or exit with a helpful error.
@@ -46,13 +62,15 @@ pub fn resolve_context() -> Context {
     if let Some(workspace_root) = backend::find_workspace_root() {
         let codegen_crate = workspace_root.join("crates/rustc-codegen-cuda");
         let examples_dir = codegen_crate.join("examples");
-        let backend_so = backend::find_or_build_backend(&workspace_root);
+        let config = load_oxide_config(&workspace_root);
+        let backend_so = backend::find_or_build_backend(&workspace_root, config.backend.as_deref());
         return Context {
             workspace_root,
             codegen_crate,
             examples_dir,
             backend_so,
             is_workspace: true,
+            config,
         };
     }
 
@@ -62,13 +80,15 @@ pub fn resolve_context() -> Context {
     });
 
     if cwd.join("Cargo.toml").is_file() {
-        let backend_so = backend::find_or_build_backend(&cwd);
+        let config = load_oxide_config(&cwd);
+        let backend_so = backend::find_or_build_backend(&cwd, config.backend.as_deref());
         return Context {
             workspace_root: cwd.clone(),
             codegen_crate: cwd.clone(),
             examples_dir: cwd.clone(),
             backend_so,
             is_workspace: false,
+            config,
         };
     }
 
@@ -81,8 +101,8 @@ pub fn resolve_context() -> Context {
 
 /// Resolve a context for `cargo oxide doctor` with NO side effects.
 ///
-/// Identical discovery to [`resolve_context`], except the backend is
-/// only *located* (via [`backend::backend_candidate`]), never built and
+/// Identical discovery to [`resolve_context`], except the backend `.so` is
+/// only *located* (via [`backend::backend_so_candidate`]), never built and
 /// never cloned. A diagnostic command must be runnable on a machine where
 /// nothing is set up yet; gating it behind a multi-minute backend build (or
 /// a network clone) would hide the very problems it exists to report.
@@ -91,13 +111,15 @@ pub fn resolve_doctor_context() -> Context {
     if let Some(workspace_root) = backend::find_workspace_root() {
         let codegen_crate = workspace_root.join("crates/rustc-codegen-cuda");
         let examples_dir = codegen_crate.join("examples");
-        let backend_so = backend::backend_candidate(&workspace_root);
+        let config = load_oxide_config(&workspace_root);
+        let backend_so = backend::backend_so_candidate(&workspace_root, config.backend.as_deref());
         return Context {
             workspace_root,
             codegen_crate,
             examples_dir,
             backend_so,
             is_workspace: true,
+            config,
         };
     }
 
@@ -107,13 +129,15 @@ pub fn resolve_doctor_context() -> Context {
     });
 
     if cwd.join("Cargo.toml").is_file() {
-        let backend_so = backend::backend_candidate(&cwd);
+        let config = load_oxide_config(&cwd);
+        let backend_so = backend::backend_so_candidate(&cwd, config.backend.as_deref());
         return Context {
             workspace_root: cwd.clone(),
             codegen_crate: cwd.clone(),
             examples_dir: cwd.clone(),
             backend_so,
             is_workspace: false,
+            config,
         };
     }
 
@@ -130,7 +154,7 @@ pub fn resolve_doctor_context() -> Context {
 
 /// Build and run an example with the custom codegen backend.
 ///
-/// Cleans stale artifacts, sets encoded rustflags to point at the backend,
+/// Cleans stale artifacts, sets encoded rustc flags to point at the backend `.so`,
 /// and invokes `cargo run --release` from the example directory. Environment
 /// variables control output format (PTX / NVVM IR) and verbosity.
 #[allow(clippy::too_many_arguments)]
@@ -153,6 +177,7 @@ pub fn codegen_run(
     let interop = load_interop_config(&example_dir);
 
     let output_format = format_label(emit_nvvm_ir);
+    let target_arch = configured_arch(ctx, arch);
     // Target precedence for `cargo oxide run` (highest first):
     //   1. --arch <sm_XX>            explicit user override   -> CUDA_OXIDE_TARGET
     //   2. CUDA_OXIDE_TARGET=<sm_XX> explicit env override (from the parent)
@@ -166,7 +191,7 @@ pub fn codegen_run(
     // We only detect for `run`, not `build`/`pipeline`: `run` loads the cubin
     // on the local GPU, whereas those may legitimately cross-compile for
     // another machine.
-    let detected_device_arch = detect_run_target_arch(arch, emit_nvvm_ir);
+    let detected_device_arch = detect_run_target_arch(target_arch, emit_nvvm_ir);
 
     if let Some(interop) = interop.filter(|config| !config.device_crates.is_empty()) {
         codegen_run_interop(
@@ -176,7 +201,7 @@ pub fn codegen_run(
             &interop,
             verbose,
             emit_nvvm_ir,
-            arch,
+            target_arch,
             detected_device_arch.as_deref(),
             features,
             bin,
@@ -194,7 +219,8 @@ pub fn codegen_run(
         println!("Output format: {}", output_format);
         println!(
             "Target arch: {}",
-            arch.expect("--emit-nvvm-ir requires --arch")
+            configured_arch_label(ctx, arch)
+                .expect("--emit-nvvm-ir requires a configured architecture")
         );
         println!();
     } else if let Some(dev) = detected_device_arch.as_deref() {
@@ -206,14 +232,13 @@ pub fn codegen_run(
         println!();
     }
     println!("This is the proper cargo workflow:");
-    println!("  CARGO_ENCODED_RUSTFLAGS=\"-Z\\x1fcodegen-backend=...\" cargo run");
+    println!("  CARGO_ENCODED_RUSTFLAGS=<cuda-oxide flags> cargo run");
     println!();
 
     touch_main_rs(&example_dir);
 
     let mut cmd = Command::new("cargo");
     cmd.args(["run", "--release"]).current_dir(&example_dir);
-    apply_codegen_rustflags(&mut cmd, &ctx.backend_so, false);
 
     if let Some(bin) = bin {
         cmd.args(["--bin", bin]);
@@ -222,23 +247,10 @@ pub fn codegen_run(
         cmd.args(["--features", features]);
     }
 
-    if verbose || std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
-        cmd.env("CUDA_OXIDE_VERBOSE", "1");
-    } else {
-        cmd.env_remove("CUDA_OXIDE_VERBOSE");
-    }
-    forward_env_var(&mut cmd, "CUDA_OXIDE_SHOW_RUSTC_MIR");
-    forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_MIR");
-    forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_LLVM");
-    if no_fmad {
-        cmd.env("CUDA_OXIDE_NO_FMA", "1");
-    } else {
-        cmd.env_remove("CUDA_OXIDE_NO_FMA");
-    }
-
-    apply_output_mode(&mut cmd, emit_nvvm_ir, arch);
-    apply_device_arch_hint(&mut cmd, arch, detected_device_arch.as_deref());
-    apply_loader_path(&mut cmd);
+    apply_common_codegen_env(&mut cmd, ctx, verbose, no_fmad);
+    apply_codegen_rustflags(&mut cmd, ctx, false, &[]);
+    apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch);
+    apply_device_arch_hint(&mut cmd, target_arch, detected_device_arch.as_deref());
 
     if let Some(bin) = bin {
         println!("Building and running {} (bin: {})...", example, bin);
@@ -305,7 +317,7 @@ fn codegen_run_interop(
         arch,
         detected_device_arch,
     );
-    run_host_cargo(example, example_dir, "run", features, bin, verbose);
+    run_host_cargo(ctx, example, example_dir, "run", features, bin, verbose);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -332,7 +344,7 @@ fn codegen_build_interop(
     // `build` may cross-compile for another machine, so no device-arch hint:
     // only an explicit `--arch` pins the target here.
     build_interop_device_crates(ctx, example_dir, interop, verbose, arch, None);
-    run_host_cargo(example, example_dir, "build", features, None, verbose);
+    run_host_cargo(ctx, example, example_dir, "build", features, None, verbose);
 }
 
 fn reject_interop_nvvm_ir(emit_nvvm_ir: bool) {
@@ -404,21 +416,15 @@ fn build_interop_device_crate(
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--release", "--manifest-path"])
         .arg(&manifest_path)
-        .current_dir(device_dir)
-        .env("CUDA_OXIDE_PTX_DIR", &ptx_dir);
-    apply_codegen_rustflags(&mut cmd, &ctx.backend_so, false);
+        .current_dir(device_dir);
 
-    if verbose || std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
-        cmd.env("CUDA_OXIDE_VERBOSE", "1");
-    } else {
-        cmd.env_remove("CUDA_OXIDE_VERBOSE");
-    }
-    forward_env_var(&mut cmd, "CUDA_OXIDE_SHOW_RUSTC_MIR");
-    forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_MIR");
-    forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_LLVM");
+    apply_common_codegen_env(&mut cmd, ctx, verbose, false);
+    apply_codegen_rustflags(&mut cmd, ctx, false, &[]);
+    // This is an internal artifact contract, so it must override a project
+    // `[env]` default for the same variable.
+    cmd.env("CUDA_OXIDE_PTX_DIR", &ptx_dir);
     apply_output_mode(&mut cmd, false, arch);
     apply_device_arch_hint(&mut cmd, arch, detected_device_arch);
-    apply_loader_path(&mut cmd);
 
     let status = cmd.status().expect("Failed to build interop device crate");
     if !status.success() {
@@ -441,6 +447,7 @@ fn build_interop_device_crate(
 }
 
 fn run_host_cargo(
+    ctx: &Context,
     example: &str,
     example_dir: &Path,
     cargo_subcommand: &str,
@@ -462,7 +469,8 @@ fn run_host_cargo(
         cmd.args(["--features", features]);
     }
 
-    apply_loader_path(&mut cmd);
+    apply_config_env(&mut cmd, ctx);
+    apply_loader_path(&mut cmd, ctx);
 
     if cargo_subcommand == "run" {
         if let Some(bin) = bin {
@@ -507,6 +515,7 @@ pub fn codegen_build(
     features: Option<&str>,
     no_fmad: bool,
 ) {
+    let target_arch = configured_arch(ctx, arch);
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
     } else {
@@ -523,7 +532,7 @@ pub fn codegen_build(
             &interop,
             verbose,
             emit_nvvm_ir,
-            arch,
+            target_arch,
             features,
         );
         return;
@@ -540,28 +549,14 @@ pub fn codegen_build(
 
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--release"]).current_dir(&example_dir);
-    apply_codegen_rustflags(&mut cmd, &ctx.backend_so, false);
 
     if let Some(features) = features {
         cmd.args(["--features", features]);
     }
 
-    if verbose || std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
-        cmd.env("CUDA_OXIDE_VERBOSE", "1");
-    } else {
-        cmd.env_remove("CUDA_OXIDE_VERBOSE");
-    }
-    forward_env_var(&mut cmd, "CUDA_OXIDE_SHOW_RUSTC_MIR");
-    forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_MIR");
-    forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_LLVM");
-    if no_fmad {
-        cmd.env("CUDA_OXIDE_NO_FMA", "1");
-    } else {
-        cmd.env_remove("CUDA_OXIDE_NO_FMA");
-    }
-
-    apply_output_mode(&mut cmd, emit_nvvm_ir, arch);
-    apply_loader_path(&mut cmd);
+    apply_common_codegen_env(&mut cmd, ctx, verbose, no_fmad);
+    apply_codegen_rustflags(&mut cmd, ctx, false, &[]);
+    apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch);
 
     println!("Building {}...", example);
     println!();
@@ -583,7 +578,8 @@ pub fn codegen_build(
 /// has to run through libNVVM separately to get linkable LTOIR. This folds both
 /// halves into one command for the Tile-to-SIMT interop workflow (#96): it
 /// builds the crate in NVVM IR mode, then compiles the emitted `<crate>.ll`
-/// with libNVVM `-gen-lto` and writes `<crate>.ltoir` (or `output`).
+/// with libNVVM `-gen-lto` and writes `<crate>.ltoir` (or `output`) plus the
+/// matching `.target` file used for runtime loading.
 ///
 /// `arch` is required because LTOIR is architecture-specific. It accepts
 /// `sm_XX`, `compute_XX`, or a bare `XX`, all mapped to libNVVM's
@@ -608,12 +604,20 @@ pub fn emit_ltoir(
         std::process::exit(1);
     }
 
+    // Normalize once: libNVVM consumes compute_XX, while the compiler records
+    // and nvJitLink consumes the equivalent sm_XX spelling.
+    let parsed_arch = parse_nvvm_arch(arch).unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    });
+    let sm_arch = parsed_arch.sm();
+
     // Step 1: build in NVVM IR mode so the backend writes `<crate>.ll` as
     // libNVVM-ready NVVM IR. codegen_build exits on build failure. FMA
     // contraction stays at its default (on) for the LTOIR build. Pass
     // quiet=true so the intermediate "✓ Build succeeded" line is suppressed;
     // emit_ltoir prints its own unified summary at the end.
-    codegen_build(ctx, example, verbose, true, Some(arch), features, false);
+    codegen_build(ctx, example, verbose, true, Some(&sm_arch), features, false);
 
     // Step 2: compile that NVVM IR to LTOIR via libNVVM -gen-lto.
     let ll_path = example_dir.join(format!("{example}.ll"));
@@ -625,8 +629,8 @@ pub fn emit_ltoir(
         std::process::exit(1);
     });
 
-    let compute_arch = nvvm_compute_arch(arch);
-    let ltoir = compile_nvvm_to_ltoir(&ir, example, &compute_arch);
+    let compute_arch = parsed_arch.compute();
+    let ltoir = compile_nvvm_to_ltoir(&ir, example, &parsed_arch);
 
     // Step 3: write the artifact.
     let out_path = output
@@ -636,6 +640,14 @@ pub fn emit_ltoir(
         eprintln!(
             "Error: could not write LTOIR to {}: {e}",
             out_path.display()
+        );
+        std::process::exit(1);
+    });
+    let target_path = out_path.with_extension("target");
+    std::fs::write(&target_path, format!("{sm_arch}\n")).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: could not write LTOIR target metadata to {}: {e}",
+            target_path.display()
         );
         std::process::exit(1);
     });
@@ -652,51 +664,61 @@ pub fn emit_ltoir(
 ///
 /// Accepts `sm_XX` (the form `--arch` and the rest of cargo-oxide use),
 /// `compute_XX` (passed through), or a bare `XX`.
-fn nvvm_compute_arch(arch: &str) -> String {
-    if let Some(cc) = arch.strip_prefix("sm_") {
-        format!("compute_{cc}")
-    } else if arch.starts_with("compute_") {
+fn parse_nvvm_arch(arch: &str) -> Result<libnvvm_sys::CudaArch, libnvvm_sys::CudaArchParseError> {
+    let normalized = if arch.starts_with("sm_") || arch.starts_with("compute_") {
         arch.to_string()
     } else {
         format!("compute_{arch}")
-    }
-}
-
-/// Lowest compute capability whose libNVVM accepts cuda-oxide's exported dialect.
-///
-/// cuda-oxide exports NVVM IR 2.0 (opaque pointers, LLVM 20 dialect). NVIDIA's
-/// libNVVM only parses that dialect for compute_100 and newer (Blackwell+);
-/// older targets route to the typed-pointer (NVVM IR 1.x) parser and reject the
-/// module while parsing types. See <https://github.com/NVlabs/cuda-oxide/issues/98>.
-const NVVM_OPAQUE_PTR_MIN_CC: u32 = 100;
-
-/// Parse the numeric compute capability out of a `compute_XX` string.
-///
-/// Reads the leading capability digits and ignores a trailing architecture
-/// variant letter, so `compute_90`, `compute_90a`, and `compute_100f` all yield
-/// their base capability. Returns `None` when there are no leading digits, in
-/// which case the caller skips the capability-floor hint rather than guessing.
-fn compute_capability(compute_arch: &str) -> Option<u32> {
-    let suffix = compute_arch.strip_prefix("compute_")?;
-    let digits: String = suffix.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+    };
+    normalized.parse()
 }
 
 /// Compile NVVM IR text to binary LTOIR with libNVVM `-gen-lto`. Exits with a
 /// diagnostic on any libNVVM failure (the program log is attached to the error).
 ///
-/// When the target is below [`NVVM_OPAQUE_PTR_MIN_CC`] a compile failure also
-/// prints the issue #98 explanation, since the cryptic libNVVM parse error
-/// otherwise gives no hint that the opaque-pointer dialect is the cause. The
-/// hint is gated on actual failure so it disappears automatically if the floor
-/// ever moves.
-fn compile_nvvm_to_ltoir(ir: &[u8], name: &str, compute_arch: &str) -> Vec<u8> {
+fn compile_nvvm_to_ltoir(ir: &[u8], name: &str, arch: &libnvvm_sys::CudaArch) -> Vec<u8> {
     let nvvm = libnvvm_sys::LibNvvm::load().unwrap_or_else(|e| {
         eprintln!("Error: could not load libNVVM: {e}");
         eprintln!("libNVVM ships with the CUDA Toolkit at <CUDA>/nvvm/lib64/libnvvm.so.");
         eprintln!("Run `cargo oxide doctor` to check your toolkit setup.");
         std::process::exit(1);
     });
+    let ir_version = nvvm.ir_version().unwrap_or_else(|e| {
+        eprintln!("Error: could not query libNVVM's accepted IR version: {e}");
+        std::process::exit(1);
+    });
+    if (ir_version.ir_major, ir_version.ir_minor) != (2, 0) {
+        eprintln!(
+            "Error: installed libNVVM accepts NVVM IR {}.{}, but cuda-oxide emits NVVM IR 2.0",
+            ir_version.ir_major, ir_version.ir_minor
+        );
+        std::process::exit(1);
+    }
+    if let Some(llvm_major) = nvvm.llvm_version(arch).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: could not query libNVVM's LLVM dialect for {}: {e}",
+            arch.compute()
+        );
+        std::process::exit(1);
+    }) {
+        let mismatch = if arch.uses_legacy_llvm() {
+            llvm_major != 7
+        } else {
+            llvm_major == 7
+        };
+        if mismatch {
+            let expected = if arch.uses_legacy_llvm() {
+                "legacy LLVM 7 typed-pointer"
+            } else {
+                "modern opaque-pointer"
+            };
+            eprintln!(
+                "Error: libNVVM reports LLVM {llvm_major} for {}, but cuda-oxide selected the {expected} dialect",
+                arch.compute()
+            );
+            std::process::exit(1);
+        }
+    }
     let mut program = libnvvm_sys::Program::new(&nvvm).unwrap_or_else(|e| {
         eprintln!("Error: nvvmCreateProgram failed: {e}");
         std::process::exit(1);
@@ -728,34 +750,301 @@ fn compile_nvvm_to_ltoir(ir: &[u8], name: &str, compute_arch: &str) -> Vec<u8> {
         eprintln!("Error: libNVVM rejected the NVVM IR module: {e}");
         std::process::exit(1);
     });
-    let arch_opt = format!("-arch={compute_arch}");
+    let arch_opt = format!("-arch={}", arch.compute());
+    program.verify(&[&arch_opt]).unwrap_or_else(|e| {
+        eprintln!("Error: libNVVM verification failed: {e}");
+        std::process::exit(1);
+    });
     program
         .compile(&[&arch_opt, "-gen-lto"])
         .unwrap_or_else(|e| {
             eprintln!("Error: libNVVM -gen-lto compilation failed: {e}");
-            if compute_capability(compute_arch).is_some_and(|cc| cc < NVVM_OPAQUE_PTR_MIN_CC) {
-                eprintln!();
-                eprintln!(
-                    "{compute_arch} is below compute_{NVVM_OPAQUE_PTR_MIN_CC}. cuda-oxide exports"
-                );
-                eprintln!(
-                    "NVVM IR 2.0 (opaque pointers), which libNVVM only accepts for"
-                );
-                eprintln!(
-                    "compute_{NVVM_OPAQUE_PTR_MIN_CC} and newer (Blackwell+); older targets reject it while"
-                );
-                eprintln!("parsing types. Target sm_100 or newer, or follow the typed-pointer");
-                eprintln!("export work at https://github.com/NVlabs/cuda-oxide/issues/98.");
-            }
             std::process::exit(1);
         })
+}
+
+/// Options for `cargo oxide build -- ...` / `cargo oxide test -- ...`.
+#[derive(Clone, Copy)]
+pub struct CargoPassthroughOptions<'a> {
+    pub verbose: bool,
+    pub emit_nvvm_ir: bool,
+    pub arch: Option<&'a str>,
+    pub features: Option<&'a str>,
+    pub cargo_target_dir: Option<&'a Path>,
+    pub device_codegen_crate: Option<&'a str>,
+    pub device_cfgs: &'a [String],
+    pub no_fmad: bool,
+}
+
+fn normalize_device_codegen_crates(raw: &str) -> Result<String, String> {
+    let mut normalized = Vec::new();
+    for item in raw.split(',') {
+        let name = item.trim().replace('-', "_");
+        if name.is_empty() {
+            return Err(
+                "--device-codegen-crate requires a comma-separated list without empty entries"
+                    .to_string(),
+            );
+        }
+        if !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(format!(
+                "invalid device-codegen crate name `{item}`; use Cargo crate names separated by commas"
+            ));
+        }
+        if !normalized.contains(&name) {
+            normalized.push(name);
+        }
+    }
+    Ok(normalized.join(","))
+}
+
+fn project_config_env<'a>(ctx: &'a Context, key: &str) -> Option<&'a str> {
+    ctx.config
+        .env
+        .iter()
+        .find(|(configured_key, _)| configured_key == key)
+        .map(|(_, value)| value.as_str())
+}
+
+fn configured_device_codegen_crates(
+    ctx: &Context,
+    explicit: Option<&str>,
+) -> Result<Option<String>, String> {
+    let inherited = std::env::var("CUDA_OXIDE_DEVICE_CODEGEN_CRATE").ok();
+    resolve_device_codegen_crates(
+        explicit,
+        inherited.as_deref(),
+        project_config_env(ctx, "CUDA_OXIDE_DEVICE_CODEGEN_CRATE"),
+    )
+}
+
+fn resolve_device_codegen_crates(
+    explicit: Option<&str>,
+    inherited: Option<&str>,
+    configured: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(explicit) = explicit {
+        return normalize_device_codegen_crates(explicit).map(Some);
+    }
+
+    inherited
+        .or(configured)
+        .filter(|value| !value.trim().is_empty())
+        .map(normalize_device_codegen_crates)
+        .transpose()
+}
+
+fn passthrough_codegen_fingerprint(
+    ctx: &Context,
+    opts: &CargoPassthroughOptions<'_>,
+    owner_filter: Option<&str>,
+    target_arch: Option<&str>,
+) -> String {
+    let inherited_env: BTreeMap<String, Option<String>> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            key.into_string()
+                .ok()
+                .map(|key| (key, value.into_string().ok()))
+        })
+        .collect();
+    passthrough_codegen_fingerprint_with_env(ctx, opts, owner_filter, target_arch, &inherited_env)
+}
+
+fn passthrough_codegen_fingerprint_with_env(
+    ctx: &Context,
+    opts: &CargoPassthroughOptions<'_>,
+    owner_filter: Option<&str>,
+    target_arch: Option<&str>,
+    inherited_env: &BTreeMap<String, Option<String>>,
+) -> String {
+    let mut effective_env = BTreeMap::new();
+    effective_env.insert(
+        "__CUDA_OXIDE_BACKEND_ARTIFACT".to_string(),
+        backend_artifact_identity(&ctx.backend_so),
+    );
+
+    // Project-configured CUDA_OXIDE_* variables are defaults. Mirror the same
+    // parent override rule as `apply_config_env` so changes that can affect
+    // codegen also change Cargo's rustflags fingerprint.
+    for (key, configured_value) in &ctx.config.env {
+        if !key.starts_with("CUDA_OXIDE_") {
+            continue;
+        }
+        match inherited_env.get(key) {
+            Some(Some(value)) => {
+                effective_env.insert(key.clone(), value.clone());
+            }
+            // `apply_config_env` sees the non-Unicode parent value through
+            // var_os and does not replace it; backend readers using `var`
+            // ignore it, so there is no effective Unicode value to hash.
+            Some(None) => {}
+            None => {
+                effective_env.insert(key.clone(), configured_value.clone());
+            }
+        }
+    }
+    // Capture backend settings inherited outside project config, including
+    // current and future CUDA_OXIDE_* switches.
+    for (key, value) in inherited_env
+        .iter()
+        .filter(|(key, value)| key.starts_with("CUDA_OXIDE_") && value.is_some())
+    {
+        effective_env.insert(
+            key.clone(),
+            value
+                .as_ref()
+                .expect("filtered to Unicode environment values")
+                .clone(),
+        );
+    }
+
+    if opts.verbose {
+        effective_env.insert("CUDA_OXIDE_VERBOSE".to_string(), "1".to_string());
+    }
+    if opts.no_fmad {
+        effective_env.insert("CUDA_OXIDE_NO_FMA".to_string(), "1".to_string());
+    }
+    if opts.emit_nvvm_ir {
+        effective_env.insert("CUDA_OXIDE_EMIT_NVVM_IR".to_string(), "1".to_string());
+    }
+    if let Some(target_arch) = target_arch {
+        effective_env.insert("CUDA_OXIDE_TARGET".to_string(), target_arch.to_string());
+    }
+    if let Some(owner_filter) = owner_filter {
+        effective_env.insert(
+            "CUDA_OXIDE_DEVICE_CODEGEN_CRATE".to_string(),
+            owner_filter.to_string(),
+        );
+    }
+
+    // Stable FNV-1a over length-delimited key/value pairs. The cfg carries
+    // only the digest, so backend settings are not included verbatim in rustc
+    // command lines or diagnostics.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for (key, value) in effective_env {
+        for bytes in [key.as_bytes(), value.as_bytes()] {
+            for byte in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    format!("{hash:016x}")
+}
+
+fn backend_artifact_identity(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let path = canonical.to_string_lossy();
+    let Ok(metadata) = std::fs::metadata(&canonical) else {
+        return format!("{path}|missing");
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{path}|{}|{modified}", metadata.len())
+}
+
+fn cargo_passthrough_command(
+    ctx: &Context,
+    cargo_subcommand: &str,
+    opts: &CargoPassthroughOptions<'_>,
+    cargo_args: &[String],
+) -> Result<Command, String> {
+    let target_arch = configured_arch(ctx, opts.arch);
+    let owner_filter = configured_device_codegen_crates(ctx, opts.device_codegen_crate)?;
+    let mut fingerprinted_device_cfgs = opts.device_cfgs.to_vec();
+    // Cargo does not fingerprint arbitrary child environment variables. An
+    // otherwise-unused cfg makes every effective codegen setting part of the
+    // rustc command line, so changing target/output/FMA/filter settings reruns
+    // the backend instead of silently reusing stale PTX or NVVM IR.
+    let fingerprint =
+        passthrough_codegen_fingerprint(ctx, opts, owner_filter.as_deref(), target_arch);
+    fingerprinted_device_cfgs.push(format!("cuda_oxide_internal_codegen_env=\"{fingerprint}\""));
+    let mut cmd = Command::new("cargo");
+    cmd.arg(cargo_subcommand);
+    if let Some(features) = opts.features {
+        cmd.args(["--features", features]);
+    }
+    cmd.args(cargo_args).current_dir(&ctx.workspace_root);
+
+    // Project configuration provides defaults. Explicit wrapper flags and
+    // internal compiler requirements are applied afterward and therefore win.
+    apply_common_codegen_env(&mut cmd, ctx, opts.verbose, opts.no_fmad);
+    apply_codegen_rustflags(&mut cmd, ctx, false, &fingerprinted_device_cfgs);
+
+    if let Some(cargo_target_dir) = opts.cargo_target_dir {
+        cmd.env("CARGO_TARGET_DIR", cargo_target_dir);
+    }
+    if let Some(owner_filter) = owner_filter {
+        cmd.env("CUDA_OXIDE_DEVICE_CODEGEN_CRATE", owner_filter);
+    }
+    apply_output_mode(&mut cmd, opts.emit_nvvm_ir, target_arch);
+    Ok(cmd)
+}
+
+/// Run an arbitrary Cargo build-like subcommand through the cuda-oxide backend.
+///
+/// Unlike example mode, this does not touch source files or clean generated
+/// artifacts. It is intended for final-target workspace builds where Cargo's
+/// incremental behavior should remain intact.
+pub fn codegen_cargo_passthrough(
+    ctx: &Context,
+    cargo_subcommand: &str,
+    opts: CargoPassthroughOptions<'_>,
+    cargo_args: &[String],
+) {
+    println!("=========================================");
+    println!("RUSTC-CODEGEN-CUDA CARGO {}", cargo_subcommand);
+    println!("=========================================");
+    println!();
+
+    let mut cmd = cargo_passthrough_command(ctx, cargo_subcommand, &opts, cargo_args)
+        .unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(2);
+        });
+
+    let displayed_args: Vec<_> = cmd
+        .get_args()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    if displayed_args.is_empty() {
+        println!("Running cargo {}...", cargo_subcommand);
+    } else {
+        println!(
+            "Running cargo {} {}...",
+            cargo_subcommand,
+            displayed_args.join(" ")
+        );
+    }
+    println!();
+
+    let status = cmd.status().expect("Failed to run cargo");
+    if !status.success() {
+        eprintln!(
+            "\nCargo {} failed with exit code: {:?}",
+            cargo_subcommand,
+            status.code()
+        );
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    println!();
+    println!("✓ Cargo {} succeeded", cargo_subcommand);
 }
 
 // =============================================================================
 // Pipeline command
 // =============================================================================
 
-/// Show the full compilation pipeline with verbose output at every stage.
+/// Show verbose pipeline progress and the available intermediate artifacts.
 ///
 /// Enables all diagnostic env vars (`CUDA_OXIDE_VERBOSE`, `SHOW_RUSTC_MIR`,
 /// `DUMP_MIR`, `DUMP_LLVM`) so the user can see MIR collection, the
@@ -769,6 +1058,7 @@ pub fn codegen_show_pipeline(
     arch: Option<&str>,
     no_fmad: bool,
 ) {
+    let target_arch = configured_arch(ctx, arch);
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
     } else {
@@ -781,13 +1071,14 @@ pub fn codegen_show_pipeline(
     println!("RUSTC-CODEGEN-CUDA PIPELINE: {}", example);
     println!("=========================================");
     println!();
-    match (emit_nvvm_ir, arch) {
+    let target_arch_label = configured_arch_label(ctx, arch);
+    match (emit_nvvm_ir, target_arch_label.as_deref()) {
         (true, Some(target_arch)) => println!("Output format: NVVM IR (arch: {})", target_arch),
         (false, Some(target_arch)) => {
             println!("Output format: PTX (arch override: {})", target_arch)
         }
         (false, None) => println!("Output format: PTX (auto-detected arch)"),
-        (true, None) => unreachable!("--emit-nvvm-ir requires --arch"),
+        (true, None) => unreachable!("--emit-nvvm-ir requires a configured architecture"),
     }
     println!();
     println!("Required flags (applied via CARGO_ENCODED_RUSTFLAGS):");
@@ -804,20 +1095,19 @@ pub fn codegen_show_pipeline(
 
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--release"]).current_dir(&example_dir);
-    apply_codegen_rustflags(&mut cmd, &ctx.backend_so, false);
 
+    apply_config_env(&mut cmd, ctx);
+    apply_codegen_rustflags(&mut cmd, ctx, false, &[]);
     cmd.env("CUDA_OXIDE_VERBOSE", "1");
     cmd.env("CUDA_OXIDE_SHOW_RUSTC_MIR", "1");
     cmd.env("CUDA_OXIDE_DUMP_MIR", "1");
     cmd.env("CUDA_OXIDE_DUMP_LLVM", "1");
     if no_fmad {
         cmd.env("CUDA_OXIDE_NO_FMA", "1");
-    } else {
-        cmd.env_remove("CUDA_OXIDE_NO_FMA");
     }
 
-    apply_output_mode(&mut cmd, emit_nvvm_ir, arch);
-    apply_loader_path(&mut cmd);
+    apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch);
+    apply_loader_path(&mut cmd, ctx);
 
     println!("Building {}...", example);
     println!();
@@ -849,23 +1139,6 @@ pub fn codegen_debug(
     use_cgdb: bool,
     use_tui: bool,
 ) {
-    let host_target = backend::active_host_target();
-    if platform::is_windows_target(&host_target) {
-        eprintln!("Error: `cargo oxide debug` does not launch a Windows debugger yet.");
-        eprintln!();
-        eprintln!(
-            "On Windows, use NVIDIA Nsight Visual Studio Edition or Visual Studio CUDA debugging."
-        );
-        eprintln!(
-            "Build first with `cargo oxide build {}` and attach from the IDE.",
-            example
-        );
-        eprintln!(
-            "If your environment provides cuda-gdb.exe, launch it manually against the release binary."
-        );
-        std::process::exit(2);
-    }
-
     let cuda_gdb = find_executable(
         "cuda-gdb",
         &[
@@ -898,7 +1171,8 @@ pub fn codegen_debug(
         ctx.workspace_root.clone()
     };
 
-    let detected_device_arch = detect_run_target_arch(arch, false);
+    let target_arch = configured_arch(ctx, arch);
+    let detected_device_arch = detect_run_target_arch(target_arch, false);
 
     println!("Building {} with debug info...", example);
     if let Some(dev) = detected_device_arch.as_deref() {
@@ -910,17 +1184,14 @@ pub fn codegen_debug(
     touch_main_rs(&example_dir);
 
     let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--release"])
-        .current_dir(&example_dir)
-        .env("CARGO_PROFILE_RELEASE_DEBUG", "2");
-    apply_codegen_rustflags(&mut cmd, &ctx.backend_so, true);
+    cmd.args(["build", "--release"]).current_dir(&example_dir);
 
-    forward_env_var(&mut cmd, "CUDA_OXIDE_SHOW_RUSTC_MIR");
-    forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_MIR");
-    forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_LLVM");
-
-    apply_debug_output_mode(&mut cmd, arch, detected_device_arch.as_deref());
-    apply_loader_path(&mut cmd);
+    apply_config_env(&mut cmd, ctx);
+    apply_codegen_rustflags(&mut cmd, ctx, true, &[]);
+    cmd.env("CARGO_PROFILE_RELEASE_DEBUG", "2");
+    apply_output_mode(&mut cmd, false, target_arch);
+    apply_device_arch_hint(&mut cmd, target_arch, detected_device_arch.as_deref());
+    apply_loader_path(&mut cmd, ctx);
 
     let status = cmd.status().expect("Failed to run cargo build");
     if !status.success() {
@@ -928,9 +1199,7 @@ pub fn codegen_debug(
         std::process::exit(status.code().unwrap_or(1));
     }
 
-    let binary = example_dir
-        .join("target/release")
-        .join(platform::executable_filename(example, &host_target));
+    let binary = example_dir.join("target/release").join(example);
     if !binary.exists() {
         eprintln!("Error: Binary not found at {:?}", binary);
         std::process::exit(1);
@@ -1081,7 +1350,7 @@ fn run_cargo_fmt(dir: &Path, check: bool) -> bool {
 /// Validate the development environment.
 ///
 /// Checks for: Rust nightly toolchain, `rust-toolchain.toml`, the codegen
-/// backend dynamic library (informational), CUDA headers (`cuda.h`), CUDA toolkit
+/// backend `.so` (informational), CUDA headers (`cuda.h`), CUDA toolkit
 /// (`nvcc`, libNVVM, nvJitLink, libdevice), LLVM (`llc`), clang/libclang,
 /// the NVIDIA driver / GPU (informational), and optionally `cuda-gdb`.
 /// Exits non-zero if any required check fails.
@@ -1091,25 +1360,6 @@ fn run_cargo_fmt(dir: &Path, check: bool) -> bool {
 /// caller resolves the context via [`resolve_doctor_context`] so nothing is
 /// built first. This is what lets it diagnose a bare machine (issue #87).
 pub fn doctor(ctx: &Context) {
-    let host_target = backend::active_host_target();
-    let is_windows = platform::is_windows_target(&host_target);
-    let backend_name = platform::dylib_filename("rustc_codegen_cuda", &host_target);
-    let object_ext = platform::object_extension(&host_target);
-    let nvcc_name = platform::executable_filename("nvcc", &host_target);
-    let llc_name = platform::executable_filename("llc", &host_target);
-    let clang_name = platform::executable_filename("clang", &host_target);
-    let cuda_gdb_name = platform::executable_filename("cuda-gdb", &host_target);
-    let libnvvm_name = if is_windows {
-        "nvvm64_*.dll"
-    } else {
-        "libnvvm.so"
-    };
-    let nvjitlink_name = if is_windows {
-        "nvJitLink_*.dll"
-    } else {
-        "libnvJitLink.so"
-    };
-
     println!("cargo-oxide environment check");
     println!("==============================");
     println!();
@@ -1145,17 +1395,15 @@ pub fn doctor(ctx: &Context) {
         ok = false;
     }
 
-    // 3. Backend dynamic library. Informational, not fatal:
-    // `run`/`build`/`pipeline`
+    // 3. Backend .so. Informational, not fatal: `run`/`build`/`pipeline`
     // build the backend on demand, so "not built yet" is a healthy state
     // for a fresh clone.
-    print!("Codegen backend ({})... ", backend_name);
+    print!("Codegen backend... ");
     if ctx.backend_so.exists() {
         println!("✓ {}", ctx.backend_so.display());
     } else {
         println!("- not built yet (run `cargo oxide setup`)");
     }
-    println!("Host object extension... .{}", object_ext);
 
     // 4. CUDA headers (cuda.h). The host `cuda-bindings` crate cannot build
     // without them; cargo-oxide itself deliberately can, which is what makes
@@ -1180,12 +1428,9 @@ pub fn doctor(ctx: &Context) {
     }
 
     // 5. CUDA toolkit
-    print!("CUDA toolkit ({})... ", nvcc_name);
-    match find_executable("nvcc", &[])
-        .and_then(|nvcc| Command::new(nvcc).arg("--version").output().ok())
-        .filter(|output| output.status.success())
-    {
-        Some(output) => {
+    print!("CUDA toolkit (nvcc)... ");
+    match Command::new("nvcc").arg("--version").output() {
+        Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout);
             if let Some(line) = version.lines().find(|l| l.contains("release")) {
                 println!("✓ {}", line.trim());
@@ -1193,32 +1438,9 @@ pub fn doctor(ctx: &Context) {
                 println!("✓ (version unknown)");
             }
         }
-        None => {
-            println!("✗ {} not found", nvcc_name);
+        _ => {
+            println!("✗ nvcc not found");
             ok = false;
-        }
-    }
-
-    if is_windows {
-        print!("CUDA driver import library (cuda.lib)... ");
-        match find_cuda_import_library() {
-            Some(path) => println!("✓ {}", path.display()),
-            None => {
-                println!("✗ cuda.lib not found");
-                eprintln!("  Installed with the CUDA Toolkit under <CUDA>\\lib\\x64\\cuda.lib.");
-                eprintln!("  Set CUDA_PATH or add that directory to the LIB environment variable.");
-                ok = false;
-            }
-        }
-
-        print!("libffi import library (ffi.lib)... ");
-        match backend::windows_libffi_library_dir() {
-            Some(path) => println!("✓ {}", path.join("ffi.lib").display()),
-            None => {
-                println!("✗ ffi.lib not found");
-                eprintln!("  Install `libffi:x64-windows` with vcpkg or set LIBFFI_LIB_DIR.");
-                ok = false;
-            }
         }
     }
 
@@ -1226,7 +1448,7 @@ pub fn doctor(ctx: &Context) {
     // CUDA libdevice math, e.g. sin/cos/exp/pow). All three ship with the
     // CUDA Toolkit; checking them here surfaces missing or split packagings
     // before a runtime failure inside `cuda_host::ltoir::load_kernel_module`.
-    print!("libNVVM ({})... ", libnvvm_name);
+    print!("libNVVM (libnvvm.so)... ");
     match libnvvm_sys::LibNvvm::load() {
         Ok(nvvm) => match nvvm.version() {
             Ok((major, minor)) => println!("✓ libNVVM {}.{}", major, minor),
@@ -1235,24 +1457,13 @@ pub fn doctor(ctx: &Context) {
         Err(e) => {
             println!("✗ {}", e);
             eprintln!("  Required only when kernels call CUDA libdevice math");
-            if is_windows {
-                eprintln!("  (sin/cos/exp/pow/...). Ships with the CUDA Toolkit at");
-                eprintln!(
-                    "  <CUDA>\\nvvm\\bin\\{}. Ensure that directory is on PATH.",
-                    libnvvm_name
-                );
-            } else {
-                eprintln!("  (sin/cos/exp/pow/...). Ships with the CUDA Toolkit at");
-                eprintln!(
-                    "  <CUDA>/nvvm/lib64/{}. No separate download.",
-                    libnvvm_name
-                );
-            }
+            eprintln!("  (sin/cos/exp/pow/...). Ships with the CUDA Toolkit at");
+            eprintln!("  <CUDA>/nvvm/lib64/libnvvm.so. No separate download.");
             ok = false;
         }
     }
 
-    print!("nvJitLink ({})... ", nvjitlink_name);
+    print!("nvJitLink (libnvJitLink.so)... ");
     match nvjitlink_sys::LibNvJitLink::load() {
         Ok(nvj) => match nvj.version() {
             Some((major, minor)) => println!("✓ nvJitLink {}.{}", major, minor),
@@ -1261,17 +1472,7 @@ pub fn doctor(ctx: &Context) {
         Err(e) => {
             println!("✗ {}", e);
             eprintln!("  Required only when kernels call CUDA libdevice math.");
-            if is_windows {
-                eprintln!(
-                    "  Ships with the CUDA Toolkit under <CUDA>\\bin\\{}. Ensure <CUDA>\\bin is on PATH.",
-                    nvjitlink_name
-                );
-            } else {
-                eprintln!(
-                    "  Ships with the CUDA Toolkit at <CUDA>/lib64/{}.",
-                    nvjitlink_name
-                );
-            }
+            eprintln!("  Ships with the CUDA Toolkit at <CUDA>/lib64/libnvJitLink.so.");
             ok = false;
         }
     }
@@ -1283,11 +1484,7 @@ pub fn doctor(ctx: &Context) {
             println!("✗ {}", e);
             eprintln!("  Required only when kernels call CUDA libdevice math.");
             eprintln!("  Ships with the CUDA Toolkit at");
-            if is_windows {
-                eprintln!("  <CUDA>\\nvvm\\libdevice\\libdevice.10.bc. Override the search");
-            } else {
-                eprintln!("  <CUDA>/nvvm/libdevice/libdevice.10.bc. Override the search");
-            }
+            eprintln!("  <CUDA>/nvvm/libdevice/libdevice.10.bc. Override the search");
             eprintln!("  with `CUDA_OXIDE_LIBDEVICE=<path>` if you have it elsewhere.");
             ok = false;
         }
@@ -1302,14 +1499,14 @@ pub fn doctor(ctx: &Context) {
     //   2. Rust toolchain's `llvm-tools` component (auto-installed via rustup)
     //   3. `llc-22`, `llc-21`, `llc` on `PATH`
     // Whatever we pick, reject if the major version is < 21.
-    print!("{} (LLVM)... ", llc_name);
+    print!("llc (LLVM)... ");
 
     // The pipeline's primary entry: the `llc` bundled with the pinned Rust
     // toolchain's `llvm-tools` component. Built with the NVPTX backend
     // enabled, so the typical novice path is `rustup component add llvm-tools`
     // and that's it. Surface the absolute path so doctor's output matches
     // what the pipeline actually invokes.
-    let rustup_llc_path: Option<PathBuf> = Command::new("rustc")
+    let rustup_llc_path: Option<String> = Command::new("rustc")
         .args(["--print", "sysroot", "--print", "host-tuple"])
         .output()
         .ok()
@@ -1319,23 +1516,23 @@ pub fn doctor(ctx: &Context) {
             let mut lines = stdout.lines();
             let sysroot = lines.next()?;
             let host = lines.next()?;
-            let path: PathBuf = [sysroot, "lib", "rustlib", host, "bin", &llc_name]
+            let path: std::path::PathBuf = [sysroot, "lib", "rustlib", host, "bin", "llc"]
                 .iter()
                 .collect();
-            path.is_file().then_some(path)
+            path.is_file()
+                .then(|| path.to_str().map(str::to_string))
+                .flatten()
         });
 
-    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut candidates: Vec<String> = Vec::new();
     if let Ok(env_llc) = std::env::var("CUDA_OXIDE_LLC") {
-        candidates.push(PathBuf::from(env_llc));
+        candidates.push(env_llc);
     }
-    if let Some(rustup) = rustup_llc_path {
+    if let Some(rustup) = rustup_llc_path.clone() {
         candidates.push(rustup);
     }
     for name in ["llc-22", "llc-21", "llc"] {
-        if let Some(path) = find_executable(name, &[]) {
-            candidates.push(path);
-        }
+        candidates.push(name.to_string());
     }
 
     let llc_pick = candidates.iter().find_map(|candidate| {
@@ -1346,7 +1543,7 @@ pub fn doctor(ctx: &Context) {
             .filter(|o| o.status.success())
             .map(|o| {
                 (
-                    candidate.display().to_string(),
+                    candidate.clone(),
                     String::from_utf8_lossy(&o.stdout).into_owned(),
                 )
             })
@@ -1373,39 +1570,21 @@ pub fn doctor(ctx: &Context) {
                         binary, v
                     );
                     eprintln!("  WGMMA intrinsic signatures cuda-oxide emits. Install a newer");
-                    eprintln!("  toolchain (`rustup component add llvm-tools` is usually enough)");
-                    if is_windows {
-                        eprintln!(
-                            "  or install LLVM 21+ for Windows and add its bin directory to PATH."
-                        );
-                        eprintln!(
-                            "  You can also set `CUDA_OXIDE_LLC=C:\\path\\to\\{}`.",
-                            llc_name
-                        );
-                    } else {
-                        eprintln!(
-                            "  or `sudo apt install llvm-21`) and either add it to PATH or set"
-                        );
-                        eprintln!("  `CUDA_OXIDE_LLC=/path/to/llc`.");
-                    }
+                    eprintln!("  toolchain (`rustup component add llvm-tools` is usually enough,");
+                    eprintln!("  or `sudo apt install llvm-21`) and either add it to PATH or set");
+                    eprintln!("  `CUDA_OXIDE_LLC=/path/to/llc`.");
                     ok = false;
                 }
                 None => println!("✓ {} ({}, version could not be parsed)", banner, binary),
             }
         }
         None => {
-            println!("✗ {} not found", llc_name);
+            println!("✗ llc not found");
             eprintln!("  cuda-oxide probes (in order): $CUDA_OXIDE_LLC, the Rust toolchain's");
             eprintln!("  llvm-tools llc, then llc-22/llc-21/llc on PATH. Easiest fix:");
             eprintln!("    rustup component add llvm-tools");
-            if is_windows {
-                eprintln!(
-                    "  Alternative: install LLVM 21+ for Windows and add its bin directory to PATH."
-                );
-            } else {
-                eprintln!("  Alternative: `sudo apt install llvm-21` (older versions reject");
-                eprintln!("  modern TMA / tcgen05 / WGMMA intrinsics).");
-            }
+            eprintln!("  Alternative: `sudo apt install llvm-21` (older versions reject");
+            eprintln!("  modern TMA / tcgen05 / WGMMA intrinsics).");
             ok = false;
         }
     }
@@ -1419,15 +1598,13 @@ pub fn doctor(ctx: &Context) {
     // bare `libclang1-*` (without the matching `libclang-common-*-dev`)
     // leave `/usr/lib/clang/*/include` empty and bindgen explodes with a
     // mysterious "'stddef.h' file not found". Catch that up front.
-    print!("{} / libclang resource dir... ", clang_name);
-    let clang_resource_dir = find_executable("clang", &[]).and_then(|clang| {
-        Command::new(clang)
-            .arg("-print-resource-dir")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    });
+    print!("clang / libclang resource dir... ");
+    let clang_resource_dir = Command::new("clang")
+        .arg("-print-resource-dir")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
     match clang_resource_dir {
         Some(ref dir) if std::path::Path::new(&format!("{}/include/stddef.h", dir)).exists() => {
             println!("✓ {}", dir);
@@ -1438,37 +1615,17 @@ pub fn doctor(ctx: &Context) {
                 dir
             );
             eprintln!("  Host `cuda-bindings` uses bindgen, which needs clang's own stddef.h.");
-            if is_windows {
-                eprintln!(
-                    "  Install LLVM/Clang for Windows and ensure {} is on PATH.",
-                    clang_name
-                );
-                eprintln!(
-                    "  If libclang is installed elsewhere, set LIBCLANG_PATH to its bin directory."
-                );
-            } else {
-                eprintln!("  Install the matching dev headers: sudo apt install clang-21");
-                eprintln!("  (or libclang-common-21-dev)");
-            }
+            eprintln!("  Install the matching dev headers: sudo apt install clang-21");
+            eprintln!("  (or libclang-common-21-dev)");
             ok = false;
         }
         None => {
-            println!("✗ {} not found", clang_name);
+            println!("✗ clang not found");
             eprintln!(
                 "  Host `cuda-bindings` uses bindgen, which needs clang + its resource headers."
             );
-            if is_windows {
-                eprintln!(
-                    "  Install LLVM/Clang for Windows and ensure {} is on PATH.",
-                    clang_name
-                );
-                eprintln!(
-                    "  If libclang is installed elsewhere, set LIBCLANG_PATH to its bin directory."
-                );
-            } else {
-                eprintln!("  Install with: sudo apt install clang-21");
-                eprintln!("  (or at minimum `libclang-common-21-dev` alongside your libclang)");
-            }
+            eprintln!("  Install with: sudo apt install clang-21");
+            eprintln!("  (or at minimum `libclang-common-21-dev` alongside your libclang)");
             ok = false;
         }
     }
@@ -1501,12 +1658,9 @@ pub fn doctor(ctx: &Context) {
     }
 
     // 9. cuda-gdb (optional)
-    print!("{} (optional)... ", cuda_gdb_name);
-    match find_executable("cuda-gdb", &[])
-        .and_then(|cuda_gdb| Command::new(cuda_gdb).arg("--version").output().ok())
-        .filter(|output| output.status.success())
-    {
-        Some(output) => {
+    print!("cuda-gdb (optional)... ");
+    match Command::new("cuda-gdb").arg("--version").output() {
+        Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout);
             if let Some(line) = version.lines().next() {
                 println!("✓ {}", line.trim());
@@ -1514,12 +1668,8 @@ pub fn doctor(ctx: &Context) {
                 println!("✓");
             }
         }
-        None => {
-            if is_windows {
-                println!("- not found (Windows debugging usually uses Nsight / Visual Studio)");
-            } else {
-                println!("- not found (only needed for `cargo oxide debug`)");
-            }
+        _ => {
+            println!("- not found (only needed for `cargo oxide debug`)");
         }
     }
 
@@ -1593,6 +1743,133 @@ pub fn setup(ctx: &Context) {
 // =============================================================================
 // Helpers
 // =============================================================================
+
+fn load_oxide_config(workspace_root: &Path) -> OxideConfig {
+    let config_path = workspace_root.join(".cargo/cuda-oxide.toml");
+    if !config_path.exists() {
+        return OxideConfig::default();
+    }
+
+    let source = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: could not read cuda-oxide config {}: {}",
+            config_path.display(),
+            e
+        );
+        std::process::exit(1);
+    });
+    let document: toml::Value = toml::from_str(&source).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: could not parse cuda-oxide config {}: {}",
+            config_path.display(),
+            e
+        );
+        std::process::exit(1);
+    });
+    let table = document.as_table().unwrap_or_else(|| {
+        eprintln!(
+            "Error: cuda-oxide config {} must be a TOML table",
+            config_path.display()
+        );
+        std::process::exit(1);
+    });
+
+    let backend = optional_config_string(table, "backend", &config_path)
+        .map(PathBuf::from)
+        .map(|path| absolutize_config_path(path, &config_path));
+    let default_arch = optional_config_string(table, "default-arch", &config_path);
+    let extra_rustflags = optional_config_string_array(table, "extra-rustflags", &config_path);
+    let env = table
+        .get("env")
+        .map(|value| parse_config_env(value, &config_path))
+        .unwrap_or_default();
+
+    OxideConfig {
+        backend,
+        default_arch,
+        extra_rustflags,
+        env,
+    }
+}
+
+fn absolutize_config_path(path: PathBuf, config_path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(path)
+}
+
+fn optional_config_string(table: &toml::Table, key: &str, config_path: &Path) -> Option<String> {
+    table.get(key).map(|value| {
+        value.as_str().map(str::to_string).unwrap_or_else(|| {
+            eprintln!(
+                "Error: cuda-oxide config {} field `{}` must be a string",
+                config_path.display(),
+                key
+            );
+            std::process::exit(1);
+        })
+    })
+}
+
+fn optional_config_string_array(table: &toml::Table, key: &str, config_path: &Path) -> Vec<String> {
+    table
+        .get(key)
+        .map(|value| {
+            value
+                .as_array()
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "Error: cuda-oxide config {} field `{}` must be an array of strings",
+                        config_path.display(),
+                        key
+                    );
+                    std::process::exit(1);
+                })
+                .iter()
+                .map(|item| {
+                    item.as_str().map(str::to_string).unwrap_or_else(|| {
+                        eprintln!(
+                            "Error: cuda-oxide config {} field `{}` must be an array of strings",
+                            config_path.display(),
+                            key
+                        );
+                        std::process::exit(1);
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_config_env(value: &toml::Value, config_path: &Path) -> Vec<(String, String)> {
+    let table = value.as_table().unwrap_or_else(|| {
+        eprintln!(
+            "Error: cuda-oxide config {} field `env` must be a table of strings",
+            config_path.display()
+        );
+        std::process::exit(1);
+    });
+    let mut env: Vec<_> = table
+        .iter()
+        .map(|(key, value)| {
+            let value = value.as_str().unwrap_or_else(|| {
+                eprintln!(
+                    "Error: cuda-oxide config {} env value `{}` must be a string",
+                    config_path.display(),
+                    key
+                );
+                std::process::exit(1);
+            });
+            (key.clone(), value.to_string())
+        })
+        .collect();
+    env.sort_by(|left, right| left.0.cmp(&right.0));
+    env
+}
 
 fn load_interop_config(example_dir: &Path) -> Option<InteropConfig> {
     let manifest_path = example_dir.join("Cargo.toml");
@@ -1749,85 +2026,76 @@ fn resolve_example_dir(ctx: &Context, example: &str) -> PathBuf {
     example_dir
 }
 
-const RUSTFLAGS_SEPARATOR: char = '\x1f';
+const ENCODED_RUSTFLAGS_SEPARATOR: char = '\u{1f}';
 
-/// Configure child cargo to use encoded rustflags for the codegen backend.
+/// Construct boundary-preserving rustc flags for Cargo.
 ///
-/// `CARGO_ENCODED_RUSTFLAGS` preserves backend paths with spaces. When we set
-/// it, remove `RUSTFLAGS` from the child env so cargo does not merge two flag
-/// sources and accidentally split a path.
-fn apply_codegen_rustflags(cmd: &mut Command, backend_so: &Path, debug: bool) {
-    let encoded = build_encoded_rustflags(backend_so, debug);
-    cmd.env("CARGO_ENCODED_RUSTFLAGS", encoded);
-    cmd.env_remove("RUSTFLAGS");
-}
-
-/// Construct encoded rustflags that configure rustc to use our backend.
-///
-/// Always includes `-Z codegen-backend`, `-C opt-level=3`, disabled debug
-/// assertions, suppressed JumpThreading (prevents barrier duplication), and
-/// v0 symbol mangling. Appends `-C debuginfo=2` when `debug` is true, then
-/// appends user-provided `CARGO_ENCODED_RUSTFLAGS` followed by `RUSTFLAGS`.
-fn build_encoded_rustflags(backend_so: &Path, debug: bool) -> String {
+/// `RUSTFLAGS` is whitespace-split by Cargo, which corrupts a single flag
+/// containing spaces. `CARGO_ENCODED_RUSTFLAGS` uses unit separators and keeps
+/// every configured array element and `--device-cfg` value intact.
+fn build_encoded_rustflags(ctx: &Context, debug: bool, device_cfgs: &[String]) -> String {
     let existing_encoded = std::env::var("CARGO_ENCODED_RUSTFLAGS").ok();
-    let existing_rustflags = std::env::var("RUSTFLAGS").ok();
+    let existing = std::env::var("RUSTFLAGS").ok();
+    let mut explicit_rustflags = Vec::new();
+    for cfg in device_cfgs {
+        explicit_rustflags.push("--cfg".to_string());
+        explicit_rustflags.push(cfg.clone());
+    }
     build_encoded_rustflags_with_existing(
-        backend_so,
+        &ctx.backend_so,
         debug,
+        &ctx.config.extra_rustflags,
+        &explicit_rustflags,
         existing_encoded.as_deref(),
-        existing_rustflags.as_deref(),
+        existing.as_deref(),
     )
 }
 
 fn build_encoded_rustflags_with_existing(
     backend_so: &Path,
     debug: bool,
-    existing_encoded: Option<&str>,
+    configured_rustflags: &[String],
+    explicit_rustflags: &[String],
+    existing_encoded_rustflags: Option<&str>,
     existing_rustflags: Option<&str>,
 ) -> String {
-    let mut flags = required_codegen_rustflags(backend_so, debug);
-    flags.extend(parse_encoded_rustflags(existing_encoded));
-    flags.extend(parse_rustflags(existing_rustflags));
-    encode_rustflags(&flags)
-}
+    // Project flags are defaults, inherited flags are user overrides, and
+    // explicit wrapper flags are stronger. cuda-oxide's compiler invariants
+    // come last because rustc resolves repeated -C/-Z options last-one-wins.
+    let mut flags = configured_rustflags.to_vec();
 
-fn required_codegen_rustflags(backend_so: &Path, debug: bool) -> Vec<String> {
-    let mut flags = vec![
-        "-Z".to_string(),
-        format!("codegen-backend={}", backend_so.display()),
-        "-C".to_string(),
-        "opt-level=3".to_string(),
-        "-C".to_string(),
-        "debug-assertions=off".to_string(),
-        "-Z".to_string(),
-        "mir-enable-passes=-JumpThreading".to_string(),
-        "-Csymbol-mangling-version=v0".to_string(),
-    ];
-    if debug {
-        flags.extend(["-C".to_string(), "debuginfo=2".to_string()]);
+    if let Some(existing) = existing_encoded_rustflags {
+        flags.extend(
+            existing
+                .split(ENCODED_RUSTFLAGS_SEPARATOR)
+                .filter(|flag| !flag.is_empty())
+                .map(str::to_string),
+        );
+    } else if let Some(existing) = existing_rustflags {
+        // Match Cargo's legacy RUSTFLAGS behavior when converting it to the
+        // encoded representation.
+        flags.extend(existing.split_whitespace().map(str::to_string));
     }
-    flags
+    flags.extend(explicit_rustflags.iter().cloned());
+    flags.extend([
+        format!("-Zcodegen-backend={}", backend_so.display()),
+        "-Copt-level=3".to_string(),
+        "-Cdebug-assertions=off".to_string(),
+        "-Zmir-enable-passes=-JumpThreading".to_string(),
+        "-Csymbol-mangling-version=v0".to_string(),
+    ]);
+    if debug {
+        flags.push("-Cdebuginfo=2".to_string());
+    }
+    flags.join(&ENCODED_RUSTFLAGS_SEPARATOR.to_string())
 }
 
-fn parse_encoded_rustflags(existing: Option<&str>) -> Vec<String> {
-    existing
-        .unwrap_or_default()
-        .split(RUSTFLAGS_SEPARATOR)
-        .filter(|flag| !flag.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn parse_rustflags(existing: Option<&str>) -> Vec<String> {
-    existing
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(str::to_string)
-        .collect()
-}
-
-fn encode_rustflags(flags: &[String]) -> String {
-    flags.join(&RUSTFLAGS_SEPARATOR.to_string())
+fn apply_codegen_rustflags(cmd: &mut Command, ctx: &Context, debug: bool, device_cfgs: &[String]) {
+    cmd.env(
+        "CARGO_ENCODED_RUSTFLAGS",
+        build_encoded_rustflags(ctx, debug, device_cfgs),
+    )
+    .env_remove("RUSTFLAGS");
 }
 
 /// Set environment variables for the codegen backend.
@@ -1844,18 +2112,55 @@ fn apply_output_mode(cmd: &mut Command, emit_nvvm_ir: bool, arch: Option<&str>) 
     }
 }
 
-/// Configure the device-code target for `cargo oxide debug`.
-///
-/// Debug launches the built binary immediately, so it follows `run` rather than
-/// `build`: an explicit `--arch`/`CUDA_OXIDE_TARGET` remains a hard override,
-/// while the local GPU arch is forwarded as a compatibility hint.
-fn apply_debug_output_mode(
-    cmd: &mut Command,
-    explicit_arch: Option<&str>,
-    detected_device_arch: Option<&str>,
-) {
-    apply_output_mode(cmd, false, explicit_arch);
-    apply_device_arch_hint(cmd, explicit_arch, detected_device_arch);
+fn configured_arch<'a>(ctx: &'a Context, cli_arch: Option<&'a str>) -> Option<&'a str> {
+    if cli_arch.is_some() || std::env::var("CUDA_OXIDE_TARGET").is_ok() {
+        cli_arch
+    } else {
+        ctx.config
+            .default_arch
+            .as_deref()
+            .or_else(|| project_config_env(ctx, "CUDA_OXIDE_TARGET"))
+    }
+}
+
+fn configured_arch_label(ctx: &Context, cli_arch: Option<&str>) -> Option<String> {
+    cli_arch
+        .map(str::to_string)
+        .or_else(|| std::env::var("CUDA_OXIDE_TARGET").ok())
+        .or_else(|| ctx.config.default_arch.clone())
+        .or_else(|| project_config_env(ctx, "CUDA_OXIDE_TARGET").map(str::to_string))
+}
+
+pub fn has_configured_arch(ctx: &Context, cli_arch: Option<&str>) -> bool {
+    cli_arch.is_some()
+        || std::env::var("CUDA_OXIDE_TARGET").is_ok()
+        || ctx.config.default_arch.is_some()
+        || project_config_env(ctx, "CUDA_OXIDE_TARGET").is_some()
+}
+
+fn apply_config_env(cmd: &mut Command, ctx: &Context) {
+    for (key, value) in &ctx.config.env {
+        if matches!(key.as_str(), "RUSTFLAGS" | "CARGO_ENCODED_RUSTFLAGS") {
+            continue;
+        }
+        // Project values are defaults. An explicitly inherited environment is
+        // stronger, and command-specific CLI/internal settings are applied
+        // after this helper and are stronger still.
+        if std::env::var_os(key).is_none() {
+            cmd.env(key, value);
+        }
+    }
+}
+
+fn apply_common_codegen_env(cmd: &mut Command, ctx: &Context, verbose: bool, no_fmad: bool) {
+    apply_config_env(cmd, ctx);
+    if verbose {
+        cmd.env("CUDA_OXIDE_VERBOSE", "1");
+    }
+    if no_fmad {
+        cmd.env("CUDA_OXIDE_NO_FMA", "1");
+    }
+    apply_loader_path(cmd, ctx);
 }
 
 /// Forward the auto-detected GPU arch as a *hint* via `CUDA_OXIDE_DEVICE_ARCH`.
@@ -2036,21 +2341,22 @@ fn format_sm_arch((major, minor): (u32, u32)) -> String {
     }
 }
 
-/// Forward an env var to the child process if it's set in the parent, otherwise remove it.
-fn forward_env_var(cmd: &mut Command, var: &str) {
-    if let Ok(val) = std::env::var(var) {
-        cmd.env(var, val);
-    } else {
-        cmd.env_remove(var);
-    }
+fn inherited_or_configured_env(ctx: &Context, key: &str) -> Option<String> {
+    std::env::var(key).ok().or_else(|| {
+        ctx.config
+            .env
+            .iter()
+            .find(|(configured_key, _)| configured_key == key)
+            .map(|(_, value)| value.clone())
+    })
 }
 
 /// Build the platform loader path for the child cargo process.
 ///
 /// Includes the rustc sysroot lib (for `librustc_driver.so` etc.), the
 /// libmathdx lib (when `LIBMATHDX_PATH` is set), and any existing
-/// loader path from the parent environment.
-fn apply_loader_path(cmd: &mut Command) {
+/// loader path from the parent environment or project config.
+fn apply_loader_path(cmd: &mut Command, ctx: &Context) {
     let host_target = backend::active_host_target();
     let loader_env = platform::loader_env_var(&host_target);
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -2062,11 +2368,14 @@ fn apply_loader_path(cmd: &mut Command) {
     {
         paths.push(libffi_bin_dir);
     }
-    if let Ok(libmathdx_path) = std::env::var("LIBMATHDX_PATH") {
+    if let Some(libmathdx_path) = inherited_or_configured_env(ctx, "LIBMATHDX_PATH") {
         paths.push(PathBuf::from(libmathdx_path).join("lib"));
     }
+    if let Some(existing) = inherited_or_configured_env(ctx, loader_env) {
+        paths.extend(std::env::split_paths(OsStr::new(&existing)));
+    }
     if !paths.is_empty()
-        && let Some(value) = platform::prepend_env_paths(loader_env, paths)
+        && let Some(value) = platform::join_env_paths(paths)
     {
         cmd.env(loader_env, value);
     }
@@ -2110,7 +2419,15 @@ fn artifact_stem(example: &str) -> String {
 /// previous run so we can verify the build produces fresh output.
 fn clean_generated_files(example_dir: &Path, example: &str) {
     let stem = artifact_stem(example);
-    for ext in &["ptx", "ll", "opt.ll", "ltoir", "cubin"] {
+    for ext in &[
+        "ptx",
+        "ll",
+        "opt.ll",
+        "ltoir",
+        "cubin",
+        "target",
+        "cubin.target",
+    ] {
         let file = example_dir.join(format!("{}.{}", stem, ext));
         if file.exists() {
             let _ = std::fs::remove_file(&file);
@@ -2371,37 +2688,6 @@ fn main() {
     println!("  cargo oxide run {}", name);
 }
 
-fn find_cuda_import_library() -> Option<PathBuf> {
-    if let Some(path) =
-        std::env::var_os("LIB").and_then(|paths| find_file_in_paths("cuda.lib", &paths))
-    {
-        return Some(path);
-    }
-
-    let mut roots = Vec::new();
-    for key in ["CUDA_PATH", "CUDA_HOME"] {
-        if let Ok(value) = std::env::var(key) {
-            roots.push(PathBuf::from(value));
-        }
-    }
-    for (key, value) in std::env::vars() {
-        if key.starts_with("CUDA_PATH_V") {
-            roots.push(PathBuf::from(value));
-        }
-    }
-    roots
-        .into_iter()
-        .map(|root| root.join("lib").join("x64").join("cuda.lib"))
-        .find(|candidate| candidate.is_file())
-}
-
-fn find_file_in_paths(name: &str, paths: &OsStr) -> Option<PathBuf> {
-    platform::split_env_paths(paths)
-        .into_iter()
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
 /// Locate an executable by native PATH scanning, then fallback absolute paths.
 fn find_executable(name: &str, fallback_paths: &[&str]) -> Option<PathBuf> {
     let host_target = backend::active_host_target();
@@ -2473,6 +2759,11 @@ fn executable_candidate_names(name: &str, pathext: Option<&OsStr>, target: &str)
         return names;
     }
 
+    let native_name = platform::executable_filename(name, target);
+    if native_name != name {
+        names.push(OsString::from(native_name));
+    }
+
     let pathext = pathext
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
@@ -2482,7 +2773,10 @@ fn executable_candidate_names(name: &str, pathext: Option<&OsStr>, target: &str)
         } else {
             format!(".{ext}")
         };
-        names.push(OsString::from(format!("{name}{ext}")));
+        let candidate = OsString::from(format!("{name}{ext}"));
+        if !names.contains(&candidate) {
+            names.push(candidate);
+        }
     }
     names
 }
@@ -2491,12 +2785,34 @@ fn executable_candidate_names(name: &str, pathext: Option<&OsStr>, target: &str)
 mod tests {
     use super::*;
     use std::ffi::OsStr;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn command_env(cmd: &Command, key: &str) -> Option<String> {
         cmd.get_envs()
             .find(|(name, _)| *name == OsStr::new(key))
             .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    fn decoded_rustflags(encoded: &str) -> Vec<&str> {
+        encoded.split(ENCODED_RUSTFLAGS_SEPARATOR).collect()
+    }
+
+    fn has_codegen_env_fingerprint(flags: &[&str]) -> bool {
+        flags.windows(2).any(|pair| {
+            pair[0] == "--cfg"
+                && pair[1].starts_with("cuda_oxide_internal_codegen_env=\"")
+                && pair[1].ends_with('"')
+        })
+    }
+
+    fn test_context(config: OxideConfig) -> Context {
+        Context {
+            workspace_root: PathBuf::from("/tmp/cargo-oxide-test-workspace"),
+            codegen_crate: PathBuf::from("/tmp/cargo-oxide-test-codegen"),
+            examples_dir: PathBuf::from("/tmp/cargo-oxide-test-examples"),
+            backend_so: PathBuf::from("/tmp/backend path/librustc_codegen_cuda.so"),
+            is_workspace: false,
+            config,
+        }
     }
 
     #[test]
@@ -2506,138 +2822,449 @@ mod tests {
     }
 
     #[test]
-    fn build_rustflags_encodes_backend_path_with_spaces() {
-        let encoded = build_encoded_rustflags_with_existing(
-            Path::new(r"C:\Program Files\cuda oxide\rustc_codegen_cuda.dll"),
+    fn generated_file_cleanup_preserves_ltoir_cubin_cache() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cuda_oxide_clean_cache_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for extension in ["ptx", "ll", "ltoir", "cubin", "target"] {
+            std::fs::write(root.join(format!("my_kernel.{extension}")), b"stale").unwrap();
+        }
+        let cached_cubin =
+            root.join(".oxide-artifacts/ltoir-cubin-cache/v1/entries/key/image.cubin");
+        std::fs::create_dir_all(cached_cubin.parent().unwrap()).unwrap();
+        std::fs::write(&cached_cubin, b"persistent cache entry").unwrap();
+
+        clean_generated_files(&root, "my-kernel");
+
+        for extension in ["ptx", "ll", "ltoir", "cubin", "target"] {
+            assert!(!root.join(format!("my_kernel.{extension}")).exists());
+        }
+        assert_eq!(
+            std::fs::read(&cached_cubin).unwrap(),
+            b"persistent cache entry"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn encoded_rustflags_preserve_inherited_flags_but_required_flags_win() {
+        let rustflags = build_encoded_rustflags_with_existing(
+            Path::new("/tmp/librustc_codegen_cuda.so"),
             false,
-            Some("-C\x1ftarget-cpu=native"),
+            &[],
+            &[],
+            Some(
+                "-Lnative=/nix/store/cuda-cudart/lib\u{1f}-Copt-level=0\u{1f}-Zcodegen-backend=llvm",
+            ),
             Some("-L native=/nix/store/cuda-cudart/lib"),
         );
-        let flags: Vec<_> = encoded.split(RUSTFLAGS_SEPARATOR).collect();
+        let flags = decoded_rustflags(&rustflags);
 
-        assert_eq!(flags[0], "-Z");
+        assert_eq!(flags[0], "-Lnative=/nix/store/cuda-cudart/lib");
+        assert!(flags.contains(&"-Copt-level=0"));
+        assert!(flags.contains(&"-Zcodegen-backend=llvm"));
         assert_eq!(
-            flags[1],
-            r"codegen-backend=C:\Program Files\cuda oxide\rustc_codegen_cuda.dll"
+            &flags[flags.len() - 5..],
+            [
+                "-Zcodegen-backend=/tmp/librustc_codegen_cuda.so",
+                "-Copt-level=3",
+                "-Cdebug-assertions=off",
+                "-Zmir-enable-passes=-JumpThreading",
+                "-Csymbol-mangling-version=v0",
+            ]
         );
-        assert!(flags.contains(&"opt-level=3"));
-
-        let encoded_user_pos = flags
-            .iter()
-            .position(|flag| *flag == "target-cpu=native")
-            .unwrap();
-        let rustflags_user_pos = flags
-            .iter()
-            .position(|flag| *flag == "native=/nix/store/cuda-cudart/lib")
-            .unwrap();
-        assert!(encoded_user_pos < rustflags_user_pos);
+        assert!(!flags.contains(&"native=/nix/store/cuda-cudart/lib"));
     }
 
     #[test]
-    fn build_rustflags_ignores_empty_existing_flags_and_adds_debug() {
-        let encoded = build_encoded_rustflags_with_existing(
-            Path::new("/tmp/librustc_codegen_cuda.so"),
-            true,
-            Some(""),
-            Some(""),
+    fn encoded_rustflags_preserve_configured_flag_boundaries_and_spaces() {
+        let rustflags = build_encoded_rustflags_with_existing(
+            Path::new("/tmp/backend path/librustc_codegen_cuda.so"),
+            false,
+            &["--cfg".to_string(), "model=\"alpha beta\"".to_string()],
+            &[],
+            None,
+            Some("-L native=/nix/store/cuda-cudart/lib"),
         );
-        let flags: Vec<_> = encoded.split(RUSTFLAGS_SEPARATOR).collect();
-
-        assert!(flags.contains(&"debuginfo=2"));
-        assert!(!encoded.ends_with(RUSTFLAGS_SEPARATOR));
-    }
-
-    #[test]
-    fn apply_codegen_rustflags_sets_encoded_and_removes_rustflags() {
-        let mut cmd = Command::new("cargo");
-        cmd.env("RUSTFLAGS", "-Awarnings");
-
-        apply_codegen_rustflags(&mut cmd, Path::new("/tmp/librustc_codegen_cuda.so"), false);
+        let flags = decoded_rustflags(&rustflags);
 
         assert!(
-            command_env(&cmd, "CARGO_ENCODED_RUSTFLAGS")
+            flags
+                .windows(2)
+                .any(|pair| pair == ["--cfg", "model=\"alpha beta\""])
+        );
+        assert_eq!(&flags[2..4], ["-L", "native=/nix/store/cuda-cudart/lib"]);
+        assert_eq!(
+            flags[flags.len() - 5],
+            "-Zcodegen-backend=/tmp/backend path/librustc_codegen_cuda.so"
+        );
+    }
+
+    #[test]
+    fn encoded_rustflags_ignore_empty_existing_flags() {
+        let rustflags = build_encoded_rustflags_with_existing(
+            Path::new("/tmp/librustc_codegen_cuda.so"),
+            true,
+            &[],
+            &[],
+            None,
+            Some(""),
+        );
+        let flags = decoded_rustflags(&rustflags);
+
+        assert!(flags.contains(&"-Cdebuginfo=2"));
+        assert!(!flags.contains(&""));
+    }
+
+    #[test]
+    fn project_config_parser_loads_backend_arch_flags_and_env() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargo_oxide_config_test_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let cargo_dir = root.join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        std::fs::write(
+            cargo_dir.join("cuda-oxide.toml"),
+            r#"
+backend = "../backend/librustc_codegen_cuda.so"
+default-arch = "sm_90"
+extra-rustflags = ["--cfg", "model=\"alpha beta\""]
+
+[env]
+MY_BUILD_FLAG = "configured"
+"#,
+        )
+        .unwrap();
+
+        let config = load_oxide_config(&root);
+        assert_eq!(
+            config.backend,
+            Some(cargo_dir.join("../backend/librustc_codegen_cuda.so"))
+        );
+        assert_eq!(config.default_arch.as_deref(), Some("sm_90"));
+        assert_eq!(config.extra_rustflags, ["--cfg", "model=\"alpha beta\""]);
+        assert_eq!(
+            config.env,
+            vec![("MY_BUILD_FLAG".to_string(), "configured".to_string())]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn passthrough_command_preserves_argv_and_cli_overrides_config_defaults() {
+        let config = OxideConfig {
+            extra_rustflags: vec!["--cfg".to_string(), "from_config".to_string()],
+            env: vec![
+                ("CARGO_TARGET_DIR".to_string(), "config-target".to_string()),
+                (
+                    "CUDA_OXIDE_DEVICE_CODEGEN_CRATE".to_string(),
+                    "config_owner".to_string(),
+                ),
+                ("CUDA_OXIDE_VERBOSE".to_string(), "configured".to_string()),
+            ],
+            ..OxideConfig::default()
+        };
+        let ctx = test_context(config);
+        let device_cfgs = vec!["model=\"alpha beta\"".to_string()];
+        let opts = CargoPassthroughOptions {
+            verbose: true,
+            emit_nvvm_ir: false,
+            arch: Some("sm_90"),
+            features: Some("wrapper_feature"),
+            cargo_target_dir: Some(Path::new("cli-target")),
+            device_codegen_crate: Some("gpu-kernels, math_gpu"),
+            device_cfgs: &device_cfgs,
+            no_fmad: false,
+        };
+        let cargo_args = vec![
+            "-p".to_string(),
+            "gpu-app".to_string(),
+            "--".to_string(),
+            "--nocapture".to_string(),
+        ];
+
+        let cmd = cargo_passthrough_command(&ctx, "test", &opts, &cargo_args).unwrap();
+        assert_eq!(
+            cmd.get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "test",
+                "--features",
+                "wrapper_feature",
+                "-p",
+                "gpu-app",
+                "--",
+                "--nocapture",
+            ]
+        );
+        assert_eq!(
+            command_env(&cmd, "CARGO_TARGET_DIR").as_deref(),
+            Some("cli-target")
+        );
+        assert_eq!(
+            command_env(&cmd, "CUDA_OXIDE_DEVICE_CODEGEN_CRATE").as_deref(),
+            Some("gpu_kernels,math_gpu")
+        );
+        assert_eq!(
+            command_env(&cmd, "CUDA_OXIDE_TARGET").as_deref(),
+            Some("sm_90")
+        );
+        assert_eq!(
+            command_env(&cmd, "CUDA_OXIDE_VERBOSE").as_deref(),
+            Some("1")
+        );
+
+        let encoded = command_env(&cmd, "CARGO_ENCODED_RUSTFLAGS").unwrap();
+        let flags = decoded_rustflags(&encoded);
+        assert!(
+            flags
+                .windows(2)
+                .any(|pair| pair == ["--cfg", "from_config"])
+        );
+        assert!(
+            flags
+                .windows(2)
+                .any(|pair| pair == ["--cfg", "model=\"alpha beta\""])
+        );
+        assert!(has_codegen_env_fingerprint(&flags));
+        assert!(
+            cmd.get_envs()
+                .any(|(key, value)| key == OsStr::new("RUSTFLAGS") && value.is_none())
+        );
+    }
+
+    #[test]
+    fn passthrough_command_accepts_empty_cargo_args() {
+        let ctx = test_context(OxideConfig::default());
+        let opts = CargoPassthroughOptions {
+            verbose: false,
+            emit_nvvm_ir: false,
+            arch: None,
+            features: None,
+            cargo_target_dir: None,
+            device_codegen_crate: None,
+            device_cfgs: &[],
+            no_fmad: false,
+        };
+
+        let cmd = cargo_passthrough_command(&ctx, "test", &opts, &[]).unwrap();
+        assert_eq!(
+            cmd.get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["test"]
+        );
+    }
+
+    #[test]
+    fn owner_filter_resolution_is_normalized_and_has_explicit_precedence() {
+        assert_eq!(
+            resolve_device_codegen_crates(None, None, Some("gpu-kernels, math_gpu"))
                 .unwrap()
-                .contains("codegen-backend=/tmp/librustc_codegen_cuda.so")
-        );
-        assert_eq!(command_env(&cmd, "RUSTFLAGS"), None);
-    }
-
-    #[test]
-    fn find_executable_windows_scans_pathext_and_explicit_suffixes() {
-        let dir = tempdir("cargo-oxide-win-path");
-        for name in ["cuda-gdb.exe", "nvcc.exe", "llc.exe"] {
-            std::fs::write(dir.join(name), b"").unwrap();
-        }
-        let path_env = std::env::join_paths([dir.as_os_str()]).unwrap();
-        let pathext = OsStr::new(".exe;.cmd");
-        let target = "x86_64-pc-windows-msvc";
-
-        assert_eq!(
-            find_executable_in_path("cuda-gdb.exe", &path_env, Some(pathext), target),
-            Some(dir.join("cuda-gdb.exe"))
+                .as_deref(),
+            Some("gpu_kernels,math_gpu"),
         );
         assert_eq!(
-            find_executable_in_path("nvcc.exe", &path_env, Some(pathext), target),
-            Some(dir.join("nvcc.exe"))
+            resolve_device_codegen_crates(None, Some("parent-owner"), Some("config-owner"))
+                .unwrap()
+                .as_deref(),
+            Some("parent_owner"),
         );
-        assert_eq!(
-            find_executable_in_path("llc.exe", &path_env, Some(pathext), target),
-            Some(dir.join("llc.exe"))
-        );
-        assert_eq!(
-            find_executable_in_path("nvcc", &path_env, Some(pathext), target),
-            Some(dir.join("nvcc.exe"))
-        );
-        assert_eq!(
-            find_executable_in_path("llc", &path_env, Some(pathext), target),
-            Some(dir.join("llc.exe"))
+        assert!(
+            resolve_device_codegen_crates(Some(""), Some("parent-owner"), Some("config-owner"))
+                .is_err()
         );
     }
 
     #[test]
-    fn find_executable_linux_scans_names_without_suffix() {
-        let dir = tempdir("cargo-oxide-linux-path");
-        std::fs::write(dir.join("llc"), b"").unwrap();
-        let path_env = std::env::join_paths([dir.as_os_str()]).unwrap();
-
-        assert_eq!(
-            find_executable_in_path("llc", &path_env, None, "x86_64-unknown-linux-gnu"),
-            Some(dir.join("llc"))
+    fn passthrough_fingerprint_tracks_output_affecting_settings() {
+        let ctx = test_context(OxideConfig::default());
+        let base = CargoPassthroughOptions {
+            verbose: false,
+            emit_nvvm_ir: false,
+            arch: Some("sm_80"),
+            features: None,
+            cargo_target_dir: None,
+            device_codegen_crate: None,
+            device_cfgs: &[],
+            no_fmad: false,
+        };
+        let inherited_env = BTreeMap::new();
+        let base_hash = passthrough_codegen_fingerprint_with_env(
+            &ctx,
+            &base,
+            None,
+            Some("sm_80"),
+            &inherited_env,
         );
-        assert_eq!(
-            find_executable_in_path("llc.exe", &path_env, None, "x86_64-unknown-linux-gnu"),
-            None
+
+        let arch = CargoPassthroughOptions {
+            arch: Some("sm_90"),
+            ..base
+        };
+        let emit = CargoPassthroughOptions {
+            emit_nvvm_ir: true,
+            ..base
+        };
+        let no_fmad = CargoPassthroughOptions {
+            no_fmad: true,
+            ..base
+        };
+        let configured_ptx = test_context(OxideConfig {
+            env: vec![(
+                "CUDA_OXIDE_PTX_DIR".to_string(),
+                "configured-ptx".to_string(),
+            )],
+            ..OxideConfig::default()
+        });
+
+        assert_ne!(
+            base_hash,
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &arch,
+                None,
+                Some("sm_90"),
+                &inherited_env,
+            )
+        );
+        assert_ne!(
+            base_hash,
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &emit,
+                None,
+                Some("sm_80"),
+                &inherited_env,
+            )
+        );
+        assert_ne!(
+            base_hash,
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &no_fmad,
+                None,
+                Some("sm_80"),
+                &inherited_env,
+            )
+        );
+        assert_ne!(
+            base_hash,
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &base,
+                Some("gpu_kernel"),
+                Some("sm_80"),
+                &inherited_env,
+            )
+        );
+        assert_ne!(
+            base_hash,
+            passthrough_codegen_fingerprint_with_env(
+                &configured_ptx,
+                &base,
+                None,
+                Some("sm_80"),
+                &inherited_env,
+            )
         );
     }
 
     #[test]
-    fn nvvm_compute_arch_normalizes_all_accepted_forms() {
+    fn passthrough_fingerprint_tracks_backend_rebuild_at_same_path() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargo_oxide_backend_fingerprint_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = root.join("librustc_codegen_cuda.so");
+        std::fs::write(&backend, b"first").unwrap();
+
+        let mut ctx = test_context(OxideConfig::default());
+        ctx.backend_so = backend.clone();
+        let opts = CargoPassthroughOptions {
+            verbose: false,
+            emit_nvvm_ir: false,
+            arch: None,
+            features: None,
+            cargo_target_dir: None,
+            device_codegen_crate: None,
+            device_cfgs: &[],
+            no_fmad: false,
+        };
+        let inherited_env = BTreeMap::new();
+        let before =
+            passthrough_codegen_fingerprint_with_env(&ctx, &opts, None, None, &inherited_env);
+        std::fs::write(&backend, b"second-build-is-larger").unwrap();
+        let after =
+            passthrough_codegen_fingerprint_with_env(&ctx, &opts, None, None, &inherited_env);
+
+        assert_ne!(before, after);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owner_filter_rejects_empty_or_invalid_entries() {
+        assert_eq!(
+            normalize_device_codegen_crates("gpu-kernels, math_gpu").unwrap(),
+            "gpu_kernels,math_gpu"
+        );
+        assert!(normalize_device_codegen_crates("").is_err());
+        assert!(normalize_device_codegen_crates("   ").is_err());
+        assert!(normalize_device_codegen_crates("gpu,").is_err());
+        assert!(normalize_device_codegen_crates("gpu,not a crate").is_err());
+    }
+
+    #[test]
+    fn internal_ptx_directory_overrides_project_env_default() {
+        let ctx = test_context(OxideConfig {
+            env: vec![(
+                "CUDA_OXIDE_PTX_DIR".to_string(),
+                "configured-ptx".to_string(),
+            )],
+            ..OxideConfig::default()
+        });
+        let mut cmd = Command::new("cargo");
+        apply_common_codegen_env(&mut cmd, &ctx, false, false);
+        cmd.env("CUDA_OXIDE_PTX_DIR", "internal-ptx");
+        assert_eq!(
+            command_env(&cmd, "CUDA_OXIDE_PTX_DIR").as_deref(),
+            Some("internal-ptx")
+        );
+    }
+
+    #[test]
+    fn nvvm_arch_normalizes_all_accepted_forms() {
         // `sm_XX` is the form `--arch` and the rest of cargo-oxide use.
-        assert_eq!(nvvm_compute_arch("sm_120"), "compute_120");
-        assert_eq!(nvvm_compute_arch("sm_90"), "compute_90");
+        assert_eq!(parse_nvvm_arch("sm_120").unwrap().compute(), "compute_120");
+        assert_eq!(parse_nvvm_arch("sm_90").unwrap().compute(), "compute_90");
         // `compute_XX` passes through unchanged.
-        assert_eq!(nvvm_compute_arch("compute_100"), "compute_100");
+        assert_eq!(
+            parse_nvvm_arch("compute_100").unwrap().compute(),
+            "compute_100"
+        );
         // A bare capability is accepted too.
-        assert_eq!(nvvm_compute_arch("120"), "compute_120");
-    }
-
-    #[test]
-    fn compute_capability_reads_base_through_variants() {
-        // Plain capabilities parse, so the issue #98 floor hint can fire.
-        assert_eq!(compute_capability("compute_90"), Some(90));
-        assert_eq!(compute_capability("compute_100"), Some(100));
-        assert_eq!(compute_capability("compute_120"), Some(120));
-        // Architecture variants resolve to their base capability, so a pre-Blackwell
-        // variant like compute_90a still trips the floor hint.
-        assert_eq!(compute_capability("compute_90a"), Some(90));
-        assert_eq!(compute_capability("compute_100a"), Some(100));
-        assert_eq!(compute_capability("compute_120f"), Some(120));
-        // The floor itself: below 100 is hinted, 100+ is not.
-        assert!(compute_capability("compute_90a").unwrap() < NVVM_OPAQUE_PTR_MIN_CC);
-        assert!(compute_capability("compute_100").unwrap() >= NVVM_OPAQUE_PTR_MIN_CC);
-        // A non-compute string or a missing capability yields no hint.
-        assert_eq!(compute_capability("sm_90"), None);
-        assert_eq!(compute_capability("compute_"), None);
+        assert_eq!(parse_nvvm_arch("120").unwrap().compute(), "compute_120");
+        assert!(parse_nvvm_arch("sm_90x").is_err());
     }
 
     #[test]
@@ -2714,10 +3341,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_debug_output_mode_forwards_detected_gpu_hint() {
+    fn debug_output_mode_forwards_detected_gpu_hint() {
         let mut cmd = Command::new("cargo");
 
-        apply_debug_output_mode(&mut cmd, None, Some("sm_120a"));
+        apply_output_mode(&mut cmd, false, None);
+        apply_device_arch_hint(&mut cmd, None, Some("sm_120a"));
 
         assert_eq!(
             command_env(&cmd, "CUDA_OXIDE_DEVICE_ARCH").as_deref(),
@@ -2728,10 +3356,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_debug_output_mode_honors_explicit_arch_override() {
+    fn debug_output_mode_honors_explicit_arch_override() {
         let mut cmd = Command::new("cargo");
 
-        apply_debug_output_mode(&mut cmd, Some("sm_90"), Some("sm_120a"));
+        apply_output_mode(&mut cmd, false, Some("sm_90"));
+        apply_device_arch_hint(&mut cmd, Some("sm_90"), Some("sm_120a"));
 
         assert_eq!(
             command_env(&cmd, "CUDA_OXIDE_TARGET").as_deref(),
@@ -2880,20 +3509,5 @@ mod tests {
             std::env::remove_var("CUDA_OXIDE_TARGET");
         }
         assert_eq!(result, None);
-    }
-
-    fn tempdir(prefix: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "{}-{}-{}",
-            prefix,
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        path
     }
 }

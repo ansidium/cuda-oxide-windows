@@ -16,14 +16,16 @@ use pliron::{
     basic_block::BasicBlock,
     builtin::{
         attributes::{FPDoubleAttr, FPSingleAttr, IntegerAttr},
-        op_interfaces::SymbolOpInterface,
+        op_interfaces::{BranchOpInterface, SymbolOpInterface},
         type_interfaces::FunctionTypeInterface,
+        types::IntegerType,
     },
     context::Ptr,
     linked_list::ContainsLinkedList,
     location::Located,
     op::Op,
     operation::Operation,
+    printable::Printable,
     r#type::Typed,
     value::Value,
 };
@@ -31,7 +33,7 @@ use pliron::{
 use crate::{
     attributes::FPHalfAttr,
     ops::{self, FuncOp, GlobalOpExt},
-    types::FuncType,
+    types::{FuncType, PointerType},
 };
 
 use super::{
@@ -54,6 +56,15 @@ impl<'a> ModuleExportState<'a> {
         let name = global.get_symbol_name(self.ctx);
         let ty = global.get_type(self.ctx);
         let address_space = global.address_space(self.ctx);
+
+        // NVVM only permits module-scope variables in generic/global,
+        // shared, or constant memory. Local memory (address space 5) is for
+        // per-thread allocations, not LLVM globals.
+        if self.nvvm_ir_dialect.is_some() && !matches!(address_space, 0 | 1 | 3 | 4) {
+            return Err(format!(
+                "NVVM global `@{name}` uses unsupported address space {address_space}; expected generic (0), global (1), shared (3), or constant (4)"
+            ));
+        }
 
         // Check for external linkage (dynamic shared memory)
         let is_external = global
@@ -97,9 +108,68 @@ impl<'a> ModuleExportState<'a> {
             // Internal linkage: static storage in the global's address space.
             write!(output, "@{name} = addrspace({address_space}) global ").unwrap();
             self.export_type(ty, output)?;
-            writeln!(output, " zeroinitializer, align {alignment}").unwrap();
+            if let Some(hex) = global.initializer_hex(self.ctx) {
+                let bytes = decode_hex_initializer(&hex)?;
+                write!(output, " ").unwrap();
+                self.export_byte_initializer(ty, &bytes, output)?;
+                writeln!(output, ", align {alignment}").unwrap();
+            } else {
+                // NVVM forbids initialized shared variables. `undef` denotes
+                // uninitialized shared storage and is required by both legacy and
+                // modern NVVM IR. Keep the ordinary llc/PTX path's historical zero
+                // initializer for compatibility.
+                let initializer = if self.nvvm_ir_dialect.is_some() && address_space == 3 {
+                    "undef"
+                } else {
+                    "zeroinitializer"
+                };
+                writeln!(output, " {initializer}, align {alignment}").unwrap();
+            }
         }
 
+        Ok(())
+    }
+
+    /// Render an evaluated Rust allocation without interpreting its contents.
+    ///
+    /// The lowering boundary deliberately represents initialized globals as
+    /// `[N x i8]`. Escaping every byte keeps all bit patterns intact, including
+    /// NaN payloads, and makes Rust padding explicit without teaching this
+    /// exporter Rust's layout rules.
+    fn export_byte_initializer(
+        &self,
+        ty: pliron::r#type::TypeHandle,
+        bytes: &[u8],
+        output: &mut String,
+    ) -> Result<(), String> {
+        let ty_ref = ty.deref(self.ctx);
+        let array_ty = ty_ref
+            .downcast_ref::<crate::types::ArrayType>()
+            .ok_or_else(|| {
+                format!(
+                    "explicit global initializer requires `[N x i8]` storage, found `{}`",
+                    ty_ref.disp(self.ctx)
+                )
+            })?;
+        let elem_ty = array_ty.elem_type();
+        let elem_ref = elem_ty.deref(self.ctx);
+        let is_i8 = elem_ref
+            .downcast_ref::<IntegerType>()
+            .is_some_and(|int_ty| int_ty.width() == 8);
+        if !is_i8 || array_ty.size() != bytes.len() as u64 {
+            return Err(format!(
+                "explicit global initializer has {} bytes but storage type is `{}`; expected `[{} x i8]`",
+                bytes.len(),
+                ty_ref.disp(self.ctx),
+                bytes.len()
+            ));
+        }
+
+        write!(output, "c\"").unwrap();
+        for byte in bytes {
+            write!(output, "\\{byte:02X}").unwrap();
+        }
+        write!(output, "\"").unwrap();
         Ok(())
     }
 
@@ -126,20 +196,6 @@ impl<'a> ModuleExportState<'a> {
         let is_kernel = attrs
             .get::<pliron::builtin::attributes::StringAttr>(&kernel_key)
             .is_some();
-
-        // Track ALL kernels if backend requires annotations for every kernel
-        if is_kernel && self.track_all_kernels {
-            self.all_kernels.push(KernelInfo {
-                name: fixed_func_name.clone(),
-            });
-        }
-
-        // Track device function definitions (not declarations) for @llvm.used preservation
-        // in standalone device function compilation. Extern declarations are excluded
-        // because they're resolved at link time — only definitions need DCE protection.
-        if !is_kernel && has_device_prefix(&func_name) {
-            self.device_functions.push(fixed_func_name.clone());
-        }
 
         // Check for cluster dimension attributes (from #[cluster(x,y,z)])
         // These will be emitted as nvvm.annotations metadata
@@ -185,6 +241,22 @@ impl<'a> ModuleExportState<'a> {
         let func_ty = ft_ref
             .downcast_ref::<FuncType>()
             .ok_or("Not a function type")?;
+
+        self.function_types.insert(fixed_func_name.clone(), ft);
+
+        // Track ALL kernels if backend requires annotations for every kernel.
+        if is_kernel && self.track_all_kernels {
+            self.all_kernels.push(KernelInfo {
+                name: fixed_func_name.clone(),
+            });
+        }
+
+        // Track device function definitions (not declarations) for @llvm.used
+        // preservation in standalone device-function compilation.
+        let is_declaration = func.get_operation().deref(self.ctx).regions().count() == 0;
+        if !is_declaration && !is_kernel && has_device_prefix(&func_name) {
+            self.device_functions.push(fixed_func_name.clone());
+        }
 
         let ret_ty = func_ty.result_type();
 
@@ -373,6 +445,11 @@ impl<'a> ModuleExportState<'a> {
                         } else if let Some(fp64_attr) = val_attr.downcast_ref::<FPDoubleAttr>() {
                             let float_val: f64 = fp64_attr.clone().into();
                             format_float_literal(float_val)
+                        } else if self.legacy_typed_pointers() {
+                            return Err(format!(
+                                "legacy LLVM 7 export cannot render constant attribute `{}`",
+                                val_attr.disp(self.ctx)
+                            ));
                         } else {
                             "0".to_string() // Fallback
                         };
@@ -389,10 +466,52 @@ impl<'a> ModuleExportState<'a> {
                     // later-printed block defines the address used by an
                     // earlier-printed block. The op-emit arm in `export_op`
                     // for AddressOfOp asserts this invariant.
-                    if let Some(address_of) = op_dyn.downcast_ref::<ops::AddressOfOp>() {
-                        let global_name = address_of.get_global_name(self.ctx);
+                    if !self.legacy_typed_pointers()
+                        && let Some(address_of) = op_dyn.downcast_ref::<ops::AddressOfOp>()
+                    {
+                        let symbol_name = address_of.get_global_name(self.ctx).to_string();
                         let res = op_ref.get_result(0);
-                        value_names.insert(res, format!("@{global_name}"));
+                        let result_type = res.get_type(self.ctx);
+                        let result_ref = result_type.deref(self.ctx);
+                        let result_pointer =
+                            result_ref.downcast_ref::<PointerType>().ok_or_else(|| {
+                                format!(
+                                    "addressof result is not a pointer: `{}`",
+                                    result_ref.disp(self.ctx)
+                                )
+                            })?;
+
+                        let exported_name = if let Some(info) =
+                            self.global_symbols.get(&symbol_name)
+                        {
+                            if result_pointer.address_space() != info.address_space {
+                                return Err(format!(
+                                    "addressof `@{symbol_name}` address-space mismatch: result is {}, global is {}",
+                                    result_pointer.address_space(),
+                                    info.address_space
+                                ));
+                            }
+                            symbol_name
+                        } else {
+                            let function_name = if symbol_name.starts_with("llvm_") {
+                                symbol_name.replace('_', ".")
+                            } else {
+                                strip_device_prefix(&symbol_name)
+                            };
+                            if !self.function_types.contains_key(&function_name) {
+                                return Err(format!(
+                                    "addressof references unknown symbol `@{symbol_name}`"
+                                ));
+                            }
+                            if result_pointer.address_space() != 0 {
+                                return Err(format!(
+                                    "function addressof `@{function_name}` must produce a program-address-space (0) pointer, got address space {}",
+                                    result_pointer.address_space()
+                                ));
+                            }
+                            function_name
+                        };
+                        value_names.insert(res, format!("@{exported_name}"));
                         continue;
                     }
 
@@ -406,6 +525,34 @@ impl<'a> ModuleExportState<'a> {
 
             // Build predecessor map for PHI generation
             let mut pred_map: PredecessorMap = FxHashMap::default();
+            let validate_edge = |source: Ptr<BasicBlock>, dest: Ptr<BasicBlock>, args: &[Value]| {
+                let expected: Vec<_> = dest.deref(self.ctx).arguments().collect();
+                let source_label = block_labels
+                    .get(&source)
+                    .map(String::as_str)
+                    .unwrap_or("<unknown>");
+                let dest_label = block_labels
+                    .get(&dest)
+                    .map(String::as_str)
+                    .unwrap_or("<unknown>");
+                if args.len() != expected.len() {
+                    return Err(format!(
+                        "predecessor `%{source_label}` supplies {} values to `%{dest_label}`, which expects {} block arguments",
+                        args.len(),
+                        expected.len()
+                    ));
+                }
+                for (index, (value, argument)) in args.iter().copied().zip(expected).enumerate() {
+                    if value.get_type(self.ctx) != argument.get_type(self.ctx) {
+                        return Err(format!(
+                            "predecessor `%{source_label}` value {index} has type `{}`, but `%{dest_label}` block argument has type `{}`",
+                            value.get_type(self.ctx).disp(self.ctx),
+                            argument.get_type(self.ctx).disp(self.ctx)
+                        ));
+                    }
+                }
+                Ok(())
+            };
             for block in func
                 .get_operation()
                 .deref(self.ctx)
@@ -418,27 +565,33 @@ impl<'a> ModuleExportState<'a> {
                     let term_obj = Operation::get_op_dyn(term, self.ctx);
                     let term_dyn = term_obj.as_ref();
 
-                    if term_dyn.downcast_ref::<ops::BrOp>().is_some() {
+                    if let Some(branch) = term_dyn.downcast_ref::<ops::BrOp>() {
                         // BrOp has 1 successor and all operands are passed to it
                         let dest = term.deref(self.ctx).successors().next().unwrap();
-                        let args: Vec<_> = term.deref(self.ctx).operands().collect();
+                        let args = branch.successor_operands(self.ctx, 0);
+                        validate_edge(block, dest, &args)?;
                         pred_map.entry(dest).or_default().push((block, args));
-                    } else if term_dyn.downcast_ref::<ops::CondBrOp>().is_some() {
+                    } else if let Some(branch) = term_dyn.downcast_ref::<ops::CondBrOp>() {
                         let succs: Vec<_> = term.deref(self.ctx).successors().collect();
                         let true_dest = succs[0];
                         let false_dest = succs[1];
-
-                        // Calculate split point for operands
-                        // [cond, true_args..., false_args...]
-                        let num_true = true_dest.deref(self.ctx).arguments().count();
-                        let num_false = false_dest.deref(self.ctx).arguments().count();
-
-                        let all_ops: Vec<_> = term.deref(self.ctx).operands().collect();
-                        if all_ops.len() >= 1 + num_true + num_false {
-                            let true_args = all_ops[1..=num_true].to_vec();
-                            let false_args =
-                                all_ops[1 + num_true..1 + num_true + num_false].to_vec();
-
+                        let true_args = branch.successor_operands(self.ctx, 0);
+                        let false_args = branch.successor_operands(self.ctx, 1);
+                        validate_edge(block, true_dest, &true_args)?;
+                        validate_edge(block, false_dest, &false_args)?;
+                        if true_dest == false_dest {
+                            if true_args != false_args {
+                                return Err(format!(
+                                    "conditional branch `%{}` reaches `%{}` on both edges with different forwarded values; LLVM PHIs cannot distinguish duplicate edges from one predecessor",
+                                    block_labels.get(&block).unwrap(),
+                                    block_labels.get(&true_dest).unwrap()
+                                ));
+                            }
+                            pred_map
+                                .entry(true_dest)
+                                .or_default()
+                                .push((block, true_args));
+                        } else {
                             pred_map
                                 .entry(true_dest)
                                 .or_default()
@@ -545,12 +698,10 @@ impl<'a> ModuleExportState<'a> {
                         let label = block_labels.get(pred_block).unwrap();
                         write!(output, ", %{label} ]").unwrap();
                     } else {
-                        write!(
-                            output,
-                            "[ undef, %{} ]",
+                        return Err(format!(
+                            "predecessor `%{}` does not supply block argument {arg_idx} for `%{label}`",
                             block_labels.get(pred_block).unwrap()
-                        )
-                        .unwrap();
+                        ));
                     }
                 }
                 writeln!(output).unwrap();
@@ -568,5 +719,27 @@ impl<'a> ModuleExportState<'a> {
             )?;
         }
         Ok(())
+    }
+}
+
+fn decode_hex_initializer(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err("global initializer hex string has odd length".to_string());
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks_exact(2) {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        bytes.push((hi << 4) | lo);
+    }
+    Ok(bytes)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!("invalid hex digit {:?}", byte as char)),
     }
 }
