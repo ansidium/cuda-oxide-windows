@@ -14,9 +14,9 @@ use dialect_mir::{
     ops::{MirConstructArrayOp, MirExtractFieldOp},
     types::MirArrayType,
 };
-use dialect_nvvm::ops::{MmaM16N8K16F32Bf16Op, MovmatrixTransB16Op};
+use dialect_nvvm::ops::{MmaM8N8K4F64Op, MmaM16N8K16F32Bf16Op, MovmatrixTransB16Op};
 use pliron::basic_block::BasicBlock;
-use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::input_err;
 use pliron::location::{Located, Location};
@@ -288,6 +288,176 @@ pub fn emit_mma_m16n8k16_f32_bf16(
         block_map,
         loc,
         "mma_m16n8k16_f32_bf16 call without target block",
+    )
+}
+
+/// Emit `mma_m8n8k4_f64`: Warp MMA with f64 accumulator and f64 inputs.
+///
+/// Args:
+/// - arg 0: `[f64; 2]` (lane-local C accumulator fragment)
+/// - arg 1: `f64` (lane-local A fragment)
+/// - arg 2: `f64` (lane-local B fragment)
+///
+/// Returns: `[f64; 2]` (lane-local D result fragment)
+#[allow(clippy::too_many_arguments)]
+pub fn emit_mma_m8n8k4_f64(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    if args.len() != 3 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "mma_m8n8k4_f64 expects 3 arguments (acc, a, b), got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let (acc, mut last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+
+    let f64_ty = FP64Type::get(ctx);
+    let acc_ty = acc.get_type(ctx);
+    let valid_acc = acc_ty
+        .deref(ctx)
+        .downcast_ref::<MirArrayType>()
+        .is_some_and(|array| {
+            array.size() == 2
+                && array
+                    .element_type()
+                    .deref(ctx)
+                    .downcast_ref::<FP64Type>()
+                    .is_some()
+        });
+    if !valid_acc {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(
+                "mma_m8n8k4_f64 accumulator must have type [f64; 2]".to_string()
+            )
+        );
+    }
+
+    let mut accumulator_registers = Vec::with_capacity(2);
+    for index in 0..2 {
+        let extract = Operation::new(
+            ctx,
+            MirExtractFieldOp::get_concrete_op_info(),
+            vec![f64_ty.into()],
+            vec![acc],
+            vec![],
+            0,
+        );
+        extract.deref_mut(ctx).set_loc(loc.clone());
+        MirExtractFieldOp::new(extract).set_attr_index(ctx, FieldIndexAttr(index));
+        if let Some(previous) = last_op {
+            extract.insert_after(ctx, previous);
+        } else {
+            extract.insert_at_front(block_ptr, ctx);
+        }
+        last_op = Some(extract);
+        accumulator_registers.push(extract.deref(ctx).get_result(0));
+    }
+
+    let (a, last_op_after) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[1],
+        value_map,
+        block_ptr,
+        last_op,
+        loc.clone(),
+    )?;
+    last_op = last_op_after;
+
+    let (b, last_op_after) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[2],
+        value_map,
+        block_ptr,
+        last_op,
+        loc.clone(),
+    )?;
+    last_op = last_op_after;
+
+    for (name, value) in [("A", a), ("B", b)] {
+        if value
+            .get_type(ctx)
+            .deref(ctx)
+            .downcast_ref::<FP64Type>()
+            .is_none()
+        {
+            return input_err!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "mma_m8n8k4_f64 {name} fragment must have type f64"
+                ))
+            );
+        }
+    }
+
+    let operands = vec![accumulator_registers[0], accumulator_registers[1], a, b];
+
+    let mma_op = Operation::new(
+        ctx,
+        MmaM8N8K4F64Op::get_concrete_op_info(),
+        vec![f64_ty.into(), f64_ty.into()],
+        operands,
+        vec![],
+        0,
+    );
+    mma_op.deref_mut(ctx).set_loc(loc.clone());
+
+    if let Some(prev) = last_op {
+        mma_op.insert_after(ctx, prev);
+    } else {
+        mma_op.insert_at_front(block_ptr, ctx);
+    }
+
+    let results: Vec<Value> = (0..2)
+        .map(|index| mma_op.deref(ctx).get_result(index))
+        .collect();
+    let array_ty = MirArrayType::get(ctx, f64_ty.into(), 2);
+    let array = Operation::new(
+        ctx,
+        MirConstructArrayOp::get_concrete_op_info(),
+        vec![array_ty.into()],
+        results,
+        vec![],
+        0,
+    );
+    array.deref_mut(ctx).set_loc(loc.clone());
+    array.insert_after(ctx, mma_op);
+    let array_result = array.deref(ctx).get_result(0);
+
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        array_result,
+        target,
+        block_ptr,
+        array,
+        value_map,
+        block_map,
+        loc,
+        "mma_m8n8k4_f64 call without target block",
     )
 }
 

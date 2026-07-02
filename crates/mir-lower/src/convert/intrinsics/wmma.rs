@@ -8,7 +8,7 @@
 use crate::convert::intrinsics::common::*;
 use llvm_export::ops::{self as llvm, AsmKind, InlineAsmOpExt};
 use llvm_export::types as llvm_types;
-use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
 use pliron::irbuild::inserter::Inserter;
@@ -98,6 +98,47 @@ pub(crate) fn convert_mma_m16n8k16_f32_bf16(
     for index in 0..4 {
         let extract = llvm::ExtractValueOp::new(ctx, aggregate, vec![index as u32])
             .map_err(|error| pliron::input_error_noloc!("{}", error))?;
+        rewriter.insert_operation(ctx, extract.get_operation());
+        results.push(extract.get_operation().deref(ctx).get_result(0));
+    }
+    rewriter.replace_operation_with_values(ctx, op, results);
+    Ok(())
+}
+
+/// Convert `mma_m8n8k4_f64` to inline PTX assembly.
+///
+/// The operation consumes the two C registers plus A and B directly, and
+/// returns both D fragment registers. No pointer or memory operand is involved.
+pub(crate) fn convert_mma_m8n8k4_f64(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 4 {
+        return pliron::input_err_noloc!(
+            "mma_m8n8k4_f64 requires 4 f64 operands (c0, c1, a, b), got {}",
+            operands.len()
+        );
+    }
+
+    let f64_ty = FP64Type::get(ctx);
+    let result_ty = llvm_types::StructType::get_unnamed(ctx, vec![f64_ty.into(), f64_ty.into()]);
+    let inline_asm = inline_asm_convergent(
+        ctx,
+        rewriter,
+        result_ty.into(),
+        operands,
+        "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 \
+         {$0, $1}, {$4}, {$5}, {$2, $3};",
+        "=d,=d,d,d,d,d",
+    );
+
+    let aggregate = inline_asm.deref(ctx).get_result(0);
+    let mut results = Vec::with_capacity(2);
+    for index in 0..2 {
+        let extract = llvm::ExtractValueOp::new(ctx, aggregate, vec![index])?;
         rewriter.insert_operation(ctx, extract.get_operation());
         results.push(extract.get_operation().deref(ctx).get_result(0));
     }
