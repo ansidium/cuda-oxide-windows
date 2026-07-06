@@ -62,7 +62,7 @@
 //! fingerprint file defers to the mtime checks (a `cargo-oxide` reinstall or
 //! `rm -rf ~/.cargo/cuda-oxide` heals those).
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
@@ -70,6 +70,8 @@ use std::time::SystemTime;
 use crate::platform;
 
 const BACKEND_CRATE_NAME: &str = "rustc_codegen_cuda";
+const WINDOWS_MSVC_LINKER_ENV: &str = "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER";
+const WINDOWS_MSVC_LLD_LINKER: &str = "lld-link";
 
 /// Finds the workspace root by walking up from CWD looking for Cargo.toml
 /// with a `crates/rustc-codegen-cuda` directory.
@@ -184,7 +186,7 @@ pub fn find_or_build_backend(workspace_root: &Path, configured_backend: Option<&
 ///    so the caller can report the configured-but-absent path.
 /// 3. Packaged backend next to the running `cargo-oxide` executable.
 /// 4. Local repo host build path
-///    (`crates/rustc-codegen-cuda/target/<host>/debug/...`).
+///    (`crates/rustc-codegen-cuda/target/<host>/<profile>/...`).
 /// 5. Cache path at `~/.cargo/cuda-oxide/<platform filename>`.
 ///
 /// `cargo oxide doctor` uses this so that a diagnostic run never triggers a
@@ -439,9 +441,11 @@ fn backend_build_command(
     let codegen_crate = absolute_path(codegen_crate);
     let target_dir = codegen_crate.join("target");
     let mut cmd = Command::new("cargo");
+    cmd.args(["build", "--lib"]);
+    if backend_build_profile(host_target) == "release" {
+        cmd.arg("--release");
+    }
     cmd.args([
-        "build",
-        "--lib",
         "--target",
         "host-tuple",
         "--message-format=json-render-diagnostics",
@@ -458,6 +462,8 @@ fn backend_build_command(
     cmd.env_remove("CARGO_BUILD_TARGET");
 
     if platform::is_windows_target(host_target) {
+        prefer_windows_lld_linker_for_backend(&mut cmd);
+
         let mut loader_paths = Vec::new();
         if let Some(libffi) = find_windows_libffi_paths() {
             if let Some(value) = platform::prepend_env_paths("LIB", vec![libffi.lib_dir]) {
@@ -494,6 +500,40 @@ fn backend_build_command(
     cmd
 }
 
+fn backend_build_profile(host_target: &str) -> &'static str {
+    if platform::is_windows_target(host_target) {
+        // The Windows dylib links a large rustc plugin graph. Debug builds now
+        // exceed MSVC/lld-link object/export limits; release keeps the backend
+        // below those linker ceilings.
+        "release"
+    } else {
+        "debug"
+    }
+}
+
+fn prefer_windows_lld_linker_for_backend(cmd: &mut Command) {
+    if std::env::var_os(WINDOWS_MSVC_LINKER_ENV).is_some() {
+        return;
+    }
+    if windows_executable_on_path(WINDOWS_MSVC_LLD_LINKER) {
+        cmd.env(WINDOWS_MSVC_LINKER_ENV, WINDOWS_MSVC_LLD_LINKER);
+    }
+}
+
+fn windows_executable_on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .as_deref()
+        .is_some_and(|paths| windows_executable_in_path(name, paths))
+}
+
+fn windows_executable_in_path(name: &str, paths: &OsStr) -> bool {
+    let has_extension = Path::new(name).extension().is_some();
+    std::env::split_paths(paths).any(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file() || (!has_extension && dir.join(format!("{name}.exe")).is_file())
+    })
+}
+
 fn absolute_path(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -514,9 +554,11 @@ fn backend_dylib_filename() -> String {
 
 fn backend_so_path_candidate(codegen_crate: &Path) -> PathBuf {
     let target_dir = codegen_crate.join("target");
+    let host_target = active_host_target();
+    let profile = backend_build_profile(&host_target);
     let profile_dir = active_host_triple()
-        .map(|host| target_dir.join(host).join("debug"))
-        .unwrap_or_else(|| target_dir.join("debug"));
+        .map(|host| target_dir.join(host).join(profile))
+        .unwrap_or_else(|| target_dir.join(profile));
     profile_dir.join(backend_dylib_filename())
 }
 
@@ -887,6 +929,33 @@ mod tests {
             args.iter()
                 .any(|arg| arg == "--message-format=json-render-diagnostics")
         );
+        assert!(!args.iter().any(|arg| arg == "--release"));
+    }
+
+    #[test]
+    fn windows_backend_build_command_uses_release_profile() {
+        let root = tempdir();
+        let codegen = root.join("codegen");
+        let command = backend_build_command(&codegen, None, "x86_64-pc-windows-msvc");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(args.iter().any(|arg| arg == "--release"));
+    }
+
+    #[test]
+    fn windows_executable_lookup_accepts_exe_suffix_from_path() {
+        let root = tempdir();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("lld-link.exe"), "").unwrap();
+        let paths = std::env::join_paths([bin]).unwrap();
+
+        assert!(windows_executable_in_path("lld-link", &paths));
+        assert!(windows_executable_in_path("lld-link.exe", &paths));
+        assert!(!windows_executable_in_path("link", &paths));
     }
 
     #[test]
