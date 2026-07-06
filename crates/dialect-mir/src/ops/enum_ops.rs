@@ -229,6 +229,92 @@ impl Verify for MirGetDiscriminantOp {
 }
 
 // ============================================================================
+// MirSetDiscriminantOp
+// ============================================================================
+
+/// MIR set discriminant operation.
+///
+/// Writes an enum's discriminant (tag) to the memory location pointed to by
+/// the first operand. This is the device-side lowering of MIR's
+/// `StatementKind::SetDiscriminant`.
+///
+/// # Operands
+///
+/// ```text
+/// | Name            | Type                              |
+/// |-----------------|-----------------------------------|
+/// | `enum_ptr`      | Pointer to MirEnumType            |
+/// | `discriminant`  | IntegerType (enum's discriminant) |
+/// ```
+///
+/// # Results
+///
+/// None.
+///
+/// # Verification
+///
+/// - First operand must be a `MirPtrType` pointing to a `MirEnumType`.
+/// - Second operand type must match the enum's discriminant type.
+#[pliron_op(
+    name = "mir.set_discriminant",
+    format,
+    interfaces = [NOpdsInterface<2>, NResultsInterface<0>]
+)]
+pub struct MirSetDiscriminantOp;
+
+impl MirSetDiscriminantOp {
+    /// Create a new MirSetDiscriminantOp wrapper.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        MirSetDiscriminantOp { op }
+    }
+}
+
+impl Verify for MirSetDiscriminantOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        let op = &*self.get_operation().deref(ctx);
+
+        // First operand must be a pointer to an enum type; second operand
+        // must match the enum's discriminant type. All type checks are kept
+        // inside the borrow of the pointer pointee so the returned refs do
+        // not outlive the deref guard.
+        let ptr_operand = op.get_operand(0);
+        let ptr_ty = ptr_operand.get_type(ctx);
+        let ptr_ty_obj = ptr_ty.deref(ctx);
+
+        let discr_operand = op.get_operand(1);
+        let discr_ty = discr_operand.get_type(ctx);
+
+        match ptr_ty_obj.downcast_ref::<crate::types::MirPtrType>() {
+            Some(ptr_type) => {
+                let pointee = ptr_type.pointee.deref(ctx);
+                match pointee.downcast_ref::<MirEnumType>() {
+                    Some(enum_ty) => {
+                        let expected_discr_ty = enum_ty.discriminant_type();
+                        if discr_ty != expected_discr_ty {
+                            return verify_err!(
+                                op.loc(),
+                                "MirSetDiscriminantOp discriminant type must match enum discriminant type. Expected: {}, Actual: {}",
+                                expected_discr_ty.disp(ctx),
+                                discr_ty.disp(ctx)
+                            );
+                        }
+                        Ok(())
+                    }
+                    None => verify_err!(
+                        op.loc(),
+                        "MirSetDiscriminantOp pointer must point to an enum type"
+                    ),
+                }
+            }
+            None => verify_err!(
+                op.loc(),
+                "MirSetDiscriminantOp first operand must be a pointer type"
+            ),
+        }
+    }
+}
+
+// ============================================================================
 // MirEnumPayloadOp
 // ============================================================================
 
@@ -369,5 +455,6 @@ impl Verify for MirEnumPayloadOp {
 pub fn register(ctx: &mut Context) {
     MirConstructEnumOp::register(ctx);
     MirGetDiscriminantOp::register(ctx);
+    MirSetDiscriminantOp::register(ctx);
     MirEnumPayloadOp::register(ctx);
 }

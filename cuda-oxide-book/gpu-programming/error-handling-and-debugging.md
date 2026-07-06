@@ -93,7 +93,9 @@ A common workflow for catching device-side errors:
 
 ```rust
 // Launch kernel
-module.vecadd(&stream, config, &a, &b, &mut c).expect("Launch failed");
+// SAFETY: config matches vecadd's 1D indexing and all buffer bounds.
+unsafe { module.vecadd(&stream, config, &a, &b, &mut c) }
+    .expect("Launch failed");
 
 // Synchronize and check for traps
 stream.synchronize().expect("Kernel trapped -- check gpu_assert! conditions");
@@ -111,7 +113,8 @@ The synchronous launch path returns
 `Result<(), DriverError>`. The `DriverError` wraps a CUDA driver result code:
 
 ```rust
-match module.vecadd(&stream, config, &a, &b, &mut c) {
+// SAFETY: config matches vecadd's 1D indexing and all buffer bounds.
+match unsafe { module.vecadd(&stream, config, &a, &b, &mut c) } {
     Ok(()) => { /* launched successfully */ }
     Err(e) => eprintln!("Launch failed: {e}"),
 }
@@ -312,6 +315,12 @@ frame; select the kernel frame (`frame 1`) to inspect kernel locals.
 4. Inspect threads: `cuda thread`, `cuda block`, `cuda warp`
 5. Print variables: `print idx`, `print *c_elem`
 
+`cargo oxide debug` selects the executable from Cargo's build artifact
+metadata instead of assuming `target/release/<example>`. That keeps debugging
+working with custom binary names, `package.default-run`, configured target
+directories, host target triples, and virtual workspaces. Use `--bin <name>`
+when a package has multiple binaries and no unambiguous default.
+
 For programmatic breakpoints, use `debug::breakpoint()` in your kernel code.
 When cuda-gdb hits the `brkpt` instruction, it pauses execution and lets you
 inspect the GPU state.
@@ -320,6 +329,55 @@ inspect the GPU state.
 `debug::breakpoint()` will **crash** the kernel if no debugger is attached.
 Guard it with a compile-time flag or only use it during debugging sessions.
 :::
+
+## `cargo oxide sanitize` -- Compute Sanitizer
+
+For memory and synchronization correctness checks, run the same build path under
+NVIDIA Compute Sanitizer:
+
+```bash
+cargo oxide sanitize vecadd
+cargo oxide sanitize sharedmem --tool racecheck
+cargo oxide sanitize debug --tool synccheck -- --kernel-name kns=clock
+cargo oxide sanitize my_app -- --leak-check full -- --app-flag value
+```
+
+`memcheck` is the default tool. Use `racecheck` for shared-memory hazards,
+`initcheck` for uninitialized global-memory reads, and `synccheck` for invalid
+synchronization usage. Extra arguments after `--` are passed directly to
+`compute-sanitizer` before the executable; use a second `--` to pass arguments
+to the target program after the executable.
+
+The command enables optimized device line tables by default so findings can
+name Rust source files and lines. An explicit `CUDA_OXIDE_DEBUG` process or
+project setting still wins.
+
+Compute Sanitizer normally exits with status zero even when it reports a tool
+finding. `cargo oxide sanitize` therefore supplies `--error-exitcode 86` by
+default, making findings fail scripts and CI. An explicit sanitizer argument
+overrides that default:
+
+```bash
+# Intentionally keep a zero exit status and inspect the printed report.
+cargo oxide sanitize vecadd -- --error-exitcode 0
+```
+
+Options such as `--check-exit-code no` and `--require-cuda-init no` weaken what
+a zero status proves. The wrapper therefore never declares the report clean
+from process status alone; it reports completion and leaves the sanitizer
+output visible for inspection.
+
+The `--no-fmad` CLI flag is forwarded through both ordinary and interop builds.
+It keeps ordinary multiply and add/subtract operations separate, with one
+rounding per operation. Explicit fused operations such as `f32::mul_add`
+remain fused.
+
+NVVM IR and LTOIR builds also produce `.options` and versioned `.target`
+sidecars. Keep both files with the artifact so later libNVVM and nvJitLink
+steps preserve the same FMA policy.
+
+Run `memcheck` first when investigating memory safety. The other tools are
+complementary and do not perform full memory-access checking.
 
 ## `cargo oxide doctor` -- environment validation
 
@@ -406,7 +464,7 @@ for the full profiling toolkit.
 
 | Pitfall                          | Symptom                                    | Fix                                                              |
 |:---------------------------------|:-------------------------------------------|:-----------------------------------------------------------------|
-| Race condition on output buffer  | Wrong results, non-deterministic           | Use `DisjointSlice` instead of raw `*mut T`                      |
+| Race condition on output buffer  | Wrong results, non-deterministic           | Use `DisjointSlice` plus matching prepared launch geometry      |
 | Missing `sync_threads()`         | Stale shared memory reads                  | Add barrier between writes and reads                             |
 | Wrong `shared_mem_bytes`         | `LAUNCH_OUT_OF_RESOURCES` or garbage data  | Match `LaunchConfig` to actual `DynamicSharedArray` usage        |
 | Out-of-bounds with raw pointers  | Trap or silent corruption                  | Use `DisjointSlice::get_mut` for bounds checking                 |

@@ -40,12 +40,12 @@ set -uo pipefail
 
 # ---- Example categorization ---------------------------------------------
 
-TCGEN05_EXAMPLES=(gemm_sol tcgen05 tcgen05_matmul)
+TCGEN05_EXAMPLES=(gemm_sol gemm_sol_final tcgen05 tcgen05_matmul)
 WGMMA_EXAMPLES=(wgmma)
 LTOIR_EXAMPLES=(addressof_sharedarray cpp_consumes_rust_device device_ffi_test legacy_nvvm_pointer_shapes manual_launch_libdevice mathdx_ffi_test primitive_stress)
 AUTO_NVVM_EXAMPLES=(libdevice_math)
 NVVM_VERIFY_EXAMPLES=(device_global libdevice_math legacy_nvvm_pointer_shapes primitive_stress)
-ERROR_EXAMPLES=(error error_wgmma_mma_unimplemented error_set_discriminant_unhandled error_static_initializer_provenance error_drop_glue error_heap_alloc error_missing_device_attr)
+ERROR_EXAMPLES=(error error_wgmma_mma_unimplemented error_set_discriminant_niche error_set_discriminant_uninhabited error_static_initializer_provenance error_drop_glue error_heap_alloc error_missing_device_attr)
 
 classify() {
     local ex="$1" cat
@@ -430,8 +430,15 @@ verdict_compile() {
     fi
     if [[ -s "${ex_dir}/${artifact}.ll" ]]; then
         local target_file="${ex_dir}/${artifact}.target"
-        if [[ -s "${target_file}" ]] && grep -qE '^sm_[0-9]+[af]?$' "${target_file}"; then
-            echo "PASS (compiled NVVM IR for $(tr -d '[:space:]' < "${target_file}"))"
+        local target
+        target="$(sed -n '1p' "${target_file}" 2>/dev/null)"
+        if [[ "${target}" =~ ^sm_[0-9]+[af]?$ ]]; then
+            if grep -qx 'compile-options=v1' "${target_file}" && \
+               [[ ! -s "${ex_dir}/${artifact}.options" ]]; then
+                echo "FAIL (versioned NVVM IR target is missing its .options sidecar)"
+                return 1
+            fi
+            echo "PASS (compiled NVVM IR for ${target})"
             return 0
         fi
         echo "FAIL (NVVM IR emitted without a concrete .target sidecar)"

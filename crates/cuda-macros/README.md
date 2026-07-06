@@ -3,9 +3,10 @@
 Procedural macros for writing CUDA kernels in Rust. Provides `#[cuda_module]`
 for typed embedded-module loading, `#[kernel]` for GPU entry points,
 `#[device]`, `#[launch_bounds]`, `#[cluster_launch]`, `#[cooperative_launch]`,
-`gpu_printf!`, `ptx_asm!`, and the lower-level `cuda_launch!` / `cuda_launch_async!`
-escape hatches. `cuda_launch!` is caller-unsafe: prefer `#[cuda_module]`
-unless you are launching a module loaded at runtime by name.
+`#[launch_contract]`, `gpu_printf!`, `ptx_asm!`, and the lower-level `cuda_launch!` / `cuda_launch_async!`
+escape hatches. Both lower-level launch macros are caller-unsafe: prefer
+`#[cuda_module]` with a launch contract unless you are launching a module
+loaded at runtime by name.
 
 ## Attributes
 
@@ -15,7 +16,13 @@ Marks a function as a CUDA kernel. Generates:
 1. An entry point renamed into the reserved `cuda_oxide_kernel_<hash>_<name>` namespace
    (with `#[no_mangle]`) so the codegen backend can find it. The hash makes the prefix
    unguessable for user code; see `crates/reserved-oxide-symbols/` for the contract.
-2. A `__<name>_CudaKernel` marker struct implementing `CudaKernel` (or `GenericCudaKernel` for generics).
+2. Host lookup metadata used by typed launch APIs.
+3. For a generic kernel, a readable `<name>_ptx_name::<...>()` helper. Generated
+   marker types are internal plumbing and should not be named by application code.
+
+The `<name>_ptx_name` sibling is part of the generated API, so that name must
+remain free beside a generic kernel. Calling it also retains that concrete
+specialization in device output; it cannot return a name for an omitted entry.
 
 > **Reserved names.** The macros refuse to compile any function whose name starts with
 > `cuda_oxide_` -- that namespace is reserved for cuda-oxide-internal mangling. The check
@@ -36,16 +43,20 @@ pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
 **Generic kernels** work in two modes:
 
 ```rust
-// Mode 1: call-site instantiation (PTX name from type_name)
+// Mode 1: call-site specialization (PTX name from the function-item TypeId)
 #[kernel]
 pub fn scale<T: Copy + Mul<Output = T>>(factor: T, input: &[T], mut out: DisjointSlice<T>) { ... }
-// Launch: module.scale::<f32>(&stream, config, factor, &input, &mut out)?
+// Raw launch: unsafe { module.scale::<f32>(&stream, config, factor, &input, &mut out)? }
+// Inspect its generated entry name: scale_ptx_name::<f32>()
 
 // Mode 2: explicit instantiation list
 #[kernel(f32, i32)]
 pub fn scale<T: Copy + Mul<Output = T>>(factor: T, input: &[T], mut out: DisjointSlice<T>) { ... }
 // Generates named entry points: scale_f32, scale_i32
 ```
+
+The legacy explicit list supports exactly one type parameter. Use Mode 1 for
+const parameters, lifetimes, or mixed type/const kernels.
 
 ### `#[device]` -- Device Helper Functions and Externs
 
@@ -73,7 +84,9 @@ extern "C" {
 
 ### `#[launch_bounds(max_threads, min_blocks)]`
 
-Occupancy hints for register allocation. Must come **after** `#[kernel]`.
+Occupancy hints for register allocation. It may appear before or after
+`#[kernel]`; generic kernels forward its compiler marker to every generated
+entry.
 
 ```rust
 #[kernel]
@@ -82,9 +95,84 @@ pub fn optimized(out: DisjointSlice<f32>) { ... }
 // PTX: .entry optimized .maxntid 256 .minnctapersm 2 { ... }
 ```
 
+### `#[launch_contract(...)]`
+
+Declares a kernel's launch-time correctness assumptions. Inside
+`#[cuda_module]`, this changes that kernel's generated API from a raw
+`LaunchConfig` to a prepared, specialization-branded launch:
+
+```rust
+#[kernel]
+#[launch_bounds(256)]
+#[launch_contract(
+    domain = 1,
+    block = (256, 1, 1),
+    dynamic_shared_range = (1024, 49152),
+    dynamic_shared_alignment = 128,
+    min_compute_capability = (9, 0),
+)]
+pub fn reduce(input: &[f32], mut out: DisjointSlice<f32>) { /* ... */ }
+
+let prepared = module.prepare_reduce(LaunchConfig1D::new(blocks, 256, 8192))?;
+module.reduce(&stream, &prepared, &input, &mut out)?;
+```
+
+Kernel configuration attributes may appear before or after `#[kernel]`. If an
+attribute expands first, generic kernel generation forwards its exact internal
+marker to the exported entry.
+
+```text
+prepare_reduce: dimensions + live CUDA limits -> PreparedLaunch<reduce>
+reduce:         PreparedLaunch<reduce>         -> enqueue
+reduce_unchecked: raw LaunchConfig             -> unsafe expert path
+```
+
+`block` is exact. If it is omitted, `#[launch_bounds]` supplies the compiled
+maximum total threads per block. For example, a limit of 256 accepts both
+`(256, 1, 1)` and `(16, 16, 1)`. Dynamic shared memory is either exact
+(`dynamic_shared = BYTES`) or an inclusive range. The byte extent is an author
+promise; the alignment is a compiler-visible minimum and is merged with any
+higher `DynamicSharedArray<T, ALIGN>` request in the body or a reachable local
+helper. Prelinked external helpers retain their separately compiled alignment.
+Contract values are integer literals in this initial API; specialization const
+expressions are not accepted yet.
+
+`domain` is deliberately explicit because calls through device helpers defeat
+AST inference. `#[cuda_module]` adds a sealed trait bound to the complete
+`DisjointSlice` parameter type, so Rust resolves aliases before checking the
+rank:
+
+```text
+type Tile = Index2D<64>;  DisjointSlice<_, Tile>    + domain 2 -> accepted
+type Tile = Index1D;      DisjointSlice<_, Tile>    + domain 2 -> type error
+local struct named DisjointSlice                     -> type error
+```
+
+Mutable slice parameters, incompatible cluster axes, and blocks above the
+emitted launch bounds are also rejected.
+
+Opted-in kernels gain generated sync, borrowed-async, and owned-async safe
+methods that consume the same prepared proof. Their raw paths use an
+`_unchecked` suffix. Uncontracted methods keep their existing names, but are
+also unsafe because no proof ties their raw configuration to the kernel.
+
+All loaders for a module containing a contracted kernel are unsafe. Bundles are
+currently identified at package granularity, so `load()` cannot distinguish a
+library artifact from a same-package binary artifact by name alone. The caller
+must prove that `load`, `load_async`, `load_named`, `load_async_named`, or
+`from_module` binds code with the ABI and resource semantics declared by the
+module. Generic loading also merges all PTX bundles, so those specializations
+must match and have no conflicting entry definitions. Preparation and launch
+are safe after this one-time binding.
+
+Cluster and cooperative requirements are each checked against the live device.
+Combining them currently fails preparation because cuda-oxide cannot yet prove
+the combined residency limit with the available occupancy query.
+
 ### `#[cluster_launch(x, y, z)]`
 
-Compile-time thread block cluster dimensions (Hopper+). Must come **after** `#[kernel]`.
+Compile-time thread block cluster dimensions (Hopper+). It may appear before or
+after `#[kernel]`.
 
 ```rust
 #[kernel]
@@ -96,10 +184,11 @@ pub fn cluster_kernel(out: DisjointSlice<u32>) { ... }
 ### `#[cooperative_launch]`
 
 Marks a kernel for cooperative launch, the precondition for grid-wide
-barriers (`cuda_device::grid::sync()`). Must come **after** `#[kernel]`.
-Unlike `#[cluster_launch]` this changes nothing in the PTX: `#[cuda_module]`
-reads the marker and routes every generated launch method through
-`cuLaunchKernelEx` with `CU_LAUNCH_ATTRIBUTE_COOPERATIVE` set. May be
+barriers (`cuda_device::grid::sync()`). It may appear before or after
+`#[kernel]`. Unlike `#[cluster_launch]` this changes nothing in the PTX:
+`#[cuda_module]` records the setting before nested attributes expand and
+routes every generated launch method through `cuLaunchKernelEx` with
+`CU_LAUNCH_ATTRIBUTE_COOPERATIVE` set. May be
 combined with `#[cluster_launch]`; both attributes then go into the same
 `cuLaunchKernelEx` call.
 
@@ -132,7 +221,10 @@ mod kernels {
 }
 
 let module = kernels::load(&ctx)?;
-module.vecadd(&stream, LaunchConfig::for_num_elems(N as u32), &a_dev, &b_dev, &mut c_dev)?;
+// SAFETY: the raw geometry is 1-D and matches vecadd's indexing and resources.
+unsafe {
+    module.vecadd(&stream, LaunchConfig::for_num_elems(N as u32), &a_dev, &b_dev, &mut c_dev)?;
+}
 ```
 
 When `cuda-host` is built with its `async` feature, async code can load the
@@ -140,7 +232,11 @@ same embedded module from a `cuda-async` device context:
 
 ```rust
 let module = kernels::load_async(0)?;
-module.vecadd_async(LaunchConfig::for_num_elems(N as u32), &a_dev, &b_dev, &mut c_dev)?.sync()?;
+let launch = unsafe {
+    // SAFETY: the raw geometry is 1-D and matches vecadd's assumptions.
+    module.vecadd_async(LaunchConfig::for_num_elems(N as u32), &a_dev, &b_dev, &mut c_dev)?
+};
+launch.sync()?;
 ```
 
 Borrowed async methods return `AsyncKernelLaunch<'_>` and tie the lazy operation
@@ -148,9 +244,11 @@ to referenced buffers and borrowed scalar arguments. Owned async methods take
 device buffers by value and return them after completion:
 
 ```rust
-let (a_dev, b_dev, c_dev) = module
-    .vecadd_async_owned(LaunchConfig::for_num_elems(N as u32), a_dev, b_dev, c_dev)?
-    .await?;
+let launch = unsafe {
+    // SAFETY: the raw geometry is 1-D and matches vecadd's assumptions.
+    module.vecadd_async_owned(LaunchConfig::for_num_elems(N as u32), a_dev, b_dev, c_dev)?
+};
+let (a_dev, b_dev, c_dev) = launch.await?;
 ```
 
 ## `cuda_launch!` -- Unsafe Lower-Level Synchronous Kernel Launch
@@ -160,11 +258,12 @@ the kernel signatures at compile time and generates typed launch methods.
 `cuda_launch!` is the unsafe escape hatch for the remaining case, modules
 loaded at runtime by name, where no compile-time signature exists to check.
 
-The macro verifies nothing about the argument list. The caller promises that
-argument count, order, and types match the kernel's actual signature and that
-pointer arguments are device-accessible; a mismatch is undefined behavior
-(the driver reads past the end of the args array, or the device dereferences
-junk). Every use must therefore sit inside an `unsafe { }` block:
+The macro verifies neither the argument list nor the kernel's launch contract.
+The caller promises that argument count, order, and types match the actual
+signature, pointer arguments are device-accessible, and the geometry/resources
+satisfy the kernel's indexing and synchronization assumptions. A mismatch can
+cause undefined behavior. Every use must therefore sit inside an `unsafe { }`
+block:
 
 ```rust
 // SAFETY: argument count, order, and types match vecadd's signature;
@@ -188,8 +287,8 @@ unsafe {
 | `expr`                | `T` (scalar)        | `&mut value` as `*mut c_void`       |
 | `slice(buf)`          | `&[T]`              | Device pointer + length (two args)  |
 | `slice_mut(buf)`      | `DisjointSlice<T>`  | Device pointer + length (two args)  |
-| `move \|..\| body`    | Closure `F`         | Each capture by value               |
-| `\|..\| body`         | Closure `F`         | Pointers to captures (HMM)          |
+| `move \|..\| body`    | Closure `F`         | Whole closure environment by value  |
+| `\|..\| body`         | Closure `F`         | Whole closure environment by value  |
 
 ### PTX Name Resolution
 
@@ -197,18 +296,19 @@ unsafe {
 |:--------------|:--------------------------------------------------------|
 | Non-generic   | Original function name (`vecadd`)                       |
 | Generic       | `{name}_TID_{hex32}` (fixed length regardless of arity) |
-| Closure-only  | Same as Generic — closure type is in the hashed tuple   |
+| Closure-only  | Same as Generic — closure type is in the function item |
 
-`{hex32}` is rustc's stable 128-bit type-id hash for the *tuple* of
-generic arguments `(T0, T1, ...)`, rendered as 32 lowercase hex chars.
-The backend computes it via
-`tcx.type_id_hash(Ty::new_tup(tcx, &args)).as_u128()`; the host computes
-the same value via `cuda_host::type_id_u128::<(T0, T1, ...,)>()`. Both
-sides share a single rustc invocation and go through the same
-`erase_and_anonymize_regions` + stable-hash pipeline, so the strings
-match byte-for-byte. Hashing the tuple (not each arg separately) keeps
-the on-wire name a fixed `base.len() + 37` chars regardless of how many
-generic parameters the kernel takes.
+`{hex32}` is rustc's stable 128-bit type-id hash for the concrete generated
+kernel function-item type, rendered as 32 lowercase hex chars. Its `FnDef`
+contains the function identity and every ordered type and const argument. The
+backend hashes `Instance::ty`; the host hashes
+`&kernel_entry::<T, N>` through `cuda_host::type_id_u128_of_val`. Both use the
+same region-erasing stable-hash pipeline, so lifetimes do not create variants
+and the on-wire name stays a fixed `base.len() + 37` characters regardless of
+generic arity.
+
+The suffix is a build-time rendezvous key, not a permanent ABI. Rebuild host
+code and PTX together when the pinned rustc toolchain or crate graph changes.
 
 For generics, the macro forces monomorphization with a volatile pointer
 trick so the kernel appears in the codegen unit even without a host-side
@@ -216,14 +316,20 @@ call.
 
 ## `cuda_launch_async!` -- Lower-Level Async Kernel Launch
 
-Returns an `AsyncKernelLaunch` implementing `DeviceOperation` for `cuda-async` scheduling. Same argument forms as `cuda_launch!` but no `stream:` or `cluster_dim:` fields.
+Returns an immutable `AsyncKernelLaunch` implementing `DeviceOperation` for
+`cuda-async` scheduling. The macro first builds inert launch data, then crosses
+the same caller-unsafe raw finalization boundary as `cuda_launch!`. It accepts
+the same argument forms, but has no `stream:` or `cluster_dim:` fields.
 
 ```rust
-let op = cuda_launch_async! {
-    kernel: vecadd,
-    module: module,
-    config: LaunchConfig::for_num_elems(N as u32),
-    args: [slice(a_dev), slice(b_dev), slice_mut(c_dev)]
+// SAFETY: ABI, lifetimes, geometry, and resources match vecadd.
+let op = unsafe {
+    cuda_launch_async! {
+        kernel: vecadd,
+        module: module,
+        config: LaunchConfig::for_num_elems(N as u32),
+        args: [slice(a_dev), slice(b_dev), slice_mut(c_dev)]
+    }
 };
 ```
 

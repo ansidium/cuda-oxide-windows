@@ -804,6 +804,124 @@ impl ThreadfenceSystemOp {
     }
 }
 
+// =============================================================================
+// SM and Grid Identification
+// =============================================================================
+
+/// Read the SM (streaming multiprocessor) processor ID.
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.smid` / PTX `%smid`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_smid",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregSmIdOp;
+
+impl ReadPtxSregSmIdOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregSmIdOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregSmIdOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_sreg_integer_result(ctx, self.get_operation(), "smid", 32)
+    }
+}
+
+/// Read the maximum SM ID + 1 (number of SM slots).
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.nsmid` / PTX `%nsmid`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_nsmid",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregNsmIdOp;
+
+impl ReadPtxSregNsmIdOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregNsmIdOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregNsmIdOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_sreg_integer_result(ctx, self.get_operation(), "nsmid", 32)
+    }
+}
+
+/// Read the grid launch identifier.
+///
+/// Corresponds to the modern 64-bit PTX `%gridid` register.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i64`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_gridid",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregGridIdOp;
+
+impl ReadPtxSregGridIdOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregGridIdOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregGridIdOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_sreg_integer_result(ctx, self.get_operation(), "gridid", 64)
+    }
+}
+
+/// Shared verifier for SM/grid identification special-register results.
+fn verify_sreg_integer_result(
+    ctx: &Context,
+    op: Ptr<Operation>,
+    register: &str,
+    width: u32,
+) -> Result<(), Error> {
+    let op = &*op.deref(ctx);
+    let res = op.get_result(0);
+    let ty = res.get_type(ctx);
+
+    let ty_obj = ty.deref(ctx);
+    let int_ty = match ty_obj.downcast_ref::<IntegerType>() {
+        Some(ty) => ty,
+        None => {
+            return verify_err!(op.loc(), "%{} result must be integer", register);
+        }
+    };
+
+    if int_ty.width() != width {
+        return verify_err!(
+            op.loc(),
+            "%{} result must be {}-bit integer",
+            register,
+            width
+        );
+    }
+    Ok(())
+}
+
 /// Register thread indexing operations with the context.
 pub(super) fn register(ctx: &mut Context) {
     // X-dimension
@@ -825,6 +943,10 @@ pub(super) fn register(ctx: &mut Context) {
     // Driver-ABI environment registers
     ReadPtxSregEnvReg1Op::register(ctx);
     ReadPtxSregEnvReg2Op::register(ctx);
+    // SM and grid identification
+    ReadPtxSregSmIdOp::register(ctx);
+    ReadPtxSregNsmIdOp::register(ctx);
+    ReadPtxSregGridIdOp::register(ctx);
     // Synchronization
     Barrier0Op::register(ctx);
     ThreadfenceBlockOp::register(ctx);

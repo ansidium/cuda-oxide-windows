@@ -8,7 +8,7 @@
 
 pub use cuda_macros::{
     cluster_launch, constant, convergent, cooperative_launch, cuda_module, device, gpu_printf,
-    kernel, launch_bounds, ptx_asm, pure, readonly,
+    kernel, launch_bounds, launch_contract, ptx_asm, pure, readonly,
 };
 
 // Re-export for convenience
@@ -34,6 +34,7 @@ pub mod thread;
 pub mod tma;
 pub mod warp;
 pub mod wgmma;
+pub mod wmma;
 
 pub use barrier::{
     // Core type
@@ -57,6 +58,8 @@ pub use barrier::{
 };
 pub use constant::{ConstantMemory, ConstantMemoryValue};
 pub use cusimd::{CuSimd, Float2, Float4, TmemRegs4, TmemRegs32};
+#[doc(hidden)]
+pub use disjoint::__LaunchContractDisjointSlice;
 pub use disjoint::DisjointSlice;
 pub use fence::*;
 pub use shared::{DynamicSharedArray, SharedArray};

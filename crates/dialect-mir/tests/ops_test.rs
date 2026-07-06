@@ -9,8 +9,8 @@ use dialect_mir::{
         MirAddOp, MirAssertOp, MirAssignOp, MirCallOp, MirCastOp, MirCheckedAddOp, MirCmpOp,
         MirCondBranchOp, MirConstantOp, MirConstructSliceOp, MirDivOp, MirEqOp, MirExtractFieldOp,
         MirFuncOp, MirGeOp, MirGlobalAllocOp, MirGotoOp, MirGtOp, MirLeOp, MirLoadOp, MirLtOp,
-        MirMulOp, MirNeOp, MirNegOp, MirNotOp, MirPtrOffsetOp, MirRemOp, MirReturnOp, MirStoreOp,
-        MirSubOp,
+        MirMulOp, MirNeOp, MirNegOp, MirNotOp, MirPtrOffsetOp, MirRemOp, MirReturnOp,
+        MirSetDiscriminantOp, MirStoreOp, MirSubOp,
     },
     types::{EnumVariant, MirEnumType, MirPtrType, MirSliceType, MirTupleType, MirUnionType},
 };
@@ -1033,5 +1033,98 @@ fn test_mir_global_alloc_verify() {
     assert!(
         MirGlobalAllocOp::new(no_attrs).verify(&ctx).is_err(),
         "missing attributes rejected"
+    );
+}
+
+#[test]
+fn test_mir_set_discriminant_verify() {
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Signed);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signed);
+    let unit = |name: &str| EnumVariant::unit(name.to_string());
+
+    let enum_ty = MirEnumType::get(
+        &mut ctx,
+        "DeviceState".to_string(),
+        i8_ty.into(),
+        vec![0, 1],
+        vec![
+            unit("Empty"),
+            EnumVariant::new("Full".to_string(), vec![i32_ty.into()]),
+        ],
+    );
+
+    let enum_ptr_ty = MirPtrType::get_generic(&mut ctx, enum_ty.into(), true);
+    let blk = BasicBlock::new(&mut ctx, None, vec![enum_ptr_ty.into(), i8_ty.into()]);
+    let enum_ptr = blk.deref(&ctx).get_argument(0);
+    let discr_val = blk.deref(&ctx).get_argument(1);
+
+    // Valid: pointer to enum + discriminant of the enum's discriminant type.
+    let op_valid = Operation::new(
+        &mut ctx,
+        MirSetDiscriminantOp::get_concrete_op_info(),
+        vec![],
+        vec![enum_ptr, discr_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirSetDiscriminantOp::new(op_valid).verify(&ctx).is_ok(),
+        "Valid set_discriminant"
+    );
+
+    // Invalid: first operand is not a pointer.
+    let op_bad_ptr = Operation::new(
+        &mut ctx,
+        MirSetDiscriminantOp::get_concrete_op_info(),
+        vec![],
+        vec![discr_val, discr_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirSetDiscriminantOp::new(op_bad_ptr).verify(&ctx).is_err(),
+        "Non-pointer enum operand rejected"
+    );
+
+    // Invalid: pointer does not point to an enum.
+    let i32_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), true);
+    let blk_i32 = BasicBlock::new(&mut ctx, None, vec![i32_ptr_ty.into(), i8_ty.into()]);
+    let i32_ptr = blk_i32.deref(&ctx).get_argument(0);
+    let i32_discr = blk_i32.deref(&ctx).get_argument(1);
+    let op_bad_pointee = Operation::new(
+        &mut ctx,
+        MirSetDiscriminantOp::get_concrete_op_info(),
+        vec![],
+        vec![i32_ptr, i32_discr],
+        vec![],
+        0,
+    );
+    assert!(
+        MirSetDiscriminantOp::new(op_bad_pointee)
+            .verify(&ctx)
+            .is_err(),
+        "Non-enum pointee rejected"
+    );
+
+    // Invalid: discriminant type mismatch (i32 instead of i8).
+    let blk_bad_discr = BasicBlock::new(&mut ctx, None, vec![enum_ptr_ty.into(), i32_ty.into()]);
+    let enum_ptr_2 = blk_bad_discr.deref(&ctx).get_argument(0);
+    let bad_discr = blk_bad_discr.deref(&ctx).get_argument(1);
+    let op_bad_discr = Operation::new(
+        &mut ctx,
+        MirSetDiscriminantOp::get_concrete_op_info(),
+        vec![],
+        vec![enum_ptr_2, bad_discr],
+        vec![],
+        0,
+    );
+    assert!(
+        MirSetDiscriminantOp::new(op_bad_discr)
+            .verify(&ctx)
+            .is_err(),
+        "Discriminant type mismatch rejected"
     );
 }

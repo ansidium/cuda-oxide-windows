@@ -254,6 +254,17 @@ impl<T, const N: usize, const ALIGN: usize> IndexMut<usize> for SharedArray<T, N
 // DynamicSharedArray - Runtime-sized shared memory
 // ============================================================================
 
+/// Compile-time minimum alignment marker for a kernel's dynamic shared memory.
+///
+/// This is injected by `#[launch_contract]`. cuda-oxide removes the call before
+/// code generation, so it adds no kernel hot-path instructions. Kernel authors
+/// should use the attribute rather than calling this function directly.
+#[doc(hidden)]
+#[inline(never)]
+pub fn __dynamic_shared_alignment<const ALIGN: usize>() {
+    // The MIR importer removes this marker after recording ALIGN.
+}
+
 /// Dynamic (runtime-sized) shared memory with configurable alignment.
 ///
 /// Unlike [`SharedArray`] which has a compile-time known size, `DynamicSharedArray`
@@ -454,4 +465,39 @@ impl<T, const ALIGN: usize> DynamicSharedArray<T, ALIGN> {
         let _ = byte_offset;
         unreachable!("DynamicSharedArray::offset called outside CUDA kernel context")
     }
+}
+
+// =============================================================================
+// Shared Memory Size Queries
+// =============================================================================
+
+/// Read the size (in bytes) of dynamic shared memory allocated for this kernel.
+///
+/// Returns the `%dynamic_smem_size` special register -- the number of bytes of
+/// shared memory requested at launch time via `LaunchConfig::shared_mem_bytes`
+/// (or the CUDA driver equivalent). This does *not* include statically allocated
+/// shared memory (`SharedArray`).
+///
+/// # PTX
+///
+/// `mov.u32 %r, %dynamic_smem_size;`
+#[inline(never)]
+pub fn dynamic_smem_size() -> u32 {
+    // Lowered to exact inline PTX for LLVM 21/22 compatibility.
+    unreachable!("dynamic_smem_size called outside CUDA kernel context")
+}
+
+/// Read the allocated user shared-memory size for this kernel's thread block.
+///
+/// Returns `%total_smem_size` in bytes. It includes static and dynamic user
+/// allocations, excludes memory reserved for NVIDIA system software, and is
+/// rounded to the target architecture's shared-memory allocation unit.
+///
+/// # PTX
+///
+/// `mov.u32 %r, %total_smem_size;`
+#[inline(never)]
+pub fn total_smem_size() -> u32 {
+    // Lowered to exact inline PTX for LLVM 21/22 compatibility.
+    unreachable!("total_smem_size called outside CUDA kernel context")
 }

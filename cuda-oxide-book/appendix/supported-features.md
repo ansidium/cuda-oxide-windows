@@ -94,6 +94,7 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 | LTOIR Linking | **Full** | Device-side LTO via libNVVM and nvJitLink. |
 | Float Math Intrinsics (libdevice) | **Full** | Rust `f32`/`f64` math methods (`sin`, `cos`, `exp`, `pow`, `sqrt`, ...) lower to CUDA libdevice (`__nv_*`) on pre-Blackwell and Blackwell GPUs. cuda-oxide selects the matching NVVM IR syntax automatically. On Blackwell, the runtime can also JIT PTX produced from a standard pre-Blackwell target such as `sm_86`. |
 | Pipeline Inspection | **Full** | `cargo oxide pipeline <example>` shows imported and post-`mem2reg` MIR, LLVM dialect, exported LLVM IR, and PTX. |
+| Compute Sanitizer Wrapper | **Full** | `cargo oxide sanitize <example>` builds the example and runs the host binary under NVIDIA Compute Sanitizer (`memcheck`, `racecheck`, `initcheck`, or `synccheck`). |
 | cuda-gdb Source Debugging | **Full** | `cargo oxide debug` builds device debug information on the PTX path and launches `cuda-gdb`. Legacy NVVM IR does not yet support debug metadata. |
 | cuda-gdb Local / Argument Inspection | **Partial** | `CUDA_OXIDE_DEBUG=full` is a `-G`-style build (optimization off, locals kept in memory) so `info args`/`info locals` show real values for scalars, pointers/references, and structs/tuples/arrays with their fields. Enums, ABI-split bare slices, closures, and projections (`x.0`) are not yet described. |
 
@@ -109,8 +110,9 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 
 | Feature | Status | Description |
 |:--------|:-------|:------------|
-| `DisjointSlice<T, IndexSpace>` | **Full** | Bounds-checked parallel write output slice. `get_mut` and `get_mut_indexed` return `Option<&mut T>`. The `IndexSpace` type parameter rejects mismatched 2D strides at compile time. |
-| `ThreadIndex<'kernel, IndexSpace>` | **Full** | Opaque witness only constructable by trusted index functions. `!Send + !Sync + !Copy + !Clone`, `'kernel`-scoped — non-transferable across threads, can't outlive the kernel body. |
+| `DisjointSlice<T, IndexSpace>` | **Full** | Bounds-checked parallel write output slice. `IndexSpace` rejects mismatched layouts; uniqueness also requires matching prepared launch geometry (or a raw unsafe proof). |
+| `ThreadIndex<'kernel, IndexSpace>` | **Full** | Opaque, non-transferable witness. `index_1d` uniqueness requires inactive Y/Z dimensions, proven by a `domain = 1` prepared launch or by the caller of a raw unsafe launch. |
+| `PreparedLaunch<K>` | **Full** | Checked, reusable launch geometry branded for the exact kernel. Raw `LaunchConfig` generated methods are unsafe. |
 | `ManagedBarrier` Typestate | **Full** | Compile-time barrier lifecycle: `Uninit → Ready → Invalidated`. Invalid transitions are compile errors. |
 
 ## Runtime Library: Atomics
@@ -134,7 +136,7 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 
 | Feature | Status | Description |
 |:--------|:-------|:------------|
-| Thread/Block/Grid Intrinsics | **Full** | `threadIdx`, `blockIdx`, `blockDim`, `gridDim`. `index_1d()` and `index_2d::<S>()` (const stride) are type-safe; `index_2d_runtime(s)` is the `unsafe` escape hatch when the stride is only known at launch time. See [The Safety Model](../gpu-safety/the-safety-model.md). |
+| Thread/Block/Grid Intrinsics | **Full** | `threadIdx`, `blockIdx`, `blockDim`, `gridDim`. Index witnesses are layout-typed; their uniqueness also depends on matching launch dimensionality. `index_2d_runtime(s)` adds a caller-proved stride. See [The Safety Model](../gpu-safety/the-safety-model.md). |
 | Block Synchronization | **Full** | `sync_threads()` — thread block barrier. |
 | Async Barriers (mbarrier) | **Full** | Hardware async barriers for Hopper+: init, arrive, test_wait, try_wait, inval. |
 | Cluster Synchronization | **Full** | `cluster_sync()` for all blocks in a cluster. sm_90+. |
@@ -172,8 +174,10 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 
 | Feature | Status | Description |
 |:--------|:-------|:------------|
-| `#[cuda_module]` Typed Launch | **Full** | Embedded module loading with typed sync/async launch methods. |
+| `#[cuda_module]` Typed Launch | **Full** | Embedded module loading with typed sync/async arguments. Raw configuration methods are unsafe. |
+| `#[launch_contract]` / `PreparedLaunch<K>` | **Full** | Checked dimensionality, exact block shape, resources, capabilities, context, and kernel identity. |
 | `cuda_launch!` Macro | **Full** | Unsafe lower-level launch for runtime-loaded modules; requires `unsafe { }`. |
+| `cuda_launch_async!` Macro | **Full** | Unsafe lower-level lazy launch; requires `unsafe { }`. |
 | `#[launch_bounds]` | **Full** | Occupancy hints: max threads per block, min blocks per SM. |
 | `#[cluster_launch]` | **Full** | Compile-time cluster dimensions. Emits `.reqnctapercluster` in PTX. |
 

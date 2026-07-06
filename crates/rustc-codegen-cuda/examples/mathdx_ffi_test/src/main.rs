@@ -706,8 +706,24 @@ fn build_tools(example_dir: &Path) -> Result<(), String> {
     let tools_dir = example_dir.join("tools");
     let compile_ltoir = tools_dir.join("compile_ltoir");
     let link_ltoir = tools_dir.join("link_ltoir");
+    let compile_source = tools_dir.join("compile_ltoir.c");
+    let link_source = tools_dir.join("link_ltoir.c");
+    let options_header = tools_dir.join("compile_options.h");
+    let build_script = tools_dir.join("build_tools.sh");
 
-    if compile_ltoir.exists() && link_ltoir.exists() {
+    let compile_sources = [
+        compile_source.as_path(),
+        options_header.as_path(),
+        build_script.as_path(),
+    ];
+    let link_sources = [
+        link_source.as_path(),
+        options_header.as_path(),
+        build_script.as_path(),
+    ];
+    if !file_needs_rebuild(&compile_ltoir, &compile_sources)
+        && !file_needs_rebuild(&link_ltoir, &link_sources)
+    {
         return Ok(());
     }
 
@@ -741,6 +757,7 @@ fn build_external_ltoir(example_dir: &Path, mathdx_root: &Path) -> Result<(), St
 /// Compiles cuda-oxide LLVM IR (.ll) to LTOIR using libNVVM.
 fn compile_cuda_oxide_ltoir(example_dir: &Path) -> Result<(), String> {
     let ll_file = example_dir.join("mathdx_ffi_test.ll");
+    let options_file = example_dir.join("mathdx_ffi_test.options");
     let ltoir_file = example_dir.join("mathdx_ffi_test.ltoir");
     let tools_dir = example_dir.join("tools");
 
@@ -753,7 +770,7 @@ fn compile_cuda_oxide_ltoir(example_dir: &Path) -> Result<(), String> {
         ));
     }
 
-    if !file_needs_rebuild(&ltoir_file, &[&ll_file]) {
+    if !file_needs_rebuild(&ltoir_file, &[&ll_file, &options_file]) {
         return Ok(());
     }
 
@@ -1078,8 +1095,8 @@ fn test_fft_config_query(
     };
 
     let output_ptr = d_output.cu_deviceptr() as *mut i32;
-    module
-        .query_fft_config((stream).as_ref(), config, output_ptr)
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.query_fft_config((stream).as_ref(), config, output_ptr) }
         .expect("Kernel launch failed");
 
     let h_output = d_output.to_host_vec(&stream).unwrap();
@@ -1123,8 +1140,8 @@ fn test_gemm_config_query(
     };
 
     let output_ptr = d_output.cu_deviceptr() as *mut i32;
-    module
-        .query_gemm_config((stream).as_ref(), config, output_ptr)
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.query_gemm_config((stream).as_ref(), config, output_ptr) }
         .expect("Kernel launch failed");
 
     let h_output = d_output.to_host_vec(&stream).unwrap();
@@ -1179,8 +1196,8 @@ fn debug_copy_through_local_runner(
 
     let input_ptr = d_input.cu_deviceptr() as *const f32;
     let output_ptr = d_output.cu_deviceptr() as *mut f32;
-    module
-        .debug_copy_through_local((stream).as_ref(), config, input_ptr, output_ptr)
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.debug_copy_through_local((stream).as_ref(), config, input_ptr, output_ptr) }
         .expect("Kernel launch failed");
 
     let h_output = d_output.to_host_vec(&stream).unwrap();
@@ -1241,8 +1258,8 @@ fn debug_extern_double_global_runner(
     };
 
     let inout_ptr = d_inout.cu_deviceptr() as *mut f32;
-    module
-        .debug_extern_double_global((stream).as_ref(), config, inout_ptr)
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.debug_extern_double_global((stream).as_ref(), config, inout_ptr) }
         .expect("Kernel launch failed");
 
     let h_output = d_inout.to_host_vec(&stream).unwrap();
@@ -1300,8 +1317,8 @@ fn debug_extern_double_runner(
 
     let input_ptr = d_input.cu_deviceptr() as *const f32;
     let output_ptr = d_output.cu_deviceptr() as *mut f32;
-    module
-        .debug_extern_double((stream).as_ref(), config, input_ptr, output_ptr)
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.debug_extern_double((stream).as_ref(), config, input_ptr, output_ptr) }
         .expect("Kernel launch failed");
 
     let h_output = d_output.to_host_vec(&stream).unwrap();
@@ -1366,8 +1383,8 @@ fn test_fft_8_roundtrip_runner(
 
     let input_ptr = d_input.cu_deviceptr() as *const f32;
     let output_ptr = d_output.cu_deviceptr() as *mut f32;
-    module
-        .test_fft_8_roundtrip((stream).as_ref(), config, input_ptr, output_ptr)
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.test_fft_8_roundtrip((stream).as_ref(), config, input_ptr, output_ptr) }
         .expect("Kernel launch failed");
 
     let h_output = d_output.to_host_vec(&stream).unwrap();
@@ -1426,8 +1443,8 @@ fn test_fft_16_roundtrip_runner(
 
     let input_ptr = d_input.cu_deviceptr() as *const f32;
     let output_ptr = d_output.cu_deviceptr() as *mut f32;
-    module
-        .test_fft_16_roundtrip((stream).as_ref(), config, input_ptr, output_ptr)
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.test_fft_16_roundtrip((stream).as_ref(), config, input_ptr, output_ptr) }
         .expect("Kernel launch failed");
 
     let h_output = d_output.to_host_vec(&stream).unwrap();
@@ -1497,8 +1514,8 @@ fn test_gemm_32x32x32_runner(
     let a_ptr = d_a.cu_deviceptr() as *const f32;
     let b_ptr = d_b.cu_deviceptr() as *const f32;
     let c_ptr = d_c.cu_deviceptr() as *mut f32;
-    module
-        .test_gemm_32x32x32((stream).as_ref(), config, a_ptr, b_ptr, c_ptr)
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.test_gemm_32x32x32((stream).as_ref(), config, a_ptr, b_ptr, c_ptr) }
         .expect("Kernel launch failed");
 
     let h_c = d_c.to_host_vec(&stream).unwrap();
@@ -1579,9 +1596,19 @@ fn test_gemm_32x32x32_alphabeta_runner(
     let a_ptr = d_a.cu_deviceptr() as *const f32;
     let b_ptr = d_b.cu_deviceptr() as *const f32;
     let c_ptr = d_c.cu_deviceptr() as *mut f32;
-    module
-        .test_gemm_32x32x32_alphabeta((stream).as_ref(), config, alpha, a_ptr, b_ptr, beta, c_ptr)
-        .expect("Kernel launch failed");
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_gemm_32x32x32_alphabeta(
+            (stream).as_ref(),
+            config,
+            alpha,
+            a_ptr,
+            b_ptr,
+            beta,
+            c_ptr,
+        )
+    }
+    .expect("Kernel launch failed");
 
     let h_result = d_c.to_host_vec(&stream).unwrap();
 

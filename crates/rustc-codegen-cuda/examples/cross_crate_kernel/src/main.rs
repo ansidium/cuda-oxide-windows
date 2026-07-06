@@ -23,7 +23,8 @@
 //! 1. Generic kernels defined in external crate (`kernel_lib::scale<T>`)
 //! 2. Monomorphization at use site (`scale::<f32>` instantiated here)
 //! 3. PTX generation for cross-crate kernels
-//! 4. Device helper functions from external crates
+//! 4. Const-generic entries instantiated for two values in the consuming crate
+//! 5. Device helper functions from external crates
 //!
 //! ## Build and Run
 //!
@@ -33,18 +34,52 @@
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 
-// Import everything from the kernel library!
-// This includes the #[kernel] functions and their generated helpers:
-// - scale, add, scale_with_helper (original functions)
-// - cuda_oxide_kernel_<hash>_* (renamed entry points; the prefix is owned
-//   by `crates/reserved-oxide-symbols/` so this crate isn't a load-bearing
-//   string-literal site)
-// - __*_CudaKernel (marker types for CudaKernel trait)
+// Import the public kernel functions and their generated `<kernel>_ptx_name`
+// helpers. Entry symbols and marker types remain implementation details.
 use kernel_lib::kernels;
+
+fn specialization_names() -> [&'static str; 4] {
+    [
+        kernels::scale_ptx_name::<f32>(),
+        kernels::scale_ptx_name::<i32>(),
+        kernels::add_const_ptx_name::<4>(),
+        kernels::add_const_ptx_name::<8>(),
+    ]
+}
+
+fn verify_generated_ptx() {
+    let ptx = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/cross_crate_kernel.ptx"
+    ))
+    .expect("read cross_crate_kernel.ptx; run `cargo oxide build cross_crate_kernel` first");
+
+    for name in specialization_names() {
+        let entry = format!(".visible .entry {name}(");
+        assert!(
+            ptx.contains(&entry),
+            "missing cross-crate PTX entry `{name}`"
+        );
+    }
+}
 
 fn main() {
     println!("=== Cross-Crate Kernel Test ===\n");
     println!("Testing kernels defined in kernel-lib crate.\n");
+
+    if std::env::args().any(|arg| arg == "--print-specializations") {
+        for name in specialization_names() {
+            println!("{name}");
+        }
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--verify-ptx") {
+        verify_generated_ptx();
+        println!("cross-crate host lookup names match all four PTX entries");
+        return;
+    }
+
+    verify_generated_ptx();
 
     // Initialize CUDA
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
@@ -71,15 +106,17 @@ fn main() {
         let input_dev = DeviceBuffer::from_host(&stream, &input).unwrap();
         let mut output_dev = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
 
-        module
-            .scale::<f32>(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.scale::<f32>(
                 (stream).as_ref(),
                 LaunchConfig::for_num_elems(N as u32),
                 factor,
                 &input_dev,
                 &mut output_dev,
             )
-            .expect("Kernel launch failed");
+        }
+        .expect("Kernel launch failed");
 
         let output: Vec<f32> = output_dev.to_host_vec(&stream).unwrap();
 
@@ -106,15 +143,17 @@ fn main() {
         let input_dev = DeviceBuffer::from_host(&stream, &input).unwrap();
         let mut output_dev = DeviceBuffer::<i32>::zeroed(&stream, N).unwrap();
 
-        module
-            .scale::<i32>(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.scale::<i32>(
                 (stream).as_ref(),
                 LaunchConfig::for_num_elems(N as u32),
                 factor,
                 &input_dev,
                 &mut output_dev,
             )
-            .expect("Kernel launch failed");
+        }
+        .expect("Kernel launch failed");
 
         let output: Vec<i32> = output_dev.to_host_vec(&stream).unwrap();
 
@@ -140,15 +179,17 @@ fn main() {
         let b_dev = DeviceBuffer::from_host(&stream, &b).unwrap();
         let mut c_dev = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
 
-        module
-            .add::<f32>(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.add::<f32>(
                 (stream).as_ref(),
                 LaunchConfig::for_num_elems(N as u32),
                 &a_dev,
                 &b_dev,
                 &mut c_dev,
             )
-            .expect("Kernel launch failed");
+        }
+        .expect("Kernel launch failed");
 
         let c: Vec<f32> = c_dev.to_host_vec(&stream).unwrap();
 
@@ -175,15 +216,17 @@ fn main() {
         let input_dev = DeviceBuffer::from_host(&stream, &input).unwrap();
         let mut output_dev = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
 
-        module
-            .scale_with_helper::<f32>(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.scale_with_helper::<f32>(
                 (stream).as_ref(),
                 LaunchConfig::for_num_elems(N as u32),
                 factor,
                 &input_dev,
                 &mut output_dev,
             )
-            .expect("Kernel launch failed");
+        }
+        .expect("Kernel launch failed");
 
         let output: Vec<f32> = output_dev.to_host_vec(&stream).unwrap();
 
@@ -199,10 +242,36 @@ fn main() {
         }
     }
 
+    // =========================================================================
+    // Test 5: Const-generic entries from the library
+    // =========================================================================
+    println!("Test 5: kernel_lib::add_const::<4/8>");
+    {
+        let input: Vec<u32> = (0..N as u32).collect();
+        let input_dev = DeviceBuffer::from_host(&stream, &input).unwrap();
+        let mut output_4 = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+        let mut output_8 = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+        let config = LaunchConfig::for_num_elems(N as u32);
+
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.add_const::<4>((stream).as_ref(), config, &input_dev, &mut output_4) }
+            .expect("add_const::<4> launch failed");
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.add_const::<8>((stream).as_ref(), config, &input_dev, &mut output_8) }
+            .expect("add_const::<8> launch failed");
+
+        let result_4 = output_4.to_host_vec(&stream).unwrap();
+        let result_8 = output_8.to_host_vec(&stream).unwrap();
+        assert!((0..N).all(|i| result_4[i] == input[i] + 4));
+        assert!((0..N).all(|i| result_8[i] == input[i] + 8));
+        println!("  ✓ PASSED: const-generic library entries remain distinct!\n");
+    }
+
     println!("=== All Cross-Crate Tests Passed! ===");
     println!("\nThis demonstrates:");
     println!("  - Generic kernels can be defined in library crates");
     println!("  - They are monomorphized when used in the application");
     println!("  - PTX is generated for all used instantiations");
+    println!("  - Const values participate in cross-crate kernel identity");
     println!("  - Device helper functions from libraries also work");
 }

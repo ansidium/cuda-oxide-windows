@@ -28,6 +28,8 @@
 //! - [`embedded`]: Load `#[cuda_module]` artifact bundles embedded in the host
 //!   binary (PTX, cubin, NVVM IR, LTOIR)
 //! - [`launch`]: Kernel launch traits (`CudaKernel`, `GenericCudaKernel`)
+//! - [`kernel_family`]: Bounded variant menus with validated selection,
+//!   overrides, and cache provenance
 //! - [`ltoir`]: libNVVM + nvJitLink wrappers (`load_kernel_module`, in-memory
 //!   cubin builders, and pre-Blackwell PTX compatibility)
 //! - [`tiling`]: Layout transformations for tensor core operations (tcgen05)
@@ -67,43 +69,58 @@
 //! let b_dev = DeviceBuffer::from_host(&stream, &b_host)?;
 //! let mut c_dev = DeviceBuffer::<f32>::zeroed(&stream, N)?;
 //!
-//! module.vecadd(
-//!     &stream,
-//!     LaunchConfig::for_num_elems(N as u32),
-//!     &a_dev,
-//!     &b_dev,
-//!     &mut c_dev,
-//! )?;
+//! // SAFETY: this raw configuration is one-dimensional and matches vecadd's
+//! // index calculation. Prefer a #[launch_contract] and PreparedLaunch when
+//! // the kernel's geometry is known.
+//! unsafe {
+//!     module.vecadd(
+//!         &stream,
+//!         LaunchConfig::for_num_elems(N as u32),
+//!         &a_dev,
+//!         &b_dev,
+//!         &mut c_dev,
+//!     )?;
+//! }
 //!
 //! let c_host = c_dev.to_host_vec(&stream)?;
 //! ```
 
 pub mod embedded;
+pub mod kernel_family;
 pub mod launch;
 pub mod ltoir;
 mod ltoir_cache;
 pub mod tiling;
 pub mod type_id;
 
+pub use kernel_family::{
+    KernelFamily, KernelFamilyBuildError, KernelFamilyId, KernelProblem, KernelSelectionCache,
+    KernelSelectionError, KernelSelectionResult, KernelSelector, KernelVariant,
+    NoKernelSelectionCache, SelectedVariant, SelectionMode, SelectionSource,
+};
 pub use launch::{
     CudaKernel, GenericCudaKernel, HasLength, KernelScalar, ReadOnly, Scalar, WriteOnly,
     push_kernel_device_slice, push_kernel_scalar, read_only_device_buffer_arg,
     writable_device_buffer_arg,
 };
-pub use type_id::type_id_u128;
+#[doc(hidden)]
+pub use type_id::__intern_generic_kernel_name;
+pub use type_id::{type_id_u128, type_id_u128_of_val};
 
 #[cfg(feature = "async")]
 pub use launch::{
-    KernelSliceArg, KernelSliceArgMut, load_cuda_module_from_async_context,
-    load_kernel_module_async, new_async_kernel_launch, new_owned_async_kernel_launch,
-    push_async_kernel_scalar, push_async_read_only_device_slice, push_async_writable_device_slice,
+    KernelSliceArg, KernelSliceArgMut, PreparedAsyncKernelLaunch, PreparedOwnedAsyncKernelLaunch,
+    load_cuda_module_from_async_context, load_kernel_module_async, new_async_kernel_launch_builder,
+    new_owned_async_kernel_launch, new_prepared_async_kernel_launch,
+    new_prepared_owned_async_kernel_launch, push_async_kernel_scalar,
+    push_async_read_only_device_slice, push_async_writable_device_slice,
     set_async_kernel_cluster_dim, set_async_kernel_cooperative,
 };
 
 #[cfg(feature = "async")]
 pub use cuda_async;
 #[cfg(feature = "async")]
-pub use cuda_async::launch::{AsyncKernelLaunch, OwnedAsyncKernelLaunch};
+pub use cuda_async::launch::{AsyncKernelLaunch, AsyncKernelLaunchBuilder, OwnedAsyncKernelLaunch};
 
 pub use embedded::{
     EmbeddedModuleError, load_all_ptx_bundles_merged, load_embedded_module,
@@ -123,9 +140,10 @@ pub use cuda_macros::{cuda_launch, cuda_module};
 
 /// Re-export of [`cuda_macros::cuda_launch_async`].
 ///
-/// Returns a lazy `cuda_async::launch::AsyncKernelLaunch`. Stream assignment is
-/// deferred to the scheduling policy -- call `.sync()` to block or `.await` to
-/// suspend.
+/// Builds a lazy `cuda_async::launch::AsyncKernelLaunch`. Raw launch
+/// configuration is not tied to the kernel's indexing assumptions, so the
+/// macro must be called inside `unsafe`. Stream assignment is deferred to the
+/// scheduling policy -- call `.sync()` to block or `.await` to suspend.
 #[cfg(feature = "async")]
 pub use cuda_macros::cuda_launch_async;
 pub use tiling::{

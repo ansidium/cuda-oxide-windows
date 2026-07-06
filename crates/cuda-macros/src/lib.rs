@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#![feature(proc_macro_def_site)]
+
 mod device_copy;
 mod printf;
 mod ptx_asm;
@@ -104,7 +106,6 @@ use quote::{format_ident, quote};
 use reserved_oxide_symbols::{
     DEVICE_EXTERN_PREFIX, DEVICE_PREFIX, INSTANTIATE_PREFIX, KERNEL_PREFIX, KERNEL_SCOPE_LOCAL,
     RESERVED_ROOT, artifact_anchor_symbol, artifact_anchor_symbol_v2, constant_symbol,
-    kernel_symbol,
 };
 use syn::{
     Expr, ExprCall, ExprMethodCall, ExprPath, FnArg, ForeignItem, GenericArgument, GenericParam,
@@ -114,8 +115,54 @@ use syn::{
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
     spanned::Spanned,
+    visit::Visit,
     visit_mut::{self, VisitMut},
 };
+
+/// Build a private identifier that cannot capture, or be captured by, a name
+/// written in the user's kernel signature.
+fn internal_ident(name: &str) -> Ident {
+    let span = if proc_macro::is_available() {
+        proc_macro::Span::def_site().into()
+    } else {
+        // Expansion helpers are also exercised as ordinary unit tests, where
+        // the compiler's procedural-macro bridge is intentionally unavailable.
+        proc_macro2::Span::call_site()
+    };
+    Ident::new(name, span)
+}
+
+fn cuda_module_async_lifetime() -> syn::Lifetime {
+    let ident = internal_ident("__cuda_oxide_async");
+    syn::Lifetime::new(&format!("'{}", ident), ident.span())
+}
+
+struct IdentFinder<'a> {
+    name: &'a str,
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for IdentFinder<'_> {
+    fn visit_ident(&mut self, ident: &'ast Ident) {
+        self.found |= ident == self.name;
+    }
+}
+
+fn call_site_ident_avoiding_item(name: &str, item: &ItemFn) -> Ident {
+    let mut candidate = name.to_owned();
+    loop {
+        let mut finder = IdentFinder {
+            name: &candidate,
+            found: false,
+        };
+        finder.visit_item_fn(item);
+        if !finder.found {
+            break;
+        }
+        candidate.push('_');
+    }
+    Ident::new(&candidate, proc_macro2::Span::call_site())
+}
 
 /// Reject function names that start with the reserved cuda-oxide prefix
 /// (`cuda_oxide_`).
@@ -145,6 +192,44 @@ fn reject_reserved_name(name: &Ident) -> Option<TokenStream> {
     } else {
         None
     }
+}
+
+/// Reject argument-position `impl Trait`, which rustc represents as a hidden
+/// type parameter that procedural macros cannot name at launch sites.
+///
+/// Without this check the host emits a non-generic lookup name while the
+/// backend correctly emits a `_TID_...` specialization, causing a runtime
+/// function-not-found error. A named generic preserves the same source-level
+/// intent and gives both sides an explicit specialization identity.
+fn impl_trait_parameter_error(input: &ItemFn, item_kind: &str) -> Option<syn::Error> {
+    #[derive(Default)]
+    struct Finder {
+        first: Option<syn::TypeImplTrait>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Finder {
+        fn visit_type_impl_trait(&mut self, node: &'ast syn::TypeImplTrait) {
+            if self.first.is_none() {
+                self.first = Some(node.clone());
+            }
+        }
+    }
+
+    let mut finder = Finder::default();
+    for arg in &input.sig.inputs {
+        if let FnArg::Typed(pat_type) = arg {
+            syn::visit::Visit::visit_type(&mut finder, &pat_type.ty);
+        }
+    }
+
+    finder.first.map(|impl_trait| {
+        syn::Error::new_spanned(
+            impl_trait,
+            format!(
+                "{item_kind} parameters cannot use `impl Trait`; name the type parameter explicitly (for example, `fn named<T: Trait>(value: T)`) so host and device specialization identities agree"
+            ),
+        )
+    })
 }
 
 /// Attribute arguments for #[kernel(...)]
@@ -183,6 +268,38 @@ impl Parse for KernelArgs {
 /// - `Copy` scalar/struct/closure/raw-pointer arguments keep their original
 ///   type and pass through `cuda_host::KernelScalar`
 ///
+/// # Nested modules
+///
+/// Kernels may be organized in inline modules nested inside the annotated
+/// module. Each namespace gets its own `LoadedModule` view, so launcher
+/// signatures resolve types, private generated helpers, and raw module
+/// identifiers beside the source kernel:
+///
+/// ```text
+/// kernels::LoadedModule
+///     -> kernels::stage::LoadedModule::from_parent(&kernels)
+///         -> stage.step(...)
+/// ```
+///
+/// All views share one loaded CUDA module and one generic-function cache.
+/// Create deeper views from their immediate parent in the same way.
+/// The name `LoadedModule` is therefore reserved in every inline namespace
+/// that owns kernels or contains a deeper kernel namespace.
+/// The generated method name `as_cuda_module` is reserved in every kernel
+/// namespace, and `from_parent` is additionally reserved in nested namespaces.
+///
+/// Procedural macros cannot see the contents of `mod child;` or `include!`.
+/// Those items are preserved, but kernels behind either boundary do not get
+/// generated launchers. Keep auto-launched nested kernels in inline modules.
+///
+/// Launcher methods are namespace-qualified, but PTX entry symbols are still
+/// bare function names. Kernel names must therefore be unique throughout one
+/// `#[cuda_module]` tree, including cfg-gated alternatives; the macro rejects
+/// duplicates rather than risk loading the wrong entry.
+/// Raw module identifiers are supported. Raw kernel function identifiers are
+/// not: their PTX-name contract predates nested-module support and remains an
+/// unsupported edge for a future backend-wide naming change.
+///
 /// # Example
 ///
 /// ```ignore
@@ -197,15 +314,32 @@ impl Parse for KernelArgs {
 /// }
 ///
 /// let module = kernels::load(&ctx)?;
-/// module.vecadd(&stream, LaunchConfig::for_num_elems(n), &a, &b, &mut c)?;
+/// // SAFETY: the raw launch is fully 1-D and matches vecadd's resources.
+/// unsafe {
+///     module.vecadd(&stream, LaunchConfig::for_num_elems(n), &a, &b, &mut c)?;
+/// }
 ///
 /// let module = kernels::load_async(0)?;
-/// module.vecadd_async(LaunchConfig::for_num_elems(n), &a, &b, &mut c)?.sync()?;
+/// // SAFETY: the raw launch is fully 1-D and matches vecadd's resources.
+/// unsafe {
+///     module.vecadd_async(LaunchConfig::for_num_elems(n), &a, &b, &mut c)
+/// }?.sync()?;
 ///
-/// let (a, b, c) = module
-///     .vecadd_async_owned(LaunchConfig::for_num_elems(n), a, b, c)?
+/// // SAFETY: the raw launch is fully 1-D and matches vecadd's resources.
+/// let (a, b, c) = unsafe {
+///     module.vecadd_async_owned(LaunchConfig::for_num_elems(n), a, b, c)
+/// }?
 ///     .await?;
 /// ```
+///
+/// # Raw launch safety
+///
+/// A raw [`LaunchConfig`](https://docs.rs/cuda-core/latest/cuda_core/struct.LaunchConfig.html)
+/// is not tied to the kernel's indexing model. The generated raw synchronous,
+/// borrowed-async, and owned-async methods are therefore `unsafe`: callers must
+/// prove that the chosen dimensions and resources satisfy the kernel. Add
+/// `#[launch_contract(...)]` to generate a prepared-launch path that is safe
+/// when the source kernel itself is safe.
 #[proc_macro_attribute]
 pub fn cuda_module(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !attr.is_empty() {
@@ -225,8 +359,16 @@ pub fn cuda_module(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 struct CudaModuleKernel {
+    module_path: Vec<Ident>,
     vis: syn::Visibility,
+    /// Availability attributes written directly on the kernel. Generated
+    /// fields and methods live in the same module, so ancestor attributes are
+    /// already inherited there.
     cfg_attrs: Vec<syn::Attribute>,
+    /// Availability attributes from every enclosing inline module followed by
+    /// the kernel's own attributes. Root-level artifact references need the
+    /// complete chain because they live outside those child modules.
+    effective_cfg_attrs: Vec<syn::Attribute>,
     method_attrs: Vec<syn::Attribute>,
     unsafety: Option<Token![unsafe]>,
     fn_name: Ident,
@@ -234,7 +376,212 @@ struct CudaModuleKernel {
     params: Vec<CudaModuleParam>,
     cluster_dim: Option<(u32, u32, u32)>,
     cooperative: bool,
+    launch_contract: Option<CudaModuleLaunchContract>,
     is_generic: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DynamicSharedContract {
+    Exact(u32),
+    Range { min_bytes: u32, max_bytes: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CudaModuleLaunchContract {
+    domain: u8,
+    exact_block: Option<(u32, u32, u32)>,
+    max_block_threads: Option<u32>,
+    dynamic_shared: DynamicSharedContract,
+    dynamic_shared_alignment: u32,
+    min_compute_capability: (u32, u32),
+}
+
+/// Arguments accepted by `#[launch_contract(...)]`.
+///
+/// The attribute is intentionally declarative. The kernel author states the
+/// launch domain and resource envelope; `#[cuda_module]` turns that statement
+/// into a branded host configuration and validates it against the live
+/// function/device once during preparation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LaunchContractArgs {
+    domain: u8,
+    exact_block: Option<(u32, u32, u32)>,
+    dynamic_shared: DynamicSharedContract,
+    dynamic_shared_alignment: u32,
+    min_compute_capability: (u32, u32),
+}
+
+impl Parse for LaunchContractArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut domain = None;
+        let mut exact_block = None;
+        let mut dynamic_shared = None;
+        let mut dynamic_shared_range = None;
+        let mut dynamic_shared_alignment = None;
+        let mut min_compute_capability = None;
+
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "domain" => {
+                    reject_duplicate(&key, domain.is_some())?;
+                    let value: syn::LitInt = input.parse()?;
+                    domain = Some(value.base10_parse::<u8>()?);
+                }
+                "block" => {
+                    reject_duplicate(&key, exact_block.is_some())?;
+                    exact_block = Some(parse_u32_triplet(input, "block")?);
+                }
+                "dynamic_shared" => {
+                    reject_duplicate(&key, dynamic_shared.is_some())?;
+                    let value: syn::LitInt = input.parse()?;
+                    dynamic_shared = Some(value.base10_parse::<u32>()?);
+                }
+                "dynamic_shared_range" => {
+                    reject_duplicate(&key, dynamic_shared_range.is_some())?;
+                    dynamic_shared_range = Some(parse_u32_pair(input, "dynamic_shared_range")?);
+                }
+                "dynamic_shared_alignment" => {
+                    reject_duplicate(&key, dynamic_shared_alignment.is_some())?;
+                    let value: syn::LitInt = input.parse()?;
+                    dynamic_shared_alignment = Some(value.base10_parse::<u32>()?);
+                }
+                "min_compute_capability" => {
+                    reject_duplicate(&key, min_compute_capability.is_some())?;
+                    let (major, minor) = parse_u32_pair(input, "min_compute_capability")?;
+                    min_compute_capability = Some((major, minor));
+                }
+                _ => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "unknown launch_contract field; expected domain, block, dynamic_shared, dynamic_shared_range, dynamic_shared_alignment, or min_compute_capability",
+                    ));
+                }
+            }
+
+            if input.is_empty() {
+                break;
+            }
+            input.parse::<Token![,]>()?;
+        }
+
+        let domain = domain.ok_or_else(|| {
+            syn::Error::new(
+                input.span(),
+                "launch_contract requires `domain = 1`, `2`, or `3`",
+            )
+        })?;
+        if !(1..=3).contains(&domain) {
+            return Err(syn::Error::new(
+                input.span(),
+                "launch_contract domain must be 1, 2, or 3",
+            ));
+        }
+        if dynamic_shared.is_some() && dynamic_shared_range.is_some() {
+            return Err(syn::Error::new(
+                input.span(),
+                "launch_contract accepts either `dynamic_shared` or `dynamic_shared_range`, not both",
+            ));
+        }
+        let dynamic_shared = match (dynamic_shared, dynamic_shared_range) {
+            (Some(bytes), None) => DynamicSharedContract::Exact(bytes),
+            (None, Some((min_bytes, max_bytes))) if min_bytes <= max_bytes => {
+                DynamicSharedContract::Range {
+                    min_bytes,
+                    max_bytes,
+                }
+            }
+            (None, Some(_)) => {
+                return Err(syn::Error::new(
+                    input.span(),
+                    "dynamic_shared_range minimum cannot exceed its maximum",
+                ));
+            }
+            (None, None) => DynamicSharedContract::Exact(0),
+            (Some(_), Some(_)) => unreachable!(),
+        };
+        let dynamic_shared_alignment = dynamic_shared_alignment.unwrap_or_else(|| {
+            if dynamic_shared_max(dynamic_shared) == 0 {
+                1
+            } else {
+                16
+            }
+        });
+        if dynamic_shared_alignment == 0 || !dynamic_shared_alignment.is_power_of_two() {
+            return Err(syn::Error::new(
+                input.span(),
+                "dynamic_shared_alignment must be a non-zero power of two",
+            ));
+        }
+        if exact_block.is_none() {
+            // A missing exact shape is valid only when #[launch_bounds]
+            // supplies the compiled maximum. This is checked after all kernel
+            // attributes have been collected so the two attributes remain one
+            // source of truth rather than duplicate integers.
+        }
+        let min_compute_capability = min_compute_capability.unwrap_or((0, 0));
+        Ok(Self {
+            domain,
+            exact_block,
+            dynamic_shared,
+            dynamic_shared_alignment,
+            min_compute_capability,
+        })
+    }
+}
+
+fn dynamic_shared_max(contract: DynamicSharedContract) -> u32 {
+    match contract {
+        DynamicSharedContract::Exact(bytes) => bytes,
+        DynamicSharedContract::Range { max_bytes, .. } => max_bytes,
+    }
+}
+
+fn reject_duplicate(key: &Ident, duplicate: bool) -> syn::Result<()> {
+    if duplicate {
+        Err(syn::Error::new(
+            key.span(),
+            format!("duplicate launch_contract field `{key}`"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_u32_triplet(input: ParseStream, field: &str) -> syn::Result<(u32, u32, u32)> {
+    let content;
+    parenthesized!(content in input);
+    let values: Punctuated<syn::LitInt, Token![,]> = Punctuated::parse_terminated(&content)?;
+    if values.len() != 3 {
+        return Err(syn::Error::new(
+            content.span(),
+            format!("{field} must be a three-dimensional tuple `(x, y, z)`"),
+        ));
+    }
+    let mut values = values.iter();
+    Ok((
+        values.next().unwrap().base10_parse()?,
+        values.next().unwrap().base10_parse()?,
+        values.next().unwrap().base10_parse()?,
+    ))
+}
+
+fn parse_u32_pair(input: ParseStream, field: &str) -> syn::Result<(u32, u32)> {
+    let content;
+    parenthesized!(content in input);
+    let values: Punctuated<syn::LitInt, Token![,]> = Punctuated::parse_terminated(&content)?;
+    if values.len() != 2 {
+        return Err(syn::Error::new(
+            content.span(),
+            format!("{field} must be a two-value tuple"),
+        ));
+    }
+    let mut values = values.iter();
+    Ok((
+        values.next().unwrap().base10_parse()?,
+        values.next().unwrap().base10_parse()?,
+    ))
 }
 
 struct CudaModuleParam {
@@ -242,6 +589,9 @@ struct CudaModuleParam {
     sync_host_ty: TokenStream2,
     async_host_ty: TokenStream2,
     marshal: CudaModuleParamMarshal,
+    mutable_slice: bool,
+    disjoint_slice_ty: Option<Type>,
+    disjoint_slice_elem: Option<TokenStream2>,
 }
 
 enum CudaModuleParamMarshal {
@@ -261,17 +611,22 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
         ));
     };
 
-    let kernels = collect_cuda_module_kernels(items)?;
-    if kernels.is_empty() {
+    let constants = collect_cuda_module_constants(items, ident)?;
+    let transformed = transform_cuda_module_items(items, &mut Vec::new(), &[], false)?;
+    if transformed.kernels.is_empty() {
         return Err(syn::Error::new_spanned(
             &module.ident,
             "cuda_module found no #[kernel] functions in this module",
         ));
     }
-    let constants = collect_cuda_module_constants(items, ident)?;
-    let module_items = cuda_module_items_with_constant_symbols(items, &constants);
+    reject_conflicting_kernel_names(&transformed.kernels)?;
+    reject_reserved_loaded_module(items)?;
 
-    let non_generic_kernels = kernels.iter().filter(|kernel| !kernel.is_generic);
+    let direct_kernels = &transformed.kernels[..transformed.direct_kernel_count];
+    reject_reserved_loaded_module_methods(direct_kernels, false)?;
+    let module_items = cuda_module_items_with_constant_symbols(&transformed.items, &constants);
+
+    let non_generic_kernels = direct_kernels.iter().filter(|kernel| !kernel.is_generic);
     let function_fields = non_generic_kernels.clone().map(|kernel| {
         let cfg_attrs = &kernel.cfg_attrs;
         let field = cuda_module_function_field(&kernel.fn_name);
@@ -291,8 +646,12 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
         }
     });
 
-    let artifact_anchor_statements = cuda_module_artifact_anchor_statements(&kernels)?;
-    let has_generic = kernels.iter().any(|k| k.is_generic);
+    let artifact_anchor_statements = cuda_module_artifact_anchor_statements(&transformed.kernels)?;
+    let has_generic = transformed.kernels.iter().any(|k| k.is_generic);
+    let has_launch_contract = transformed
+        .kernels
+        .iter()
+        .any(|kernel| kernel.launch_contract.is_some());
     let module_loader = if has_generic {
         // At least one kernel is generic: its PTX is emitted into the
         // consuming binary's bundle, not this crate's bundle. Merge all
@@ -311,14 +670,57 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
     let constant_initializers = constants
         .iter()
         .map(generate_cuda_module_constant_initializer);
-    let launch_methods = kernels.iter().map(generate_cuda_module_launch_method);
+    let launch_contract_impls = direct_kernels
+        .iter()
+        .filter_map(generate_cuda_module_launch_contract_impl);
+    let prepare_launch_methods = direct_kernels
+        .iter()
+        .filter_map(generate_cuda_module_prepare_launch_methods);
+    let launch_methods = direct_kernels
+        .iter()
+        .map(generate_cuda_module_launch_method);
     let constant_resolver_methods = constants
         .iter()
         .map(generate_cuda_module_constant_resolver_method);
     let set_constant_methods = constants
         .iter()
         .map(generate_cuda_module_set_constant_method);
-    let async_module_items = if cfg!(feature = "async") {
+    let async_module_items = if cfg!(feature = "async") && has_launch_contract {
+        quote! {
+            /// Loads this package's embedded artifact for a contracted module.
+            ///
+            /// # Safety
+            ///
+            /// For a non-generic module, the selected package bundle must be
+            /// the artifact compiled from this `cuda_module`; package names are
+            /// not yet unique across all library and binary targets. For a
+            /// generic module, the merged PTX set must contain each matching
+            /// specialization and no conflicting entry definition.
+            pub unsafe fn load_async(
+                device_id: usize,
+            ) -> ::core::result::Result<LoadedModule, ::cuda_host::cuda_async::error::DeviceError> {
+                // SAFETY: upheld by this function's caller.
+                unsafe { load_async_named(device_id, env!("CARGO_PKG_NAME")) }
+            }
+
+            /// Loads a caller-selected artifact for this contracted module.
+            ///
+            /// # Safety
+            ///
+            /// Every selected kernel must have the exact ABI and resource
+            /// semantics declared by this `cuda_module`. A matching symbol
+            /// name alone is not sufficient.
+            pub unsafe fn load_async_named(
+                device_id: usize,
+                name: &str,
+            ) -> ::core::result::Result<LoadedModule, ::cuda_host::cuda_async::error::DeviceError> {
+                ::cuda_host::load_cuda_module_from_async_context(device_id, |ctx| {
+                    // SAFETY: upheld by this function's caller.
+                    unsafe { load_named(ctx, name) }
+                })
+            }
+        }
+    } else if cfg!(feature = "async") {
         quote! {
             pub fn load_async(
                 device_id: usize,
@@ -336,9 +738,107 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
     } else {
         TokenStream2::new()
     };
+    let load_definition = if has_launch_contract {
+        quote! {
+            /// Loads this package's embedded artifact for a contracted module.
+            ///
+            /// # Safety
+            ///
+            /// For a non-generic module, the selected package bundle must be
+            /// the artifact compiled from this `cuda_module`; package names are
+            /// not yet unique across all library and binary targets. For a
+            /// generic module, the merged PTX set must contain each matching
+            /// specialization and no conflicting entry definition.
+            pub unsafe fn load(
+                ctx: &::std::sync::Arc<::cuda_core::CudaContext>,
+            ) -> ::core::result::Result<LoadedModule, ::cuda_host::EmbeddedModuleError> {
+                // SAFETY: upheld by this function's caller.
+                unsafe { load_named(ctx, env!("CARGO_PKG_NAME")) }
+            }
+        }
+    } else {
+        quote! {
+            pub fn load(
+                ctx: &::std::sync::Arc<::cuda_core::CudaContext>,
+            ) -> ::core::result::Result<LoadedModule, ::cuda_host::EmbeddedModuleError> {
+                load_named(ctx, env!("CARGO_PKG_NAME"))
+            }
+        }
+    };
+    let load_named_definition = if has_launch_contract {
+        quote! {
+            /// Loads a caller-selected artifact for this contracted module.
+            ///
+            /// # Safety
+            ///
+            /// Every selected kernel must have the exact ABI and resource
+            /// semantics declared by this `cuda_module`. A matching symbol
+            /// name alone is not sufficient.
+            pub unsafe fn load_named(
+                ctx: &::std::sync::Arc<::cuda_core::CudaContext>,
+                name: &str,
+            ) -> ::core::result::Result<LoadedModule, ::cuda_host::EmbeddedModuleError> {
+                #artifact_anchor_statements
+                #module_loader
+                // SAFETY: upheld by this function's caller.
+                unsafe { from_module(module) }.map_err(::cuda_host::EmbeddedModuleError::Driver)
+            }
+        }
+    } else {
+        quote! {
+            pub fn load_named(
+                ctx: &::std::sync::Arc<::cuda_core::CudaContext>,
+                name: &str,
+            ) -> ::core::result::Result<LoadedModule, ::cuda_host::EmbeddedModuleError> {
+                #artifact_anchor_statements
+                #module_loader
+                from_module(module).map_err(::cuda_host::EmbeddedModuleError::Driver)
+            }
+        }
+    };
+    let from_module_definition = if has_launch_contract {
+        quote! {
+            /// Binds caller-provided CUDA code to this module's launch API.
+            ///
+            /// # Safety
+            ///
+            /// Every loaded kernel must have the exact ABI and resource
+            /// semantics declared by this `cuda_module`. A matching symbol
+            /// name alone is not sufficient.
+            pub unsafe fn from_module(
+                module: ::std::sync::Arc<::cuda_core::CudaModule>,
+            ) -> ::core::result::Result<LoadedModule, ::cuda_core::DriverError> {
+                Ok(LoadedModule {
+                    __module: module.clone(),
+                    __generic_functions: ::std::sync::Arc::new(
+                        ::std::sync::Mutex::new(::std::collections::HashMap::new())
+                    ),
+                    #(#function_initializers)*
+                    #(#constant_initializers)*
+                })
+            }
+        }
+    } else {
+        quote! {
+            pub fn from_module(
+                module: ::std::sync::Arc<::cuda_core::CudaModule>,
+            ) -> ::core::result::Result<LoadedModule, ::cuda_core::DriverError> {
+                Ok(LoadedModule {
+                    __module: module.clone(),
+                    __generic_functions: ::std::sync::Arc::new(
+                        ::std::sync::Mutex::new(::std::collections::HashMap::new())
+                    ),
+                    #(#function_initializers)*
+                    #(#constant_initializers)*
+                })
+            }
+        }
+    };
     let async_launch_methods = if cfg!(feature = "async") {
-        let async_launch_methods = kernels.iter().map(generate_cuda_module_async_launch_method);
-        let owned_async_launch_methods = kernels
+        let async_launch_methods = direct_kernels
+            .iter()
+            .map(generate_cuda_module_async_launch_method);
+        let owned_async_launch_methods = direct_kernels
             .iter()
             .map(generate_cuda_module_owned_async_launch_method);
         quote! {
@@ -353,6 +853,7 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
         #(#module_attrs)*
         #vis mod #ident {
             #(#module_items)*
+            #(#launch_contract_impls)*
 
             #[derive(Clone, Debug)]
             #[allow(non_snake_case)]
@@ -367,33 +868,11 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
                 #(#constant_fields)*
             }
 
-            pub fn load(
-                ctx: &::std::sync::Arc<::cuda_core::CudaContext>,
-            ) -> ::core::result::Result<LoadedModule, ::cuda_host::EmbeddedModuleError> {
-                load_named(ctx, env!("CARGO_PKG_NAME"))
-            }
+            #load_definition
 
-            pub fn load_named(
-                ctx: &::std::sync::Arc<::cuda_core::CudaContext>,
-                name: &str,
-            ) -> ::core::result::Result<LoadedModule, ::cuda_host::EmbeddedModuleError> {
-                #artifact_anchor_statements
-                #module_loader
-                from_module(module).map_err(::cuda_host::EmbeddedModuleError::Driver)
-            }
+            #load_named_definition
 
-            pub fn from_module(
-                module: ::std::sync::Arc<::cuda_core::CudaModule>,
-            ) -> ::core::result::Result<LoadedModule, ::cuda_core::DriverError> {
-                Ok(LoadedModule {
-                    __module: module.clone(),
-                    __generic_functions: ::std::sync::Arc::new(
-                        ::std::sync::Mutex::new(::std::collections::HashMap::new())
-                    ),
-                    #(#function_initializers)*
-                    #(#constant_initializers)*
-                })
-            }
+            #from_module_definition
 
             #async_module_items
 
@@ -403,6 +882,7 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
                 }
 
                 #(#launch_methods)*
+                #(#prepare_launch_methods)*
                 #(#constant_resolver_methods)*
                 #(#set_constant_methods)*
                 #async_launch_methods
@@ -411,38 +891,338 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
     })
 }
 
-fn collect_cuda_module_kernels(items: &[Item]) -> syn::Result<Vec<CudaModuleKernel>> {
-    let mut kernels = Vec::new();
+struct CudaModuleLevel {
+    items: Vec<Item>,
+    kernels: Vec<CudaModuleKernel>,
+    direct_kernel_count: usize,
+}
+
+/// Recursively rewrite only inline child modules.
+///
+/// Every module that owns a kernel (or contains a deeper module that does)
+/// receives its own `LoadedModule`. That keeps generated method signatures in
+/// the same Rust scope as the source kernel. File-backed modules and
+/// `include!` invocations are preserved but not traversed: their contents are
+/// not present in an attribute macro's input token stream, and reproducing
+/// rustc's module loader in a proc macro is neither complete nor hygienic.
+fn transform_cuda_module_items(
+    items: &[Item],
+    module_path: &mut Vec<Ident>,
+    ancestor_cfg_attrs: &[syn::Attribute],
+    generate_nested_support: bool,
+) -> syn::Result<CudaModuleLevel> {
+    let mut transformed_items = Vec::with_capacity(items.len());
+    let mut direct_kernels = Vec::new();
+    let mut descendant_kernels = Vec::new();
+
     for item in items {
-        let Item::Fn(item_fn) = item else {
-            continue;
-        };
-        if !has_attr_named(&item_fn.attrs, "kernel") {
-            continue;
+        match item {
+            Item::Fn(item_fn) => {
+                if let Some(kernel) = cuda_module_kernel(item_fn, module_path, ancestor_cfg_attrs)?
+                {
+                    direct_kernels.push(kernel);
+                }
+                transformed_items.push(item.clone());
+            }
+            Item::Mod(item_mod) => {
+                let Some((_brace, nested_items)) = &item_mod.content else {
+                    // Attribute macros receive the declaration, not the file's
+                    // contents. Preserve it exactly, but do not pretend that
+                    // kernels behind this boundary were discovered.
+                    transformed_items.push(item.clone());
+                    continue;
+                };
+
+                module_path.push(item_mod.ident.clone());
+                let mut nested_cfg_attrs = ancestor_cfg_attrs.to_vec();
+                nested_cfg_attrs.extend(cuda_module_cfg_attrs(&item_mod.attrs)?);
+                let nested = transform_cuda_module_items(
+                    nested_items,
+                    module_path,
+                    &nested_cfg_attrs,
+                    true,
+                )?;
+                module_path.pop();
+
+                let mut transformed_mod = item_mod.clone();
+                transformed_mod
+                    .content
+                    .as_mut()
+                    .expect("inline module content disappeared")
+                    .1 = nested.items;
+                descendant_kernels.extend(nested.kernels);
+                transformed_items.push(Item::Mod(transformed_mod));
+            }
+            _ => transformed_items.push(item.clone()),
         }
-        let cluster_dim = cuda_module_cluster_dim(&item_fn.attrs)?;
-        let cooperative = cuda_module_cooperative(&item_fn.attrs)?;
-        let params = cuda_module_params(item_fn)?;
-        let is_generic = item_fn
-            .sig
-            .generics
-            .params
-            .iter()
-            .any(|param| matches!(param, GenericParam::Type(_)));
-        kernels.push(CudaModuleKernel {
-            vis: item_fn.vis.clone(),
-            cfg_attrs: cuda_module_cfg_attrs(&item_fn.attrs),
-            method_attrs: cuda_module_method_attrs(&item_fn.attrs),
-            unsafety: item_fn.sig.unsafety,
-            fn_name: item_fn.sig.ident.clone(),
-            generics: item_fn.sig.generics.clone(),
-            params,
-            cluster_dim,
-            cooperative,
-            is_generic,
-        });
     }
-    Ok(kernels)
+
+    let direct_kernel_count = direct_kernels.len();
+    let mut kernels = direct_kernels;
+    kernels.extend(descendant_kernels);
+
+    if generate_nested_support && !kernels.is_empty() {
+        reject_reserved_loaded_module(items)?;
+        reject_reserved_loaded_module_methods(&kernels[..direct_kernel_count], true)?;
+        let support = generate_nested_cuda_module_support(&kernels[..direct_kernel_count]);
+        let mut support_items = syn::parse2::<syn::File>(support)?.items;
+        transformed_items.append(&mut support_items);
+    }
+
+    Ok(CudaModuleLevel {
+        items: transformed_items,
+        kernels,
+        direct_kernel_count,
+    })
+}
+
+fn reject_reserved_loaded_module(items: &[Item]) -> syn::Result<()> {
+    for item in items {
+        let ident = match item {
+            Item::Const(item) => Some(&item.ident),
+            Item::Enum(item) => Some(&item.ident),
+            Item::ExternCrate(item) => item
+                .rename
+                .as_ref()
+                .map(|(_as_token, rename)| rename)
+                .or(Some(&item.ident)),
+            Item::Fn(item) => Some(&item.sig.ident),
+            Item::Mod(item) => Some(&item.ident),
+            Item::Static(item) => Some(&item.ident),
+            Item::Struct(item) => Some(&item.ident),
+            Item::Trait(item) => Some(&item.ident),
+            Item::TraitAlias(item) => Some(&item.ident),
+            Item::Type(item) => Some(&item.ident),
+            Item::Union(item) => Some(&item.ident),
+            Item::Use(item) => cuda_module_loaded_module_use_binding(&item.tree),
+            _ => None,
+        };
+        if ident.is_some_and(|ident| cuda_module_ident_key(ident) == "LoadedModule") {
+            return Err(syn::Error::new_spanned(
+                ident.expect("checked above"),
+                "#[cuda_module] reserves the name `LoadedModule` in every inline namespace that contains kernels",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_reserved_loaded_module_methods(
+    kernels: &[CudaModuleKernel],
+    nested: bool,
+) -> syn::Result<()> {
+    for kernel in kernels {
+        let name = cuda_module_ident_key(&kernel.fn_name);
+        let reserved = name == "as_cuda_module" || (nested && name == "from_parent");
+        if reserved {
+            let scope = if name == "from_parent" {
+                "nested kernel namespaces"
+            } else {
+                "every kernel namespace"
+            };
+            return Err(syn::Error::new_spanned(
+                &kernel.fn_name,
+                format!(
+                    "#[cuda_module] reserves launcher method name `{name}` in {scope}; rename the kernel"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Return the collision key for generated Rust and PTX namespaces.
+///
+/// `syn::Ident::to_string()` preserves a raw prefix, but `step` and `r#step`
+/// name the same Rust identifier and must collide in cuda-oxide's bare PTX
+/// namespace. Guards compare this normalized key before generating anything.
+fn cuda_module_ident_key(ident: &Ident) -> String {
+    let spelling = ident.to_string();
+    spelling.strip_prefix("r#").unwrap_or(&spelling).to_string()
+}
+
+fn cuda_module_loaded_module_use_binding(tree: &syn::UseTree) -> Option<&Ident> {
+    match tree {
+        syn::UseTree::Path(path) => cuda_module_loaded_module_use_binding(&path.tree),
+        syn::UseTree::Name(name) => {
+            (cuda_module_ident_key(&name.ident) == "LoadedModule").then_some(&name.ident)
+        }
+        syn::UseTree::Rename(rename) => {
+            (cuda_module_ident_key(&rename.rename) == "LoadedModule").then_some(&rename.rename)
+        }
+        syn::UseTree::Group(group) => group
+            .items
+            .iter()
+            .find_map(cuda_module_loaded_module_use_binding),
+        syn::UseTree::Glob(_) => None,
+    }
+}
+
+fn cuda_module_kernel(
+    item_fn: &ItemFn,
+    module_path: &[Ident],
+    ancestor_cfg_attrs: &[syn::Attribute],
+) -> syn::Result<Option<CudaModuleKernel>> {
+    if !has_attr_named(&item_fn.attrs, "kernel") {
+        return Ok(None);
+    }
+    if let Some(err) = impl_trait_parameter_error(item_fn, "kernel") {
+        return Err(err);
+    }
+    let cluster_dim = cuda_module_cluster_dim(&item_fn.attrs)?;
+    let cooperative = cuda_module_cooperative(&item_fn.attrs)?;
+    let params = cuda_module_params(item_fn)?;
+    let launch_contract =
+        cuda_module_launch_contract(&item_fn.attrs, &item_fn.sig.ident, &params, cluster_dim)?;
+    let mut generics = item_fn.sig.generics.clone();
+    if let Some(contract) = launch_contract {
+        add_cuda_module_disjoint_contract_bounds(&mut generics, &params, contract.domain);
+    }
+    let is_generic = has_codegen_generics(&item_fn.sig.generics);
+    let cfg_attrs = cuda_module_cfg_attrs(&item_fn.attrs)?;
+    let mut effective_cfg_attrs = ancestor_cfg_attrs.to_vec();
+    effective_cfg_attrs.extend(cfg_attrs.clone());
+    Ok(Some(CudaModuleKernel {
+        module_path: module_path.to_vec(),
+        vis: item_fn.vis.clone(),
+        cfg_attrs,
+        effective_cfg_attrs,
+        method_attrs: cuda_module_method_attrs(&item_fn.attrs),
+        unsafety: item_fn.sig.unsafety,
+        fn_name: item_fn.sig.ident.clone(),
+        generics,
+        params,
+        cluster_dim,
+        cooperative,
+        launch_contract,
+        is_generic,
+    }))
+}
+
+fn generate_nested_cuda_module_support(kernels: &[CudaModuleKernel]) -> TokenStream2 {
+    let launch_contract_impls = kernels
+        .iter()
+        .filter_map(generate_cuda_module_launch_contract_impl);
+    let prepare_launch_methods = kernels
+        .iter()
+        .filter_map(generate_cuda_module_prepare_launch_methods);
+    let non_generic_kernels = kernels.iter().filter(|kernel| !kernel.is_generic);
+    let function_fields = non_generic_kernels.clone().map(|kernel| {
+        let cfg_attrs = &kernel.cfg_attrs;
+        let field = cuda_module_function_field(&kernel.fn_name);
+        quote! {
+            #(#cfg_attrs)*
+            #field: ::cuda_core::CudaFunction,
+        }
+    });
+    let function_initializers = non_generic_kernels.map(|kernel| {
+        let cfg_attrs = &kernel.cfg_attrs;
+        let field = cuda_module_function_field(&kernel.fn_name);
+        let marker = cuda_kernel_marker_name(&kernel.fn_name);
+        quote! {
+            #(#cfg_attrs)*
+            #field: module.load_function(<#marker as ::cuda_host::CudaKernel>::PTX_NAME)?,
+        }
+    });
+    let launch_methods = kernels.iter().map(generate_cuda_module_launch_method);
+    let async_launch_methods = if cfg!(feature = "async") {
+        let borrowed = kernels.iter().map(generate_cuda_module_async_launch_method);
+        let owned = kernels
+            .iter()
+            .map(generate_cuda_module_owned_async_launch_method);
+        quote! {
+            #(#borrowed)*
+            #(#owned)*
+        }
+    } else {
+        TokenStream2::new()
+    };
+
+    quote! {
+        #(#launch_contract_impls)*
+
+        #[derive(Clone, Debug)]
+        #[allow(non_snake_case)]
+        pub struct LoadedModule {
+            __module: ::std::sync::Arc<::cuda_core::CudaModule>,
+            __generic_functions: ::std::sync::Arc<
+                ::std::sync::Mutex<
+                    ::std::collections::HashMap<&'static str, ::cuda_core::CudaFunction>
+                >
+            >,
+            #(#function_fields)*
+        }
+
+        impl LoadedModule {
+            /// Bind this namespace's launchers to a module loaded by its
+            /// immediate parent namespace.
+            pub fn from_parent(
+                parent: &super::LoadedModule,
+            ) -> ::core::result::Result<Self, ::cuda_core::DriverError> {
+                let module = parent.as_cuda_module().clone();
+                Ok(Self {
+                    __module: module.clone(),
+                    __generic_functions: parent.__generic_functions.clone(),
+                    #(#function_initializers)*
+                })
+            }
+
+            pub fn as_cuda_module(&self) -> &::std::sync::Arc<::cuda_core::CudaModule> {
+                &self.__module
+            }
+
+            #(#launch_methods)*
+            #(#prepare_launch_methods)*
+            #async_launch_methods
+        }
+    }
+}
+
+/// Reject duplicate bare kernel names anywhere in one `#[cuda_module]` tree.
+///
+/// Launcher methods are namespace-qualified, but cuda-oxide's current PTX
+/// entry naming is not: `stage1::step` and `stage2::step` both export `step`.
+/// Until the backend and `#[kernel]` share a qualified entry-name contract,
+/// accepting the pair would risk resolving a launcher to the wrong entry.
+/// The restriction is therefore syntactic and also applies to cfg-gated
+/// alternatives; proc macros cannot prove that arbitrary cfg predicates are
+/// mutually exclusive.
+fn reject_conflicting_kernel_names(kernels: &[CudaModuleKernel]) -> syn::Result<()> {
+    let mut names: std::collections::HashMap<String, &CudaModuleKernel> =
+        std::collections::HashMap::new();
+    for kernel in kernels {
+        let name = cuda_module_ident_key(&kernel.fn_name);
+        if let Some(previous) = names.insert(name.clone(), kernel) {
+            return Err(syn::Error::new(
+                kernel.fn_name.span(),
+                format!(
+                    "cuda-oxide PTX entry names are currently bare function names, so \
+                     #[cuda_module] requires kernel names to be unique across its inline \
+                     module tree: `{name}` in {second} conflicts with `{name}` in {first}; \
+                     rename one of the kernels",
+                    name = name,
+                    first = cuda_module_path_description(&previous.module_path),
+                    second = cuda_module_path_description(&kernel.module_path),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn cuda_module_path_description(module_path: &[Ident]) -> String {
+    if module_path.is_empty() {
+        "the module root".to_string()
+    } else {
+        format!(
+            "`{}`",
+            module_path
+                .iter()
+                .map(Ident::to_string)
+                .collect::<Vec<_>>()
+                .join("::")
+        )
+    }
 }
 
 /// Generate the statements that pin this crate's embedded device artifact
@@ -475,9 +1255,11 @@ fn collect_cuda_module_kernels(items: &[Item]) -> syn::Result<Vec<CudaModuleKern
 /// their PTX embedded) in the *consuming* crate, so a module with only
 /// generic kernels yields no artifact here, and an anchor reference would
 /// be an undefined-symbol link error. The same reasoning extends to
-/// `#[cfg]`-gated kernels: the anchor is guarded by the disjunction of
-/// the kernels' cfg conditions so it is only referenced when at least one
-/// concrete kernel is actually compiled.
+/// cfg-gated kernels: root `load()` emits one equivalent guarded reference per
+/// concrete kernel in the complete inline tree. Each reference carries the
+/// kernel's effective ancestor-plus-local availability attributes, so a module
+/// containing only nested kernels is still independently loadable while no
+/// anchor is referenced when every concrete kernel is absent.
 fn cuda_module_artifact_anchor_statements(
     kernels: &[CudaModuleKernel],
 ) -> syn::Result<TokenStream2> {
@@ -502,34 +1284,9 @@ fn cuda_module_artifact_anchor_statements(
         return Ok(TokenStream2::new());
     }
 
-    let non_generic: Vec<&CudaModuleKernel> =
-        kernels.iter().filter(|kernel| !kernel.is_generic).collect();
-    if non_generic.is_empty() {
+    if !kernels.iter().any(|kernel| !kernel.is_generic) {
         return Ok(TokenStream2::new());
     }
-
-    let cfg_guard = if non_generic.iter().any(|kernel| kernel.cfg_attrs.is_empty()) {
-        // At least one concrete kernel is compiled unconditionally, so the
-        // artifact object always exists: no guard needed.
-        None
-    } else {
-        // Every concrete kernel is cfg-gated. Reference the anchor only
-        // when at least one of them is enabled. A kernel with several cfg
-        // attributes requires all of them, hence all(...) per kernel
-        // joined under any(...).
-        let alternatives = non_generic
-            .iter()
-            .map(|kernel| {
-                let predicates = kernel
-                    .cfg_attrs
-                    .iter()
-                    .map(|attr| attr.parse_args::<TokenStream2>())
-                    .collect::<syn::Result<Vec<_>>>()?;
-                Ok(quote! { all( #(#predicates),* ) })
-            })
-            .collect::<syn::Result<Vec<_>>>()?;
-        Some(quote! { #[cfg(any( #(#alternatives),* ))] })
-    };
 
     let binary_name = std::env::var("CARGO_BIN_NAME").ok();
     let anchor = if owner_selection.is_some() {
@@ -543,19 +1300,28 @@ fn cuda_module_artifact_anchor_statements(
         artifact_anchor_symbol(&package_name, &package_version)
     };
     let anchor_name = LitStr::new(&anchor, proc_macro2::Span::call_site());
+    let references = kernels
+        .iter()
+        .filter(|kernel| !kernel.is_generic)
+        .map(|kernel| {
+            let cfg_attrs = &kernel.effective_cfg_attrs;
+            quote! {
+                #(#cfg_attrs)*
+                let _artifact_anchor: *const ::core::primitive::u8 = {
+                    unsafe extern "C" {
+                        #[link_name = #anchor_name]
+                        static CUDA_OXIDE_BUNDLE_ANCHOR: ::core::primitive::u8;
+                    }
+                    ::std::hint::black_box(unsafe {
+                        ::core::ptr::addr_of!(CUDA_OXIDE_BUNDLE_ANCHOR)
+                    })
+                };
+            }
+        });
     Ok(quote! {
         // Keep-alive handshake with the codegen backend: see the macro
         // crate's `cuda_module_artifact_anchor_statements` for details.
-        #cfg_guard
-        let _artifact_anchor: *const ::core::primitive::u8 = {
-            unsafe extern "C" {
-                #[link_name = #anchor_name]
-                static CUDA_OXIDE_BUNDLE_ANCHOR: ::core::primitive::u8;
-            }
-            ::std::hint::black_box(unsafe {
-                ::core::ptr::addr_of!(CUDA_OXIDE_BUNDLE_ANCHOR)
-            })
-        };
+        #(#references)*
     })
 }
 
@@ -605,7 +1371,7 @@ fn collect_cuda_module_constants(
         constants.push(CudaModuleConstant {
             ident: item_static.ident.clone(),
             ty: item_static.ty.clone(),
-            cfg_attrs: cuda_module_cfg_attrs(&item_static.attrs),
+            cfg_attrs: cuda_module_cfg_attrs(&item_static.attrs)?,
             method_attrs: cuda_module_method_attrs(&item_static.attrs),
             symbol: cuda_module_constant_symbol(module_ident, &item_static.ident),
         });
@@ -838,12 +1604,87 @@ fn cuda_module_method_attrs(attrs: &[syn::Attribute]) -> Vec<syn::Attribute> {
         .collect()
 }
 
-fn cuda_module_cfg_attrs(attrs: &[syn::Attribute]) -> Vec<syn::Attribute> {
-    attrs
-        .iter()
-        .filter(|attr| attr_path_ends_with(attr, "cfg"))
-        .cloned()
-        .collect()
+/// Copy only the part of `cfg` / `cfg_attr` that controls whether an item
+/// exists. A kernel may use `cfg_attr` for function-only attributes such as
+/// `inline`; copying those onto generated fields or statements would be
+/// invalid. The nested `cfg` / `cfg_attr` availability semantics are retained;
+/// unrelated conditional attributes are omitted from generated items.
+fn cuda_module_cfg_attrs(attrs: &[syn::Attribute]) -> syn::Result<Vec<syn::Attribute>> {
+    let mut filtered = Vec::new();
+    for attr in attrs {
+        if attr_path_ends_with(attr, "cfg") {
+            filtered.push(attr.clone());
+        } else if attr_path_ends_with(attr, "cfg_attr")
+            && let Some(attr) = filter_cuda_module_cfg_attr(attr)?
+        {
+            filtered.push(attr);
+        }
+    }
+    Ok(filtered)
+}
+
+fn filter_cuda_module_cfg_attr(attr: &syn::Attribute) -> syn::Result<Option<syn::Attribute>> {
+    let syn::Meta::List(list) = &attr.meta else {
+        return Err(syn::Error::new_spanned(attr, "cfg_attr requires arguments"));
+    };
+    let parser = Punctuated::<syn::Meta, Token![,]>::parse_terminated;
+    let mut args = syn::parse::Parser::parse2(parser, list.tokens.clone())?.into_iter();
+    let predicate = args
+        .next()
+        .ok_or_else(|| syn::Error::new_spanned(attr, "cfg_attr requires a predicate"))?;
+    let mut nested = Vec::new();
+    for meta in args {
+        if let Some(meta) = filter_cuda_module_cfg_meta(meta)? {
+            nested.push(meta);
+        }
+    }
+    if nested.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(parse_quote!(#[cfg_attr(#predicate, #(#nested),*)])))
+    }
+}
+
+fn filter_cuda_module_cfg_meta(meta: syn::Meta) -> syn::Result<Option<syn::Meta>> {
+    if meta
+        .path()
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "cfg")
+    {
+        return Ok(Some(meta));
+    }
+    if meta
+        .path()
+        .segments
+        .last()
+        .is_none_or(|segment| segment.ident != "cfg_attr")
+    {
+        return Ok(None);
+    }
+    filter_cuda_module_nested_cfg_attr(meta)
+}
+
+fn filter_cuda_module_nested_cfg_attr(meta: syn::Meta) -> syn::Result<Option<syn::Meta>> {
+    let syn::Meta::List(list) = &meta else {
+        return Err(syn::Error::new_spanned(meta, "cfg_attr requires arguments"));
+    };
+    let parser = Punctuated::<syn::Meta, Token![,]>::parse_terminated;
+    let mut args = syn::parse::Parser::parse2(parser, list.tokens.clone())?.into_iter();
+    let predicate = args
+        .next()
+        .ok_or_else(|| syn::Error::new_spanned(&meta, "cfg_attr requires a predicate"))?;
+    let mut nested = Vec::new();
+    for meta in args {
+        if let Some(meta) = filter_cuda_module_cfg_meta(meta)? {
+            nested.push(meta);
+        }
+    }
+    if nested.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(parse_quote!(cfg_attr(#predicate, #(#nested),*))))
+    }
 }
 
 fn has_attr_named(attrs: &[syn::Attribute], name: &str) -> bool {
@@ -883,6 +1724,132 @@ fn cuda_module_cooperative(attrs: &[syn::Attribute]) -> syn::Result<bool> {
     Ok(false)
 }
 
+fn cuda_module_launch_contract(
+    attrs: &[syn::Attribute],
+    _fn_name: &Ident,
+    params: &[CudaModuleParam],
+    cluster_dim: Option<(u32, u32, u32)>,
+) -> syn::Result<Option<CudaModuleLaunchContract>> {
+    let contract_attrs: Vec<_> = attrs
+        .iter()
+        .filter(|attr| attr_path_ends_with(attr, "launch_contract"))
+        .collect();
+    if contract_attrs.len() > 1 {
+        return Err(syn::Error::new_spanned(
+            contract_attrs[1],
+            "a kernel may have only one launch_contract",
+        ));
+    }
+    let Some(attr) = contract_attrs.first() else {
+        return Ok(None);
+    };
+    let args = attr.parse_args::<LaunchContractArgs>()?;
+
+    if let Some(param) = params.iter().find(|param| param.mutable_slice) {
+        return Err(syn::Error::new(
+            param.name.span(),
+            "contracted kernels cannot take `&mut [T]`; use `DisjointSlice<T, IndexSpace>` so the launch domain and per-thread write ownership are explicit",
+        ));
+    }
+    if let Some(block) = args.exact_block {
+        validate_dimensions_for_domain(block, args.domain, "block", attr.span())?;
+    }
+    if let Some(cluster) = cluster_dim {
+        validate_dimensions_for_domain(cluster, args.domain, "cluster", attr.span())?;
+    }
+
+    let launch_bounds = cuda_module_launch_bounds(attrs)?;
+    if launch_bounds.is_some_and(|bounds| bounds.max_threads == 0) {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "contracted #[launch_bounds] must allow at least one X-dimension thread",
+        ));
+    }
+    if args.exact_block.is_none() && launch_bounds.is_none() {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "launch_contract requires either an exact `block = (x, y, z)` or #[launch_bounds(max_threads)]",
+        ));
+    }
+    let max_block_threads = launch_bounds.map(|bounds| bounds.max_threads);
+    if let (Some(exact), Some(maximum)) = (args.exact_block, max_block_threads) {
+        let exact_threads = u64::from(exact.0)
+            .checked_mul(u64::from(exact.1))
+            .and_then(|xy| xy.checked_mul(u64::from(exact.2)))
+            .ok_or_else(|| {
+                syn::Error::new_spanned(attr, "launch_contract block thread count overflows u64")
+            })?;
+        if exact_threads > u64::from(maximum) {
+            return Err(syn::Error::new_spanned(
+                attr,
+                format!(
+                    "launch_contract block {exact:?} has {exact_threads} threads, exceeding #[launch_bounds({maximum})]"
+                ),
+            ));
+        }
+    }
+
+    let min_compute_capability = match cluster_dim {
+        Some(_) if args.min_compute_capability < (9, 0) => (9, 0),
+        _ => args.min_compute_capability,
+    };
+
+    Ok(Some(CudaModuleLaunchContract {
+        domain: args.domain,
+        exact_block: args.exact_block,
+        max_block_threads,
+        dynamic_shared: args.dynamic_shared,
+        dynamic_shared_alignment: args.dynamic_shared_alignment,
+        min_compute_capability,
+    }))
+}
+
+fn cuda_module_launch_bounds(attrs: &[syn::Attribute]) -> syn::Result<Option<LaunchBoundsArgs>> {
+    let matching: Vec<_> = attrs
+        .iter()
+        .filter(|attr| attr_path_ends_with(attr, "launch_bounds"))
+        .collect();
+    if matching.len() > 1 {
+        return Err(syn::Error::new_spanned(
+            matching[1],
+            "a kernel may have only one launch_bounds attribute",
+        ));
+    }
+    matching
+        .first()
+        .map(|attr| attr.parse_args::<LaunchBoundsArgs>())
+        .transpose()
+}
+
+fn validate_dimensions_for_domain(
+    dimensions: (u32, u32, u32),
+    domain: u8,
+    kind: &str,
+    span: proc_macro2::Span,
+) -> syn::Result<()> {
+    if dimensions.0 == 0 || dimensions.1 == 0 || dimensions.2 == 0 {
+        return Err(syn::Error::new(
+            span,
+            format!("launch_contract {kind} dimensions must be non-zero"),
+        ));
+    }
+    let outside_domain = match domain {
+        1 => dimensions.1 != 1 || dimensions.2 != 1,
+        2 => dimensions.2 != 1,
+        3 => false,
+        _ => unreachable!(),
+    };
+    if outside_domain {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "launch_contract {kind} dimensions {dimensions:?} exceed the declared {domain}D domain"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn cuda_module_params(item_fn: &ItemFn) -> syn::Result<Vec<CudaModuleParam>> {
     item_fn
         .sig
@@ -907,17 +1874,26 @@ fn cuda_module_param_from_typed(pat_type: &syn::PatType) -> syn::Result<CudaModu
     };
     let name = pat_ident.ident.clone();
     let (sync_host_ty, async_host_ty, marshal) = cuda_module_host_type(&pat_type.ty)?;
+    let mutable_slice = cuda_module_slice_elem(&pat_type.ty).is_some_and(|(_, mutable)| mutable);
+    let disjoint_slice_elem = cuda_module_disjoint_slice_elem(&pat_type.ty);
+    let disjoint_slice_ty = disjoint_slice_elem
+        .as_ref()
+        .map(|_| pat_type.ty.as_ref().clone());
     Ok(CudaModuleParam {
         name,
         sync_host_ty,
         async_host_ty,
         marshal,
+        mutable_slice,
+        disjoint_slice_ty,
+        disjoint_slice_elem,
     })
 }
 
 fn cuda_module_host_type(
     ty: &Type,
 ) -> syn::Result<(TokenStream2, TokenStream2, CudaModuleParamMarshal)> {
+    let async_lifetime = cuda_module_async_lifetime();
     if let Some((elem_ty, mutable)) = cuda_module_slice_elem(ty) {
         let sync_host_ty = if mutable {
             quote! { &mut ::cuda_core::DeviceBuffer<#elem_ty> }
@@ -926,14 +1902,14 @@ fn cuda_module_host_type(
         };
         let (async_host_ty, marshal) = if mutable {
             (
-                quote! { &'__cuda_module_async mut impl ::cuda_host::KernelSliceArgMut<Elem = #elem_ty> },
+                quote! { &#async_lifetime mut impl ::cuda_host::KernelSliceArgMut<Elem = #elem_ty> },
                 CudaModuleParamMarshal::WritableDeviceBuffer {
                     elem_ty: quote! { #elem_ty },
                 },
             )
         } else {
             (
-                quote! { &'__cuda_module_async impl ::cuda_host::KernelSliceArg<Elem = #elem_ty> },
+                quote! { &#async_lifetime impl ::cuda_host::KernelSliceArg<Elem = #elem_ty> },
                 CudaModuleParamMarshal::ReadOnlyDeviceBuffer {
                     elem_ty: quote! { #elem_ty },
                 },
@@ -945,7 +1921,7 @@ fn cuda_module_host_type(
     if let Some(elem_ty) = cuda_module_disjoint_slice_elem(ty) {
         return Ok((
             quote! { &mut ::cuda_core::DeviceBuffer<#elem_ty> },
-            quote! { &'__cuda_module_async mut impl ::cuda_host::KernelSliceArgMut<Elem = #elem_ty> },
+            quote! { &#async_lifetime mut impl ::cuda_host::KernelSliceArgMut<Elem = #elem_ty> },
             CudaModuleParamMarshal::WritableDeviceBuffer {
                 elem_ty: quote! { #elem_ty },
             },
@@ -988,20 +1964,247 @@ fn cuda_module_disjoint_slice_elem(ty: &Type) -> Option<TokenStream2> {
     let PathArguments::AngleBracketed(args) = &segment.arguments else {
         return None;
     };
-    args.args.iter().find_map(|arg| {
-        if let GenericArgument::Type(ty) = arg {
-            Some(quote! { #ty })
-        } else {
-            None
+    let type_args: Vec<_> = args
+        .args
+        .iter()
+        .filter_map(|arg| match arg {
+            GenericArgument::Type(ty) => Some(ty),
+            _ => None,
+        })
+        .collect();
+    let elem = *type_args.first()?;
+    Some(quote! { #elem })
+}
+
+/// Adds a semantic launch-domain proof for every writable device slice.
+///
+/// The macro only uses the outer `DisjointSlice` spelling to select the host
+/// ABI. The Rust compiler decides whether the *resolved, complete type* is a
+/// genuine cuda-device slice with a compatible index space. This makes type
+/// aliases work without letting a local look-alike bypass the contract.
+fn add_cuda_module_disjoint_contract_bounds(
+    generics: &mut syn::Generics,
+    params: &[CudaModuleParam],
+    domain: u8,
+) {
+    for param in params {
+        let (Some(device_ty), Some(element_ty)) =
+            (&param.disjoint_slice_ty, &param.disjoint_slice_elem)
+        else {
+            continue;
+        };
+        let (device_ty, bound_lifetime) = cuda_module_disjoint_bound_type(device_ty);
+        generics.make_where_clause().predicates.push(parse_quote! {
+            for<#bound_lifetime> #device_ty:
+                ::cuda_device::__LaunchContractDisjointSlice<#element_ty, #domain>
+        });
+    }
+}
+
+/// Makes the elided `DisjointSlice` lifetime explicit so the complete device
+/// type can appear in an impl-level where-clause.
+fn cuda_module_disjoint_bound_type(ty: &Type) -> (Type, syn::Lifetime) {
+    let mut ty = ty.clone();
+    let Type::Path(type_path) = &mut ty else {
+        unreachable!("only recognized DisjointSlice paths reach this helper");
+    };
+    let segment = type_path
+        .path
+        .segments
+        .last_mut()
+        .expect("recognized DisjointSlice path has a final segment");
+    let PathArguments::AngleBracketed(args) = &mut segment.arguments else {
+        unreachable!("recognized DisjointSlice path has generic arguments");
+    };
+    let bound_ident = internal_ident("__cuda_oxide_disjoint");
+    let bound_lifetime = syn::Lifetime::new(&format!("'{}", bound_ident), bound_ident.span());
+    if let Some(GenericArgument::Lifetime(lifetime)) = args.args.first_mut() {
+        *lifetime = bound_lifetime.clone();
+    } else {
+        let previous = core::mem::take(&mut args.args);
+        args.args
+            .push(GenericArgument::Lifetime(bound_lifetime.clone()));
+        args.args.extend(previous);
+    }
+    (ty, bound_lifetime)
+}
+
+fn cuda_module_kernel_marker_type(kernel: &CudaModuleKernel) -> TokenStream2 {
+    let marker = cuda_kernel_marker_name(&kernel.fn_name);
+    if !kernel.is_generic {
+        return quote! { #marker };
+    }
+    let marker_args = generic_arguments(&kernel.generics);
+    if marker_args.is_empty() {
+        quote! { #marker }
+    } else {
+        quote! { #marker<#(#marker_args),*> }
+    }
+}
+
+fn generate_cuda_module_launch_contract_impl(kernel: &CudaModuleKernel) -> Option<TokenStream2> {
+    let contract = kernel.launch_contract.as_ref()?;
+    let cfg_attrs = &kernel.cfg_attrs;
+    let marker_ty = cuda_module_kernel_marker_type(kernel);
+    // `#[kernel]` erases lifetime-only generic lists because lifetimes do not
+    // create codegen instances. Mirror the marker that `#[kernel]` actually
+    // emits instead of applying erased lifetimes to a non-generic marker.
+    let generics = if kernel.is_generic {
+        kernel.generics.clone()
+    } else {
+        syn::Generics::default()
+    };
+    let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
+    let config_ty = match contract.domain {
+        1 => quote! { ::cuda_core::LaunchConfig1D },
+        2 => quote! { ::cuda_core::LaunchConfig2D },
+        3 => quote! { ::cuda_core::LaunchConfig3D },
+        _ => unreachable!(),
+    };
+    let block = if let Some((x, y, z)) = contract.exact_block {
+        quote! { ::cuda_core::BlockRequirement::Exact((#x, #y, #z)) }
+    } else {
+        let max_threads = contract
+            .max_block_threads
+            .expect("validated contract without exact block has launch bounds");
+        quote! { ::cuda_core::BlockRequirement::MaxThreads(#max_threads) }
+    };
+    let alignment = contract.dynamic_shared_alignment;
+    let dynamic_shared = match contract.dynamic_shared {
+        DynamicSharedContract::Exact(bytes) => quote! {
+            ::cuda_core::DynamicSharedMemoryRequirement::Exact {
+                bytes: #bytes,
+                min_alignment: #alignment,
+            }
+        },
+        DynamicSharedContract::Range {
+            min_bytes,
+            max_bytes,
+        } => quote! {
+            ::cuda_core::DynamicSharedMemoryRequirement::Range {
+                min_bytes: #min_bytes,
+                max_bytes: #max_bytes,
+                min_alignment: #alignment,
+            }
+        },
+    };
+    let kernel_name = kernel.fn_name.to_string();
+    let cluster = contract.cluster_tokens(kernel.cluster_dim);
+    let cooperative = kernel.cooperative.then(|| quote! { .with_cooperative() });
+    let (major, minor) = contract.min_compute_capability;
+    let compute_capability = ((major, minor) != (0, 0)).then(|| {
+        quote! { .with_min_compute_capability(#major, #minor) }
+    });
+
+    Some(quote! {
+        #(#cfg_attrs)*
+        impl #impl_generics ::cuda_core::KernelLaunchContract for #marker_ty
+        #where_clause
+        {
+            type Config = #config_ty;
+            const SPEC: ::cuda_core::LaunchContractSpec =
+                ::cuda_core::LaunchContractSpec::new(#kernel_name, #block, #dynamic_shared)
+                    #cluster
+                    #cooperative
+                    #compute_capability;
         }
     })
 }
 
+impl CudaModuleLaunchContract {
+    fn cluster_tokens(&self, cluster_dim: Option<(u32, u32, u32)>) -> Option<TokenStream2> {
+        cluster_dim.map(|(x, y, z)| quote! { .with_cluster((#x, #y, #z)) })
+    }
+}
+
+fn generate_cuda_module_prepare_launch_methods(kernel: &CudaModuleKernel) -> Option<TokenStream2> {
+    kernel.launch_contract.as_ref()?;
+    let vis = &kernel.vis;
+    let cfg_attrs = &kernel.cfg_attrs;
+    let fn_name = &kernel.fn_name;
+    let prepare_name = format_ident!("prepare_{}", fn_name);
+    let prepare_for_name = format_ident!("prepare_{}_for", fn_name);
+    let marker_ty = cuda_module_kernel_marker_type(kernel);
+    let generics = kernel.generics.clone();
+    let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
+    let function_binding = cuda_module_function_binding(kernel);
+    let function = internal_ident("__cuda_oxide_function");
+    let config = internal_ident("__cuda_oxide_config");
+    let codegen_args = codegen_generic_arguments(&kernel.generics);
+    let turbofish = if codegen_args.is_empty() {
+        quote! {}
+    } else {
+        quote! { ::<#(#codegen_args),*> }
+    };
+    let type_params: Vec<_> = kernel
+        .generics
+        .params
+        .iter()
+        .filter_map(|param| match param {
+            GenericParam::Type(type_param) => Some(&type_param.ident),
+            GenericParam::Lifetime(_) | GenericParam::Const(_) => None,
+        })
+        .collect();
+    let witness_params = type_params.iter().enumerate().map(|(index, ty)| {
+        let name = internal_ident(&format!("__cuda_oxide_type_witness_{index}"));
+        quote! { #name: &#ty }
+    });
+    let prepare_for = (!type_params.is_empty()).then(|| {
+        quote! {
+            #(#cfg_attrs)*
+            #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
+            #vis fn #prepare_for_name #impl_generics (
+                &self,
+                #(#witness_params,)*
+                #config: <#marker_ty as ::cuda_core::KernelLaunchContract>::Config,
+            ) -> ::core::result::Result<
+                ::cuda_core::PreparedLaunch<#marker_ty>,
+                ::cuda_core::LaunchContractError,
+            >
+            #where_clause
+            {
+                self.#prepare_name #turbofish (#config)
+            }
+        }
+    });
+
+    Some(quote! {
+        #(#cfg_attrs)*
+        #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
+        #vis fn #prepare_name #impl_generics (
+            &self,
+            #config: <#marker_ty as ::cuda_core::KernelLaunchContract>::Config,
+        ) -> ::core::result::Result<
+            ::cuda_core::PreparedLaunch<#marker_ty>,
+            ::cuda_core::LaunchContractError,
+        >
+        #where_clause
+        {
+            #function_binding
+            unsafe {
+                ::cuda_core::PreparedLaunch::<#marker_ty>::__prepare(
+                    #function.clone(),
+                    #config,
+                )
+            }
+        }
+
+        #prepare_for
+    })
+}
+
 fn generate_cuda_module_launch_method(kernel: &CudaModuleKernel) -> TokenStream2 {
+    if kernel.launch_contract.is_some() {
+        generate_cuda_module_prepared_launch_method(kernel)
+    } else {
+        generate_cuda_module_legacy_launch_method(kernel)
+    }
+}
+
+fn generate_cuda_module_legacy_launch_method(kernel: &CudaModuleKernel) -> TokenStream2 {
     let vis = &kernel.vis;
     let cfg_attrs = &kernel.cfg_attrs;
     let method_attrs = &kernel.method_attrs;
-    let unsafety = &kernel.unsafety;
     let fn_name = &kernel.fn_name;
     let generics = cuda_module_launch_generics(kernel);
     let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
@@ -1017,6 +2220,71 @@ fn generate_cuda_module_launch_method(kernel: &CudaModuleKernel) -> TokenStream2
         .map(|(index, param)| cuda_module_arg_marshalling(index, param));
     let function_binding = cuda_module_function_binding(kernel);
     let launch_call = cuda_module_launch_call(kernel);
+    let stream = internal_ident("__cuda_oxide_stream");
+    let config = internal_ident("__cuda_oxide_config");
+    let args = internal_ident("__cuda_oxide_args");
+
+    quote! {
+        #(#cfg_attrs)*
+        #(#method_attrs)*
+        #[doc = "Launches this kernel with an unverified raw launch configuration."]
+        #[doc = ""]
+        #[doc = "# Safety"]
+        #[doc = "The launch dimensions and resources must satisfy every indexing, memory-access, launch-bounds, and dynamic-shared-memory assumption made by the kernel. Dimensions not represented by the kernel's index model must not introduce overlapping or out-of-bounds accesses. The caller must also uphold any safety requirements documented on the kernel itself."]
+        #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
+        #vis unsafe fn #fn_name #impl_generics (
+            &self,
+            #stream: &::cuda_core::CudaStream,
+            #config: ::cuda_core::LaunchConfig,
+            #(#params),*
+        ) -> ::core::result::Result<(), ::cuda_core::DriverError>
+        #where_clause
+        {
+            #function_binding
+            let mut #args: ::std::vec::Vec<*mut ::std::ffi::c_void> = ::std::vec::Vec::new();
+            #(#arg_marshalling)*
+            #launch_call
+        }
+    }
+}
+
+fn generate_cuda_module_prepared_launch_method(kernel: &CudaModuleKernel) -> TokenStream2 {
+    let vis = &kernel.vis;
+    let cfg_attrs = &kernel.cfg_attrs;
+    let method_attrs = &kernel.method_attrs;
+    let unsafety = &kernel.unsafety;
+    let fn_name = &kernel.fn_name;
+    let unchecked_name = format_ident!("{}_unchecked", fn_name);
+    let marker_ty = cuda_module_kernel_marker_type(kernel);
+    let generics = cuda_module_launch_generics(kernel);
+    let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
+    let params: Vec<_> = kernel
+        .params
+        .iter()
+        .map(|param| {
+            let name = &param.name;
+            let host_ty = &param.sync_host_ty;
+            quote! { #name: #host_ty }
+        })
+        .collect();
+    let prepared_arg_marshalling = kernel
+        .params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| cuda_module_arg_marshalling(index, param));
+    let unchecked_arg_marshalling = kernel
+        .params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| cuda_module_arg_marshalling(index, param));
+    let unchecked_function_binding = cuda_module_function_binding(kernel);
+    let launch_call = cuda_module_launch_call(kernel);
+    let unchecked_launch_call = cuda_module_launch_call(kernel);
+    let stream = internal_ident("__cuda_oxide_stream");
+    let prepared = internal_ident("__cuda_oxide_prepared");
+    let function = internal_ident("__cuda_oxide_function");
+    let config = internal_ident("__cuda_oxide_config");
+    let args = internal_ident("__cuda_oxide_args");
 
     quote! {
         #(#cfg_attrs)*
@@ -1024,25 +2292,54 @@ fn generate_cuda_module_launch_method(kernel: &CudaModuleKernel) -> TokenStream2
         #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
         #vis #unsafety fn #fn_name #impl_generics (
             &self,
-            stream: &::cuda_core::CudaStream,
-            config: ::cuda_core::LaunchConfig,
+            #stream: &::cuda_core::CudaStream,
+            #prepared: &::cuda_core::PreparedLaunch<#marker_ty>,
+            #(#params),*
+        ) -> ::core::result::Result<(), ::cuda_core::LaunchContractError>
+        #where_clause
+        {
+            #prepared.validate_stream(#stream)?;
+            let #function = #prepared.function();
+            let #config = #prepared.__raw_config();
+            let mut #args: ::std::vec::Vec<*mut ::std::ffi::c_void> = ::std::vec::Vec::new();
+            #(#prepared_arg_marshalling)*
+            (#launch_call).map_err(::cuda_core::LaunchContractError::from)
+        }
+
+        #(#cfg_attrs)*
+        #[doc = "Unchecked launch escape hatch for this contracted kernel."]
+        #[doc = ""]
+        #[doc = "# Safety"]
+        #[doc = "The caller must uphold the kernel's declared geometry, resource, capability, and context contract."]
+        #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
+        #vis unsafe fn #unchecked_name #impl_generics (
+            &self,
+            #stream: &::cuda_core::CudaStream,
+            #config: ::cuda_core::LaunchConfig,
             #(#params),*
         ) -> ::core::result::Result<(), ::cuda_core::DriverError>
         #where_clause
         {
-            #function_binding
-            let mut __args: ::std::vec::Vec<*mut ::std::ffi::c_void> = ::std::vec::Vec::new();
-            #(#arg_marshalling)*
-            #launch_call
+            #unchecked_function_binding
+            let mut #args: ::std::vec::Vec<*mut ::std::ffi::c_void> = ::std::vec::Vec::new();
+            #(#unchecked_arg_marshalling)*
+            #unchecked_launch_call
         }
     }
 }
 
 fn generate_cuda_module_async_launch_method(kernel: &CudaModuleKernel) -> TokenStream2 {
+    if kernel.launch_contract.is_some() {
+        generate_cuda_module_prepared_async_launch_method(kernel)
+    } else {
+        generate_cuda_module_legacy_async_launch_method(kernel)
+    }
+}
+
+fn generate_cuda_module_legacy_async_launch_method(kernel: &CudaModuleKernel) -> TokenStream2 {
     let vis = &kernel.vis;
     let cfg_attrs = &kernel.cfg_attrs;
     let method_attrs = &kernel.method_attrs;
-    let unsafety = &kernel.unsafety;
     let fn_name = format_ident!("{}_async", kernel.fn_name);
     let generics = cuda_module_async_launch_generics(kernel);
     let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
@@ -1053,16 +2350,88 @@ fn generate_cuda_module_async_launch_method(kernel: &CudaModuleKernel) -> TokenS
     });
     let arg_marshalling = kernel.params.iter().map(cuda_module_async_arg_marshalling);
     let function_binding = cuda_module_function_binding(kernel);
+    let config = internal_ident("__cuda_oxide_config");
+    let function = internal_ident("__cuda_oxide_function");
+    let launch = internal_ident("__cuda_oxide_launch");
+    let async_lifetime = cuda_module_async_lifetime();
     let cluster_dim = kernel.cluster_dim.map(|(x, y, z)| quote! { (#x, #y, #z) });
     let set_cluster_dim = cluster_dim.map(|cluster_dim| {
         quote! {
-            ::cuda_host::set_async_kernel_cluster_dim(&mut __launch, #cluster_dim);
+            ::cuda_host::set_async_kernel_cluster_dim(&mut #launch, #cluster_dim);
         }
     });
     let set_cooperative = kernel.cooperative.then(|| {
         quote! {
-            ::cuda_host::set_async_kernel_cooperative(&mut __launch, true);
+            ::cuda_host::set_async_kernel_cooperative(&mut #launch, true);
         }
+    });
+
+    quote! {
+        #(#cfg_attrs)*
+        #(#method_attrs)*
+        #[doc = "Builds a lazy async launch from an unverified raw launch configuration."]
+        #[doc = ""]
+        #[doc = "# Safety"]
+        #[doc = "Before scheduling the returned operation, the launch dimensions and resources must satisfy every indexing, memory-access, launch-bounds, and dynamic-shared-memory assumption made by the kernel. Dimensions not represented by the kernel's index model must not introduce overlapping or out-of-bounds accesses. The caller must also uphold any safety requirements documented on the kernel itself."]
+        #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
+        #vis unsafe fn #fn_name #impl_generics (
+            &self,
+            #config: ::cuda_core::LaunchConfig,
+            #(#params),*
+        ) -> ::core::result::Result<::cuda_host::AsyncKernelLaunch<#async_lifetime>, ::cuda_core::DriverError>
+        #where_clause
+        {
+            #function_binding
+            let mut #launch = ::cuda_host::new_async_kernel_launch_builder(#function.clone());
+            #set_cluster_dim
+            #set_cooperative
+            #(#arg_marshalling)*
+            // SAFETY: this method is unsafe and its caller must uphold the raw
+            // launch configuration contract documented above.
+            Ok(unsafe { #launch.finalize_unchecked(#config) })
+        }
+    }
+}
+
+fn generate_cuda_module_prepared_async_launch_method(kernel: &CudaModuleKernel) -> TokenStream2 {
+    let vis = &kernel.vis;
+    let cfg_attrs = &kernel.cfg_attrs;
+    let method_attrs = &kernel.method_attrs;
+    let unsafety = &kernel.unsafety;
+    let fn_name = format_ident!("{}_async", kernel.fn_name);
+    let unchecked_name = format_ident!("{}_async_unchecked", kernel.fn_name);
+    let marker_ty = cuda_module_kernel_marker_type(kernel);
+    let generics = cuda_module_async_launch_generics(kernel);
+    let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
+    let params: Vec<_> = kernel
+        .params
+        .iter()
+        .map(|param| {
+            let name = &param.name;
+            let host_ty = &param.async_host_ty;
+            quote! { #name: #host_ty }
+        })
+        .collect();
+    let prepared_marshalling = kernel.params.iter().map(cuda_module_async_arg_marshalling);
+    let unchecked_marshalling = kernel.params.iter().map(cuda_module_async_arg_marshalling);
+    let unchecked_function_binding = cuda_module_function_binding(kernel);
+    let prepared = internal_ident("__cuda_oxide_prepared");
+    let config = internal_ident("__cuda_oxide_config");
+    let function = internal_ident("__cuda_oxide_function");
+    let launch = internal_ident("__cuda_oxide_launch");
+    let async_lifetime = cuda_module_async_lifetime();
+    let cluster_dim = kernel.cluster_dim.map(|(x, y, z)| quote! { (#x, #y, #z) });
+    let prepared_cluster = cluster_dim.as_ref().map(|cluster_dim| {
+        quote! { ::cuda_host::set_async_kernel_cluster_dim(&mut #launch, #cluster_dim); }
+    });
+    let unchecked_cluster = cluster_dim.as_ref().map(|cluster_dim| {
+        quote! { ::cuda_host::set_async_kernel_cluster_dim(&mut #launch, #cluster_dim); }
+    });
+    let prepared_cooperative = kernel.cooperative.then(|| {
+        quote! { ::cuda_host::set_async_kernel_cooperative(&mut #launch, true); }
+    });
+    let unchecked_cooperative = kernel.cooperative.then(|| {
+        quote! { ::cuda_host::set_async_kernel_cooperative(&mut #launch, true); }
     });
 
     quote! {
@@ -1071,26 +2440,72 @@ fn generate_cuda_module_async_launch_method(kernel: &CudaModuleKernel) -> TokenS
         #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
         #vis #unsafety fn #fn_name #impl_generics (
             &self,
-            config: ::cuda_core::LaunchConfig,
+            #prepared: &::cuda_core::PreparedLaunch<#marker_ty>,
             #(#params),*
-        ) -> ::core::result::Result<::cuda_host::AsyncKernelLaunch<'__cuda_module_async>, ::cuda_core::DriverError>
+        ) -> ::cuda_host::PreparedAsyncKernelLaunch<#async_lifetime, #marker_ty>
         #where_clause
         {
-            #function_binding
-            let mut __launch = ::cuda_host::new_async_kernel_launch(__func.clone(), config);
-            #set_cluster_dim
-            #set_cooperative
-            #(#arg_marshalling)*
-            Ok(__launch)
+            let mut #launch =
+                ::cuda_host::new_async_kernel_launch_builder(#prepared.function().clone());
+            #prepared_cluster
+            #prepared_cooperative
+            #(#prepared_marshalling)*
+            // SAFETY: PreparedLaunch validated this kernel-branded config and
+            // the builder has not exposed a way to mutate it after finalization.
+            let #launch = unsafe {
+                #launch.finalize_unchecked(#prepared.__raw_config())
+            };
+            unsafe {
+                ::cuda_host::new_prepared_async_kernel_launch(
+                    #launch,
+                    (*#prepared).clone(),
+                )
+            }
+        }
+
+        #(#cfg_attrs)*
+        #[doc = "Unchecked async launch escape hatch for this contracted kernel."]
+        #[doc = ""]
+        #[doc = "# Safety"]
+        #[doc = "The caller must uphold the kernel's declared geometry, resource, capability, and context contract when the returned operation is scheduled."]
+        #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
+        #vis unsafe fn #unchecked_name #impl_generics (
+            &self,
+            #config: ::cuda_core::LaunchConfig,
+            #(#params),*
+        ) -> ::core::result::Result<
+            ::cuda_host::AsyncKernelLaunch<#async_lifetime>,
+            ::cuda_core::DriverError,
+        >
+        #where_clause
+        {
+            #unchecked_function_binding
+            let mut #launch =
+                ::cuda_host::new_async_kernel_launch_builder(#function.clone());
+            #unchecked_cluster
+            #unchecked_cooperative
+            #(#unchecked_marshalling)*
+            // SAFETY: this method is unsafe and its caller must uphold the
+            // contracted kernel's raw launch requirements documented above.
+            Ok(unsafe { #launch.finalize_unchecked(#config) })
         }
     }
 }
 
 fn generate_cuda_module_owned_async_launch_method(kernel: &CudaModuleKernel) -> TokenStream2 {
+    if kernel.launch_contract.is_some() {
+        generate_cuda_module_prepared_owned_async_launch_method(kernel)
+    } else {
+        generate_cuda_module_legacy_owned_async_launch_method(kernel)
+    }
+}
+
+fn generate_cuda_module_legacy_owned_async_launch_method(
+    kernel: &CudaModuleKernel,
+) -> TokenStream2 {
     let vis = &kernel.vis;
     let cfg_attrs = &kernel.cfg_attrs;
     let method_attrs = &kernel.method_attrs;
-    let unsafety = &kernel.unsafety;
     let fn_name = format_ident!("{}_async_owned", kernel.fn_name);
     let resources = cuda_module_owned_resource_params(kernel);
     let generics = cuda_module_owned_async_launch_generics(kernel, &resources);
@@ -1117,15 +2532,18 @@ fn generate_cuda_module_owned_async_launch_method(kernel: &CudaModuleKernel) -> 
         .iter()
         .map(cuda_module_owned_async_arg_marshalling);
     let function_binding = cuda_module_function_binding(kernel);
+    let config = internal_ident("__cuda_oxide_config");
+    let function = internal_ident("__cuda_oxide_function");
+    let launch = internal_ident("__cuda_oxide_launch");
     let cluster_dim = kernel.cluster_dim.map(|(x, y, z)| quote! { (#x, #y, #z) });
     let set_cluster_dim = cluster_dim.map(|cluster_dim| {
         quote! {
-            ::cuda_host::set_async_kernel_cluster_dim(&mut __launch, #cluster_dim);
+            ::cuda_host::set_async_kernel_cluster_dim(&mut #launch, #cluster_dim);
         }
     });
     let set_cooperative = kernel.cooperative.then(|| {
         quote! {
-            ::cuda_host::set_async_kernel_cooperative(&mut __launch, true);
+            ::cuda_host::set_async_kernel_cooperative(&mut #launch, true);
         }
     });
     let resources_ty = cuda_module_owned_resources_ty(&resources);
@@ -1139,21 +2557,170 @@ fn generate_cuda_module_owned_async_launch_method(kernel: &CudaModuleKernel) -> 
     quote! {
         #(#cfg_attrs)*
         #(#method_attrs)*
+        #[doc = "Builds a lazy owned async launch from an unverified raw launch configuration."]
+        #[doc = ""]
+        #[doc = "# Safety"]
+        #[doc = "Before scheduling the returned operation, the launch dimensions and resources must satisfy every indexing, memory-access, launch-bounds, and dynamic-shared-memory assumption made by the kernel. Dimensions not represented by the kernel's index model must not introduce overlapping or out-of-bounds accesses. The caller must also uphold any safety requirements documented on the kernel itself."]
         #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
-        #vis #unsafety fn #fn_name #impl_generics (
+        #vis unsafe fn #fn_name #impl_generics (
             &self,
-            config: ::cuda_core::LaunchConfig,
+            #config: ::cuda_core::LaunchConfig,
             #(#params),*
         ) -> ::core::result::Result<::cuda_host::OwnedAsyncKernelLaunch<#resources_ty>, ::cuda_core::DriverError>
         #where_clause
         {
             #function_binding
-            let mut __launch: ::cuda_host::AsyncKernelLaunch<'static> =
-                ::cuda_host::new_async_kernel_launch(__func.clone(), config);
+            let mut #launch =
+                ::cuda_host::new_async_kernel_launch_builder(#function.clone());
             #set_cluster_dim
             #set_cooperative
             #(#arg_marshalling)*
-            Ok(::cuda_host::new_owned_async_kernel_launch(__launch, #resources_expr))
+            // SAFETY: this method is unsafe and its caller must uphold the raw
+            // launch configuration contract documented above.
+            let #launch: ::cuda_host::AsyncKernelLaunch<'static> =
+                unsafe { #launch.finalize_unchecked(#config) };
+            Ok(::cuda_host::new_owned_async_kernel_launch(#launch, #resources_expr))
+        }
+    }
+}
+
+fn generate_cuda_module_prepared_owned_async_launch_method(
+    kernel: &CudaModuleKernel,
+) -> TokenStream2 {
+    let vis = &kernel.vis;
+    let cfg_attrs = &kernel.cfg_attrs;
+    let method_attrs = &kernel.method_attrs;
+    let unsafety = &kernel.unsafety;
+    let fn_name = format_ident!("{}_async_owned", kernel.fn_name);
+    let unchecked_name = format_ident!("{}_async_owned_unchecked", kernel.fn_name);
+    let marker_ty = cuda_module_kernel_marker_type(kernel);
+    let resources = cuda_module_owned_resource_params(kernel);
+    let generics = cuda_module_owned_async_launch_generics(kernel, &resources);
+    let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
+    let params: Vec<_> = kernel
+        .params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| {
+            let name = &param.name;
+            match &param.marshal {
+                CudaModuleParamMarshal::Scalar => {
+                    let host_ty = &param.async_host_ty;
+                    quote! { #name: #host_ty }
+                }
+                CudaModuleParamMarshal::ReadOnlyDeviceBuffer { .. } => {
+                    let resource_ty = cuda_module_owned_resource_type(index);
+                    quote! { #name: #resource_ty }
+                }
+                CudaModuleParamMarshal::WritableDeviceBuffer { .. } => {
+                    let resource_ty = cuda_module_owned_resource_type(index);
+                    quote! { mut #name: #resource_ty }
+                }
+            }
+        })
+        .collect();
+    let prepared_marshalling = kernel
+        .params
+        .iter()
+        .map(cuda_module_owned_async_arg_marshalling);
+    let unchecked_marshalling = kernel
+        .params
+        .iter()
+        .map(cuda_module_owned_async_arg_marshalling);
+    let unchecked_function_binding = cuda_module_function_binding(kernel);
+    let prepared = internal_ident("__cuda_oxide_prepared");
+    let config = internal_ident("__cuda_oxide_config");
+    let function = internal_ident("__cuda_oxide_function");
+    let launch = internal_ident("__cuda_oxide_launch");
+    let owned = internal_ident("__cuda_oxide_owned");
+    let cluster_dim = kernel.cluster_dim.map(|(x, y, z)| quote! { (#x, #y, #z) });
+    let prepared_cluster = cluster_dim.as_ref().map(|cluster_dim| {
+        quote! { ::cuda_host::set_async_kernel_cluster_dim(&mut #launch, #cluster_dim); }
+    });
+    let unchecked_cluster = cluster_dim.as_ref().map(|cluster_dim| {
+        quote! { ::cuda_host::set_async_kernel_cluster_dim(&mut #launch, #cluster_dim); }
+    });
+    let prepared_cooperative = kernel.cooperative.then(|| {
+        quote! { ::cuda_host::set_async_kernel_cooperative(&mut #launch, true); }
+    });
+    let unchecked_cooperative = kernel.cooperative.then(|| {
+        quote! { ::cuda_host::set_async_kernel_cooperative(&mut #launch, true); }
+    });
+    let resources_ty = cuda_module_owned_resources_ty(&resources);
+    let prepared_resource_names = resources.iter().map(|(_, name, _, _)| name);
+    let unchecked_resource_names = resources.iter().map(|(_, name, _, _)| name);
+    let prepared_resources_expr = if resources.is_empty() {
+        quote! { () }
+    } else {
+        quote! { (#(#prepared_resource_names),*) }
+    };
+    let unchecked_resources_expr = if resources.is_empty() {
+        quote! { () }
+    } else {
+        quote! { (#(#unchecked_resource_names),*) }
+    };
+
+    quote! {
+        #(#cfg_attrs)*
+        #(#method_attrs)*
+        #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
+        #vis #unsafety fn #fn_name #impl_generics (
+            &self,
+            #prepared: &::cuda_core::PreparedLaunch<#marker_ty>,
+            #(#params),*
+        ) -> ::cuda_host::PreparedOwnedAsyncKernelLaunch<#resources_ty, #marker_ty>
+        #where_clause
+        {
+            let mut #launch =
+                ::cuda_host::new_async_kernel_launch_builder(#prepared.function().clone());
+            #prepared_cluster
+            #prepared_cooperative
+            #(#prepared_marshalling)*
+            // SAFETY: PreparedLaunch validated this kernel-branded config and
+            // the builder has not exposed a way to mutate it after finalization.
+            let #launch: ::cuda_host::AsyncKernelLaunch<'static> = unsafe {
+                #launch.finalize_unchecked(#prepared.__raw_config())
+            };
+            let #owned =
+                ::cuda_host::new_owned_async_kernel_launch(#launch, #prepared_resources_expr);
+            unsafe {
+                ::cuda_host::new_prepared_owned_async_kernel_launch(
+                    #owned,
+                    (*#prepared).clone(),
+                )
+            }
+        }
+
+        #(#cfg_attrs)*
+        #[doc = "Unchecked owned-async launch escape hatch for this contracted kernel."]
+        #[doc = ""]
+        #[doc = "# Safety"]
+        #[doc = "The caller must uphold the kernel's declared geometry, resource, capability, and context contract when the returned operation is scheduled."]
+        #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
+        #vis unsafe fn #unchecked_name #impl_generics (
+            &self,
+            #config: ::cuda_core::LaunchConfig,
+            #(#params),*
+        ) -> ::core::result::Result<
+            ::cuda_host::OwnedAsyncKernelLaunch<#resources_ty>,
+            ::cuda_core::DriverError,
+        >
+        #where_clause
+        {
+            #unchecked_function_binding
+            let mut #launch =
+                ::cuda_host::new_async_kernel_launch_builder(#function.clone());
+            #unchecked_cluster
+            #unchecked_cooperative
+            #(#unchecked_marshalling)*
+            // SAFETY: this method is unsafe and its caller must uphold the
+            // contracted kernel's raw launch requirements documented above.
+            let #launch: ::cuda_host::AsyncKernelLaunch<'static> =
+                unsafe { #launch.finalize_unchecked(#config) };
+            Ok(::cuda_host::new_owned_async_kernel_launch(
+                #launch,
+                #unchecked_resources_expr,
+            ))
         }
     }
 }
@@ -1205,15 +2772,18 @@ fn cuda_module_owned_async_launch_generics(
 
 fn cuda_module_async_launch_generics(kernel: &CudaModuleKernel) -> syn::Generics {
     let mut generics = kernel.generics.clone();
+    let async_lifetime = cuda_module_async_lifetime();
+    let lifetime_param = syn::LifetimeParam::new(async_lifetime.clone());
     generics
         .params
-        .insert(0, syn::parse_quote! { '__cuda_module_async });
+        .insert(0, syn::GenericParam::Lifetime(lifetime_param));
     for param in &kernel.params {
         if matches!(param.marshal, CudaModuleParamMarshal::Scalar) {
             let host_ty = &param.async_host_ty;
-            generics.make_where_clause().predicates.push(
-                syn::parse_quote! { #host_ty: ::cuda_host::KernelScalar + '__cuda_module_async },
-            );
+            generics
+                .make_where_clause()
+                .predicates
+                .push(syn::parse_quote! { #host_ty: ::cuda_host::KernelScalar + #async_lifetime });
         }
     }
     generics
@@ -1239,7 +2809,7 @@ fn cuda_module_owned_resource_params(
 }
 
 fn cuda_module_owned_resource_type(index: usize) -> Ident {
-    format_ident!("__CudaModuleArg{index}")
+    internal_ident(&format!("__CudaModuleArg{index}"))
 }
 
 fn cuda_module_owned_resources_ty(
@@ -1257,35 +2827,36 @@ fn cuda_module_owned_resources_ty(
 
 fn cuda_module_arg_marshalling(index: usize, param: &CudaModuleParam) -> TokenStream2 {
     let name = &param.name;
-    let value_name = format_ident!("__arg_{index}");
+    let args = internal_ident("__cuda_oxide_args");
+    let value_name = internal_ident(&format!("__cuda_oxide_arg_{index}"));
     match param.marshal {
         CudaModuleParamMarshal::Scalar => {
             quote! {
                 let mut #value_name = #name;
-                ::cuda_host::push_kernel_scalar(&mut __args, &mut #value_name);
+                ::cuda_host::push_kernel_scalar(&mut #args, &mut #value_name);
             }
         }
         CudaModuleParamMarshal::ReadOnlyDeviceBuffer { .. } => {
-            let ptr_name = format_ident!("__arg_{index}_ptr");
-            let len_name = format_ident!("__arg_{index}_len");
+            let ptr_name = internal_ident(&format!("__cuda_oxide_arg_{index}_ptr"));
+            let len_name = internal_ident(&format!("__cuda_oxide_arg_{index}_len"));
             quote! {
                 let (mut #ptr_name, mut #len_name) =
                     ::cuda_host::read_only_device_buffer_arg(#name);
                 ::cuda_host::push_kernel_device_slice(
-                    &mut __args,
+                    &mut #args,
                     &mut #ptr_name,
                     &mut #len_name,
                 );
             }
         }
         CudaModuleParamMarshal::WritableDeviceBuffer { .. } => {
-            let ptr_name = format_ident!("__arg_{index}_ptr");
-            let len_name = format_ident!("__arg_{index}_len");
+            let ptr_name = internal_ident(&format!("__cuda_oxide_arg_{index}_ptr"));
+            let len_name = internal_ident(&format!("__cuda_oxide_arg_{index}_len"));
             quote! {
                 let (mut #ptr_name, mut #len_name) =
                     ::cuda_host::writable_device_buffer_arg(#name);
                 ::cuda_host::push_kernel_device_slice(
-                    &mut __args,
+                    &mut #args,
                     &mut #ptr_name,
                     &mut #len_name,
                 );
@@ -1296,20 +2867,21 @@ fn cuda_module_arg_marshalling(index: usize, param: &CudaModuleParam) -> TokenSt
 
 fn cuda_module_owned_async_arg_marshalling(param: &CudaModuleParam) -> TokenStream2 {
     let name = &param.name;
+    let launch = internal_ident("__cuda_oxide_launch");
     match param.marshal {
         CudaModuleParamMarshal::Scalar => {
             quote! {
-                ::cuda_host::push_async_kernel_scalar(&mut __launch, #name);
+                ::cuda_host::push_async_kernel_scalar(&mut #launch, #name);
             }
         }
         CudaModuleParamMarshal::ReadOnlyDeviceBuffer { .. } => {
             quote! {
-                ::cuda_host::push_async_read_only_device_slice(&mut __launch, &#name);
+                ::cuda_host::push_async_read_only_device_slice(&mut #launch, &#name);
             }
         }
         CudaModuleParamMarshal::WritableDeviceBuffer { .. } => {
             quote! {
-                ::cuda_host::push_async_writable_device_slice(&mut __launch, &mut #name);
+                ::cuda_host::push_async_writable_device_slice(&mut #launch, &mut #name);
             }
         }
     }
@@ -1317,141 +2889,210 @@ fn cuda_module_owned_async_arg_marshalling(param: &CudaModuleParam) -> TokenStre
 
 fn cuda_module_async_arg_marshalling(param: &CudaModuleParam) -> TokenStream2 {
     let name = &param.name;
+    let launch = internal_ident("__cuda_oxide_launch");
     match param.marshal {
         CudaModuleParamMarshal::Scalar => {
             quote! {
-                ::cuda_host::push_async_kernel_scalar(&mut __launch, #name);
+                ::cuda_host::push_async_kernel_scalar(&mut #launch, #name);
             }
         }
         CudaModuleParamMarshal::ReadOnlyDeviceBuffer { .. } => {
             quote! {
-                ::cuda_host::push_async_read_only_device_slice(&mut __launch, #name);
+                ::cuda_host::push_async_read_only_device_slice(&mut #launch, #name);
             }
         }
         CudaModuleParamMarshal::WritableDeviceBuffer { .. } => {
             quote! {
-                ::cuda_host::push_async_writable_device_slice(&mut __launch, #name);
+                ::cuda_host::push_async_writable_device_slice(&mut #launch, #name);
             }
         }
     }
 }
 
 fn cuda_module_function_binding(kernel: &CudaModuleKernel) -> TokenStream2 {
+    let function = internal_ident("__cuda_oxide_function");
     if kernel.is_generic {
-        let fn_name = &kernel.fn_name;
-        let marker = cuda_kernel_marker_name(fn_name);
-        let type_params = cuda_module_type_param_names(&kernel.generics);
-        let kernel_entry = format_ident!("{}", kernel_symbol(&fn_name.to_string()));
-        let turbofish = if type_params.is_empty() {
+        let ptx_name_fn = format_ident!("{}_ptx_name", kernel.fn_name);
+        let codegen_args = codegen_generic_arguments(&kernel.generics);
+        let turbofish = if codegen_args.is_empty() {
             quote! {}
         } else {
-            quote! { ::<#(#type_params),*> }
+            quote! { ::<#(#codegen_args),*> }
         };
-        let marker_args = if type_params.is_empty() {
-            quote! {}
-        } else {
-            quote! { <#(#type_params),*> }
-        };
+        let ptx_name = internal_ident("__cuda_oxide_ptx_name");
+        let function_storage = internal_ident("__cuda_oxide_function_storage");
+        let cache = internal_ident("__cuda_oxide_function_cache");
         quote! {
-            let __kernel_ptr = #kernel_entry #turbofish as *const ();
-            unsafe {
-                let mut __force_mono: *const () = ::core::ptr::null();
-                ::core::ptr::write_volatile(&mut __force_mono, __kernel_ptr);
-                let _ = ::core::ptr::read_volatile(&__force_mono);
-            }
-            let __ptx_name =
-                <#marker #marker_args as ::cuda_host::GenericCudaKernel>::ptx_name();
-            let __func_storage = {
-                let mut __cache = self
+            let #ptx_name = #ptx_name_fn #turbofish ();
+            let #function_storage = {
+                let mut #cache = self
                     .__generic_functions
                     .lock()
                     .expect("cuda_module generic function cache poisoned");
-                if let Some(__func) = __cache.get(__ptx_name) {
-                    __func.clone()
+                if let Some(#function) = #cache.get(#ptx_name) {
+                    #function.clone()
                 } else {
-                    let __func = self.__module.load_function(__ptx_name)?;
-                    __cache.insert(__ptx_name, __func.clone());
-                    __func
+                    let #function = self.__module.load_function(#ptx_name)?;
+                    #cache.insert(#ptx_name, #function.clone());
+                    #function
                 }
             };
-            let __func = &__func_storage;
+            let #function = &#function_storage;
         }
     } else {
         let field = cuda_module_function_field(&kernel.fn_name);
         quote! {
-            let __func = &self.#field;
+            let #function = &self.#field;
         }
     }
 }
 
 fn cuda_module_launch_call(kernel: &CudaModuleKernel) -> TokenStream2 {
+    let function = internal_ident("__cuda_oxide_function");
+    let stream = internal_ident("__cuda_oxide_stream");
+    let config = internal_ident("__cuda_oxide_config");
+    let args = internal_ident("__cuda_oxide_args");
     let cluster_dim = kernel.cluster_dim.map(|(x, y, z)| quote! { (#x, #y, #z) });
     match (cluster_dim, kernel.cooperative) {
         (Some(cluster_dim), true) => quote! {
             unsafe {
                 ::cuda_core::launch_kernel_ex_cooperative_on_stream(
-                    __func,
-                    config.grid_dim,
-                    config.block_dim,
-                    config.shared_mem_bytes,
+                    #function,
+                    #config.grid_dim,
+                    #config.block_dim,
+                    #config.shared_mem_bytes,
                     #cluster_dim,
-                    stream,
-                    &mut __args,
+                    #stream,
+                    &mut #args,
                 )
             }
         },
         (Some(cluster_dim), false) => quote! {
             unsafe {
                 ::cuda_core::launch_kernel_ex_on_stream(
-                    __func,
-                    config.grid_dim,
-                    config.block_dim,
-                    config.shared_mem_bytes,
+                    #function,
+                    #config.grid_dim,
+                    #config.block_dim,
+                    #config.shared_mem_bytes,
                     #cluster_dim,
-                    stream,
-                    &mut __args,
+                    #stream,
+                    &mut #args,
                 )
             }
         },
         (None, true) => quote! {
             unsafe {
                 ::cuda_core::launch_kernel_cooperative_on_stream(
-                    __func,
-                    config.grid_dim,
-                    config.block_dim,
-                    config.shared_mem_bytes,
-                    stream,
-                    &mut __args,
+                    #function,
+                    #config.grid_dim,
+                    #config.block_dim,
+                    #config.shared_mem_bytes,
+                    #stream,
+                    &mut #args,
                 )
             }
         },
         (None, false) => quote! {
             unsafe {
                 ::cuda_core::launch_kernel_on_stream(
-                    __func,
-                    config.grid_dim,
-                    config.block_dim,
-                    config.shared_mem_bytes,
-                    stream,
-                    &mut __args,
+                    #function,
+                    #config.grid_dim,
+                    #config.block_dim,
+                    #config.shared_mem_bytes,
+                    #stream,
+                    &mut #args,
                 )
             }
         },
     }
 }
 
-fn cuda_module_type_param_names(generics: &syn::Generics) -> Vec<Ident> {
+/// Whether rustc must create distinct code for this generic parameter list.
+///
+/// Lifetimes are deliberately excluded: rustc erases them before codegen, so
+/// they cannot distinguish PTX entry points. Type and const parameters both
+/// participate in monomorphization and therefore in kernel identity.
+fn has_codegen_generics(generics: &syn::Generics) -> bool {
     generics
         .params
         .iter()
-        .filter_map(|param| {
-            if let GenericParam::Type(type_param) = param {
-                Some(type_param.ident.clone())
-            } else {
-                None
+        .any(|param| matches!(param, GenericParam::Type(_) | GenericParam::Const(_)))
+}
+
+/// Ordered generic arguments accepted by a function turbofish.
+///
+/// Rust function turbofish syntax omits lifetime arguments. Type and const
+/// identifiers must remain in declaration order so mixed `<T, const N>`
+/// kernels instantiate the exact function item requested by the caller.
+fn codegen_generic_arguments(generics: &syn::Generics) -> Vec<TokenStream2> {
+    generics
+        .params
+        .iter()
+        .filter_map(|param| match param {
+            GenericParam::Type(type_param) => {
+                let ident = &type_param.ident;
+                Some(quote! { #ident })
+            }
+            GenericParam::Const(const_param) => {
+                let ident = &const_param.ident;
+                Some(quote! { #ident })
+            }
+            GenericParam::Lifetime(_) => None,
+        })
+        .collect()
+}
+
+/// Ordered arguments for applying a generated marker type.
+///
+/// Unlike function turbofish syntax, a type application retains lifetime
+/// parameters. The specialization hash still ignores their identity because
+/// rustc's `TypeId` pipeline erases regions.
+fn generic_arguments(generics: &syn::Generics) -> Vec<TokenStream2> {
+    generics
+        .params
+        .iter()
+        .map(|param| match param {
+            GenericParam::Lifetime(lifetime_param) => {
+                let lifetime = &lifetime_param.lifetime;
+                quote! { #lifetime }
+            }
+            GenericParam::Type(type_param) => {
+                let ident = &type_param.ident;
+                quote! { #ident }
+            }
+            GenericParam::Const(const_param) => {
+                let ident = &const_param.ident;
+                quote! { #ident }
             }
         })
         .collect()
+}
+
+/// Types used by `PhantomData` so generated marker types correctly witness
+/// every lifetime and type parameter. Const parameters are part of the marker
+/// type by construction and need no field-level witness.
+fn generic_phantom_type(generics: &syn::Generics) -> TokenStream2 {
+    let witnesses: Vec<TokenStream2> = generics
+        .params
+        .iter()
+        .filter_map(|param| match param {
+            GenericParam::Lifetime(lifetime_param) => {
+                let lifetime = &lifetime_param.lifetime;
+                Some(quote! { &#lifetime () })
+            }
+            GenericParam::Type(type_param) => {
+                let ident = &type_param.ident;
+                Some(quote! { *const #ident })
+            }
+            GenericParam::Const(_) => None,
+        })
+        .collect();
+
+    if witnesses.is_empty() {
+        quote! { () }
+    } else {
+        quote! { (#(#witnesses,)*) }
+    }
 }
 
 fn cuda_module_function_field(fn_name: &Ident) -> Ident {
@@ -1535,6 +3176,9 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
     if let Some(err) = reject_reserved_name(&input.sig.ident) {
         return err;
     }
+    if let Some(err) = impl_trait_parameter_error(&input, "kernel") {
+        return err.to_compile_error().into();
+    }
 
     // Consume any `#[unroll]` / `#[unroll(N)]` attributes written directly on
     // loops inside the kernel body. We strip the attribute from the loop
@@ -1547,13 +3191,39 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
         return err.to_compile_error().into();
     }
 
-    // Check if function has type parameters
-    let has_generics = input
-        .sig
-        .generics
-        .params
-        .iter()
-        .any(|p| matches!(p, GenericParam::Type(_)));
+    // Only type and const parameters create distinct codegen instances.
+    // Lifetimes are erased before monomorphization.
+    let has_generics = has_codegen_generics(&input.sig.generics);
+
+    if has_generics && !args.instantiate_types.is_empty() {
+        let type_param_count = input
+            .sig
+            .generics
+            .params
+            .iter()
+            .filter(|param| matches!(param, GenericParam::Type(_)))
+            .count();
+        let has_const_params = input
+            .sig
+            .generics
+            .params
+            .iter()
+            .any(|param| matches!(param, GenericParam::Const(_)));
+        let has_lifetime_params = input
+            .sig
+            .generics
+            .params
+            .iter()
+            .any(|param| matches!(param, GenericParam::Lifetime(_)));
+        if type_param_count != 1 || has_const_params || has_lifetime_params {
+            return syn::Error::new_spanned(
+                &input.sig.generics,
+                "legacy #[kernel(Type, ...)] instantiation supports exactly one type parameter and no lifetime or const parameters; use #[kernel] and instantiate the kernel with a normal turbofish at the launch site",
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
 
     if has_generics && args.instantiate_types.is_empty() {
         // Generic kernel without explicit types - allow it!
@@ -1765,38 +3435,34 @@ fn find_closure_param<'a>(
     None
 }
 
-/// Strip `mut` from function argument patterns.
+/// Build wrapper parameters that can always be forwarded by value.
 ///
-/// The wrapper function just forwards arguments, so it doesn't need `mut`.
-/// Keeping `mut` causes "variable does not need to be mutable" warnings.
-fn strip_mut_from_inputs(
+/// User functions may use any irrefutable parameter pattern, including `_` or
+/// tuple destructuring. A generated wrapper cannot refer to those patterns
+/// again, so every parameter gets a private synthetic identifier while keeping
+/// its original type and attributes. The original implementation retains the
+/// user's pattern.
+fn forwarding_inputs(
     inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
-) -> Vec<FnArg> {
-    inputs
-        .iter()
-        .map(|arg| {
-            match arg {
-                FnArg::Typed(pat_type) => {
-                    let mut new_pat_type = pat_type.clone();
-                    if let Pat::Ident(pat_ident) = &*pat_type.pat
-                        && pat_ident.mutability.is_some()
-                    {
-                        // Create new PatIdent without mut
-                        let new_pat_ident = syn::PatIdent {
-                            attrs: pat_ident.attrs.clone(),
-                            by_ref: pat_ident.by_ref,
-                            mutability: None, // Strip mut
-                            ident: pat_ident.ident.clone(),
-                            subpat: pat_ident.subpat.clone(),
-                        };
-                        new_pat_type.pat = Box::new(Pat::Ident(new_pat_ident));
-                    }
-                    FnArg::Typed(new_pat_type)
-                }
-                other => other.clone(),
-            }
-        })
-        .collect()
+) -> syn::Result<(Vec<FnArg>, Vec<Ident>)> {
+    let mut wrapper_inputs = Vec::with_capacity(inputs.len());
+    let mut forwarding_names = Vec::with_capacity(inputs.len());
+
+    for (index, arg) in inputs.iter().enumerate() {
+        let FnArg::Typed(pat_type) = arg else {
+            return Err(syn::Error::new_spanned(
+                arg,
+                "CUDA kernels and device functions cannot take self parameters",
+            ));
+        };
+        let name = internal_ident(&format!("__cuda_oxide_arg_{index}"));
+        let mut wrapper_param = pat_type.clone();
+        wrapper_param.pat = Box::new(parse_quote! { #name });
+        wrapper_inputs.push(FnArg::Typed(wrapper_param));
+        forwarding_names.push(name);
+    }
+
+    Ok((wrapper_inputs, forwarding_names))
 }
 
 /// True when `path`'s *last* segment is `name`.
@@ -1985,7 +3651,10 @@ impl VisitMut for ThreadIndexCallRewriter {
 }
 
 fn inject_thread_index_scope(input: &mut ItemFn) {
-    let scope_ident = format_ident!("{}", KERNEL_SCOPE_LOCAL);
+    // Keep the ordinary call-site span so borrow-checker diagnostics continue
+    // to point at the user's `#[kernel]` / `#[device]` item. Only rename the
+    // binding when a generic parameter has deliberately taken the usual name.
+    let scope_ident = call_site_ident_avoiding_item(KERNEL_SCOPE_LOCAL, input);
     let mut rewriter = ThreadIndexCallRewriter {
         scope_ident: scope_ident.clone(),
         rewrote_index_call: false,
@@ -2000,65 +3669,108 @@ fn inject_thread_index_scope(input: &mut ItemFn) {
     }
 }
 
+/// Return compiler configuration markers already materialized in a generic
+/// kernel body by attributes that expanded before `#[kernel]`.
+///
+/// Only exact, zero-argument calls to cuda-oxide's three internal marker paths
+/// are forwarded. Nested calls and unrelated top-level calls remain solely in
+/// the helper body.
+fn top_level_kernel_configuration_markers(input: &ItemFn) -> Vec<Stmt> {
+    input
+        .block
+        .stmts
+        .iter()
+        .filter(|statement| is_kernel_configuration_marker(statement))
+        .cloned()
+        .collect()
+}
+
+fn is_kernel_configuration_marker(statement: &Stmt) -> bool {
+    let Stmt::Expr(Expr::Call(call), Some(_semicolon)) = statement else {
+        return false;
+    };
+    if !call.args.is_empty() {
+        return false;
+    }
+    let Expr::Path(ExprPath {
+        qself: None, path, ..
+    }) = &*call.func
+    else {
+        return false;
+    };
+    let segments: Vec<_> = path.segments.iter().collect();
+    if path.leading_colon.is_none()
+        || segments.len() != 3
+        || segments[0].ident != "cuda_device"
+        || !matches!(segments[0].arguments, PathArguments::None)
+        || !matches!(segments[1].arguments, PathArguments::None)
+        || !matches!(segments[2].arguments, PathArguments::AngleBracketed(_))
+    {
+        return false;
+    }
+
+    let module = &segments[1].ident;
+    let marker = &segments[2].ident;
+    (module == "thread" && marker == "__launch_bounds_config")
+        || (module == "cluster" && marker == "__cluster_config")
+        || (module == "shared" && marker == "__dynamic_shared_alignment")
+}
+
 /// Generate a generic kernel that will be instantiated from call sites (nvcc-style)
 fn generate_generic_kernel_no_instantiation(mut input: ItemFn) -> TokenStream {
     inject_thread_index_scope(&mut input);
 
+    // Attributes written below `#[kernel]` still belong to the source item
+    // when this macro runs. Route CUDA entry directives to the generated entry
+    // function, keep ordinary Rust attributes on the user-facing
+    // implementation, and copy cfg gates to every generated item.
+    let (implementation_attrs, entry_attrs, cfg_attrs) = route_generic_kernel_attrs(&input.attrs);
+    let entry_config_markers = top_level_kernel_configuration_markers(&input);
     let fn_name = &input.sig.ident;
     let vis = &input.vis;
     let generics = &input.sig.generics;
     let where_clause = &input.sig.generics.where_clause;
     let inputs = &input.sig.inputs;
     let output = &input.sig.output;
+    let constness = &input.sig.constness;
+    let unsafety = &input.sig.unsafety;
+    let abi = &input.sig.abi;
     let block = &input.block;
 
     let kernel_name = format_ident!("{}{}", KERNEL_PREFIX, fn_name);
     let instantiate_name = format_ident!("{}{}", INSTANTIATE_PREFIX, fn_name);
 
-    // For the wrapper function, strip `mut` from parameters since it just forwards them
-    let wrapper_inputs = strip_mut_from_inputs(inputs);
-
-    // Extract argument names and info for forwarding
-    let args_info: Vec<_> = input
-        .sig
-        .inputs
+    let (wrapper_inputs, arg_names) = match forwarding_inputs(inputs) {
+        Ok(forwarding) => forwarding,
+        Err(err) => return err.to_compile_error().into(),
+    };
+    let args_info: Vec<_> = arg_names
         .iter()
-        .filter_map(|arg| {
-            if let FnArg::Typed(pat_type) = arg
-                && let Pat::Ident(pat_ident) = &*pat_type.pat
-            {
-                return Some((&pat_ident.ident, &*pat_type.ty));
-            }
-            None
+        .zip(inputs.iter())
+        .filter_map(|(name, arg)| {
+            let FnArg::Typed(pat_type) = arg else {
+                return None;
+            };
+            Some((name, &*pat_type.ty))
         })
         .collect();
-
-    let arg_names: Vec<_> = args_info.iter().map(|(name, _)| *name).collect();
 
     // Find the closure generic type (looks for Fn/FnMut/FnOnce bounds)
     let closure_generic = find_closure_generic(generics);
 
-    // Extract generic type parameter names (T, F, etc.) for use in function pointer cast
-    let generic_param_names: Vec<&syn::Ident> = generics
-        .params
-        .iter()
-        .filter_map(|p| {
-            if let syn::GenericParam::Type(type_param) = p {
-                Some(&type_param.ident)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let marker_name = format_ident!("__{}_CudaKernel", fn_name);
+    // Function turbofish arguments contain both types and consts in source
+    // order. Lifetimes are inferred and therefore do not appear here.
+    let codegen_args = codegen_generic_arguments(generics);
+    let kernel_turbofish = if codegen_args.is_empty() {
+        quote! {}
+    } else {
+        quote! { ::<#(#codegen_args),*> }
+    };
+    let ptx_name_fn = format_ident!("{}_ptx_name", fn_name);
     let instantiate_helper = if let Some(closure_type_name) = closure_generic {
         if let Some((_closure_idx, (_closure_name, closure_type))) =
             find_closure_param(&args_info, &closure_type_name)
         {
-            let arg_types: Vec<TokenStream2> =
-                args_info.iter().map(|(_, ty)| quote! { #ty }).collect();
-
             quote! {
                 /// Auto-generated helper to force kernel monomorphization.
                 ///
@@ -2080,15 +3792,10 @@ fn generate_generic_kernel_no_instantiation(mut input: ItemFn) -> TokenStream {
                 /// launch — `cuda_host::type_id_u128` does not enforce
                 /// this.
                 #[doc(hidden)]
+                #(#cfg_attrs)*
                 #[inline(never)]
-                #vis fn #instantiate_name #generics (_f: &#closure_type) -> &'static str #where_clause {
-                    let __kernel_ptr = #kernel_name::<#(#generic_param_names),*> as fn(#(#arg_types),*) as *const ();
-                    unsafe {
-                        let mut __force_mono: *const () = core::ptr::null();
-                        core::ptr::write_volatile(&mut __force_mono, __kernel_ptr);
-                        let _ = core::ptr::read_volatile(&__force_mono);
-                    }
-                    <#marker_name::<#(#generic_param_names),*> as cuda_host::GenericCudaKernel>::ptx_name()
+                #vis fn #instantiate_name #generics (_: &#closure_type) -> &'static str #where_clause {
+                    #ptx_name_fn #kernel_turbofish ()
                 }
             }
         } else {
@@ -2100,20 +3807,30 @@ fn generate_generic_kernel_no_instantiation(mut input: ItemFn) -> TokenStream {
 
     // Generate the GenericCudaKernel trait implementation for unified compilation
     let generic_cuda_kernel_impl =
-        generate_generic_cuda_kernel_impl(fn_name, generics, where_clause);
+        generate_generic_cuda_kernel_impl(fn_name, vis, generics, where_clause, &cfg_attrs);
+    let implementation_call = quote! { #fn_name #kernel_turbofish (#(#arg_names),*) };
+    let implementation_call = if unsafety.is_some() {
+        quote! { unsafe { #implementation_call } }
+    } else {
+        implementation_call
+    };
 
     let expanded = quote! {
         // Original generic kernel implementation
+        #(#implementation_attrs)*
         #[inline(always)]
-        #vis fn #fn_name #generics (#inputs) #output #where_clause
+        #vis #constness #unsafety #abi fn #fn_name #generics (#inputs) #output #where_clause
         #block
 
         // Entry point for collector - NOT inlined so we can detect it
         // When called with concrete types, this instantiates the kernel
-        // Note: wrapper_inputs has `mut` stripped since we just forward args
+        // Synthetic wrapper parameter names make every irrefutable source
+        // pattern forwardable without carrying local binding `mut`.
+        #(#entry_attrs)*
         #[inline(never)]
-        #vis fn #kernel_name #generics (#(#wrapper_inputs),*) #output #where_clause {
-            #fn_name(#(#arg_names),*)
+        #vis #constness #unsafety #abi fn #kernel_name #generics (#(#wrapper_inputs),*) #output #where_clause {
+            #(#entry_config_markers)*
+            #implementation_call
         }
 
         #instantiate_helper
@@ -2122,6 +3839,45 @@ fn generate_generic_kernel_no_instantiation(mut input: ItemFn) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// Route attributes when one generic source function becomes several items.
+///
+/// CUDA entry directives must decorate the generated collector entry, not the
+/// inline implementation helper. Configuration gates must decorate every item
+/// to avoid leaving a marker or helper behind for a disabled kernel. Other
+/// user-facing attributes (documentation, lints, deprecation, etc.) stay on
+/// the implementation with the original Rust name.
+fn route_generic_kernel_attrs(
+    attrs: &[syn::Attribute],
+) -> (
+    Vec<syn::Attribute>,
+    Vec<syn::Attribute>,
+    Vec<syn::Attribute>,
+) {
+    let is_cfg = |attr: &syn::Attribute| {
+        attr_path_ends_with(attr, "cfg") || attr_path_ends_with(attr, "cfg_attr")
+    };
+    let is_entry_directive = |attr: &syn::Attribute| {
+        attr_path_ends_with(attr, "launch_bounds")
+            || attr_path_ends_with(attr, "launch_contract")
+            || attr_path_ends_with(attr, "cluster_launch")
+            || attr_path_ends_with(attr, "cooperative_launch")
+    };
+
+    let cfg_attrs = attrs.iter().filter(|attr| is_cfg(attr)).cloned().collect();
+    let implementation_attrs = attrs
+        .iter()
+        .filter(|attr| !is_entry_directive(attr) && !attr_path_ends_with(attr, "inline"))
+        .cloned()
+        .collect();
+    let entry_attrs = attrs
+        .iter()
+        .filter(|attr| is_cfg(attr) || is_entry_directive(attr))
+        .cloned()
+        .collect();
+
+    (implementation_attrs, entry_attrs, cfg_attrs)
 }
 
 /// Generate a dummy binding for a given type.
@@ -2186,26 +3942,26 @@ fn generate_simple_kernel(mut input: ItemFn) -> TokenStream {
 
 /// Generate the GenericCudaKernel trait implementation for a generic kernel.
 ///
-/// For generic kernels like `fn scale<T>()`, emits:
+/// For generic kernels like `fn tile<T, const N: usize>()`, emits:
 ///
 /// ```ignore
-/// pub struct __scale_CudaKernel<T>(PhantomData<T>);
-/// impl<T> GenericCudaKernel for __scale_CudaKernel<T> {
+/// pub struct __tile_CudaKernel<T, const N: usize>(PhantomData<*const T>);
+/// impl<T, const N: usize> GenericCudaKernel for __tile_CudaKernel<T, N> {
 ///     fn ptx_name() -> &'static str {
-///         // "scale_TID_<hex32>" — one 32-char hex chunk for the
-///         // 1-tuple `(T,)`. For an N-generic kernel we hash the
-///         // N-tuple `(T0, T1, ...)` so the name length is constant
-///         // regardless of arity.
+///         // "tile_TID_<hex32>" — one 32-char hash of the concrete
+///         // generated kernel function-item type.
 ///     }
+/// }
+/// pub fn tile_ptx_name<T, const N: usize>() -> &'static str {
+///     // Retains `kernel_entry::<T, N>` and delegates to the marker above.
 /// }
 /// ```
 ///
 /// The body computes the same string the backend writes into the PTX:
 /// `<base>_TID_<hex32>`, where `<hex32>` is
-/// `cuda_host::type_id_u128::<(T0, T1, ...,)>()` rendered as 32
-/// lowercase hex chars. The backend's `compute_kernel_export_name`
-/// computes the same hash via `Ty::new_tup(tcx, &[T0, T1, ...])` +
-/// `tcx.type_id_hash(...)`, so the two strings match byte-for-byte.
+/// `cuda_host::type_id_u128_of_val(&kernel_entry::<T, N>)` rendered as 32
+/// lowercase hex chars. The backend hashes the same concrete `FnDef` type,
+/// whose ordered generic arguments include both types and const values.
 ///
 /// Bound on the impl is `where_clause` verbatim — typically `Copy` on
 /// each value-passed generic. We deliberately do not add `'static`:
@@ -2217,58 +3973,67 @@ fn generate_simple_kernel(mut input: ItemFn) -> TokenStream {
 /// scheme.
 fn generate_generic_cuda_kernel_impl(
     fn_name: &Ident,
+    vis: &syn::Visibility,
     generics: &syn::Generics,
     where_clause: &Option<syn::WhereClause>,
+    cfg_attrs: &[syn::Attribute],
 ) -> TokenStream2 {
     let marker_name = format_ident!("__{}_CudaKernel", fn_name);
+    let ptx_name_fn = format_ident!("{}_ptx_name", fn_name);
+    let kernel_name = format_ident!("{}{}", KERNEL_PREFIX, fn_name);
     let base_name = fn_name.to_string();
-
-    let type_params: Vec<_> = generics.params.iter().collect();
-    let type_param_names: Vec<_> = generics
-        .params
-        .iter()
-        .filter_map(|p| {
-            if let syn::GenericParam::Type(tp) = p {
-                Some(&tp.ident)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let ptx_name_body = if type_param_names.is_empty() {
-        quote! {
-            fn ptx_name() -> &'static str {
-                #base_name
-            }
-        }
+    let generic_params: Vec<_> = generics.params.iter().collect();
+    let marker_args = generic_arguments(generics);
+    let codegen_args = codegen_generic_arguments(generics);
+    let phantom_type = generic_phantom_type(generics);
+    let marker_type = if marker_args.is_empty() {
+        quote! { #marker_name }
     } else {
-        // Trailing comma in the tuple type expression keeps the
-        // arity-1 case `(T,)` a real 1-tuple — without it,
-        // `(T)` would just be a parenthesized type and the hash
-        // would differ from the backend's `Ty::new_tup(tcx, &[T])`.
-        quote! {
-            fn ptx_name() -> &'static str {
-                let __hash = ::cuda_host::type_id_u128::<( #(#type_param_names,)* )>();
-                let name = format!("{}_TID_{:032x}", #base_name, __hash);
-                Box::leak(name.into_boxed_str())
-            }
-        }
+        quote! { #marker_name <#(#marker_args),*> }
     };
+    let kernel_turbofish = if codegen_args.is_empty() {
+        quote! {}
+    } else {
+        quote! { ::<#(#codegen_args),*> }
+    };
+    let (impl_generics, _, _) = generics.split_for_impl();
+    let hash = internal_ident("__cuda_oxide_kernel_hash");
+    let kernel_ptr = internal_ident("__cuda_oxide_kernel_ptr");
+    let force_mono = internal_ident("__cuda_oxide_force_mono");
 
     quote! {
         /// Marker type for a generic kernel; implements `GenericCudaKernel`.
-        /// The type parameters mirror the kernel's generic parameters.
+        /// Its generic parameters mirror the kernel's generic parameters.
+        #(#cfg_attrs)*
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
-        pub struct #marker_name<#(#type_params),*>(
-            core::marker::PhantomData<(#(#type_param_names),*)>
+        pub struct #marker_name<#(#generic_params),*>(
+            core::marker::PhantomData<#phantom_type>
         ) #where_clause;
 
-        impl<#(#type_params),*> cuda_host::GenericCudaKernel for #marker_name<#(#type_param_names),*>
+        #(#cfg_attrs)*
+        impl #impl_generics ::cuda_host::GenericCudaKernel for #marker_type
         #where_clause
         {
-            #ptx_name_body
+            fn ptx_name() -> &'static str {
+                let #hash = ::cuda_host::type_id_u128_of_val(
+                    &#kernel_name #kernel_turbofish
+                );
+                ::cuda_host::__intern_generic_kernel_name(#base_name, #hash)
+            }
+        }
+
+        /// Retains this concrete kernel specialization and returns its PTX entry name.
+        #(#cfg_attrs)*
+        #[inline(never)]
+        #vis fn #ptx_name_fn #generics () -> &'static str #where_clause {
+            let #kernel_ptr = #kernel_name #kernel_turbofish as *const ();
+            unsafe {
+                let mut #force_mono: *const () = ::core::ptr::null();
+                ::core::ptr::write_volatile(&mut #force_mono, #kernel_ptr);
+                let _ = ::core::ptr::read_volatile(&#force_mono);
+            }
+            <#marker_type as ::cuda_host::GenericCudaKernel>::ptx_name()
         }
     }
 }
@@ -2299,6 +4064,9 @@ fn generate_cuda_kernel_impl(fn_name: &Ident, ptx_name: &str, _func: &ItemFn) ->
 fn generate_generic_kernel(mut input: ItemFn, instantiate_types: Vec<Type>) -> TokenStream {
     inject_thread_index_scope(&mut input);
 
+    let (implementation_attrs, entry_attrs, _cfg_attrs) = route_generic_kernel_attrs(&input.attrs);
+    let entry_config_markers = top_level_kernel_configuration_markers(&input);
+    input.attrs.clear();
     let fn_name = &input.sig.ident;
     let vis = &input.vis;
     let generics = &input.sig.generics;
@@ -2336,6 +4104,8 @@ fn generate_generic_kernel(mut input: ItemFn, instantiate_types: Vec<Type>) -> T
     let wrappers: Vec<TokenStream2> = instantiate_types
         .iter()
         .map(|inst_type| {
+            let entry_attrs = &entry_attrs;
+            let entry_config_markers = &entry_config_markers;
             // Get a clean name for the type (for the kernel name suffix)
             let type_name = get_type_name(inst_type);
             let wrapper_name = format_ident!("{}{}_{}", KERNEL_PREFIX, fn_name, type_name);
@@ -2360,9 +4130,11 @@ fn generate_generic_kernel(mut input: ItemFn, instantiate_types: Vec<Type>) -> T
                 .collect();
 
             quote! {
+                #(#entry_attrs)*
                 #[unsafe(no_mangle)]
                 #[unsafe(export_name = #export_name_str)]
                 #vis fn #wrapper_name(#(#wrapper_args),*) {
+                    #(#entry_config_markers)*
                     #fn_name::<#inst_type>(#(#arg_names),*);
                 }
             }
@@ -2372,6 +4144,7 @@ fn generate_generic_kernel(mut input: ItemFn, instantiate_types: Vec<Type>) -> T
     // Keep the original generic function (without #[no_mangle] - it's not an entry point)
     // and add all the wrapper kernels
     let expanded = quote! {
+        #(#implementation_attrs)*
         #[inline(always)]
         #input
 
@@ -2445,7 +4218,8 @@ fn substitute_type(ty: &Type, param: &syn::Ident, replacement: &Type) -> TokenSt
 /// # Requirements
 ///
 /// - Must be used WITH `#[kernel]` (not standalone)
-/// - The `#[launch_bounds]` attribute must come AFTER `#[kernel]`
+/// - May appear before or after `#[kernel]`; generic entry generation forwards
+///   an already-expanded compiler marker to each entry wrapper
 ///
 /// # Performance Impact
 ///
@@ -2469,7 +4243,7 @@ pub fn launch_bounds(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Inject the launch bounds config marker at the start of the function body
     let marker_call: syn::Stmt = syn::parse_quote! {
-        cuda_device::thread::__launch_bounds_config::<#max_threads, #min_blocks>();
+        ::cuda_device::thread::__launch_bounds_config::<#max_threads, #min_blocks>();
     };
 
     // Prepend the marker to the function body
@@ -2481,7 +4255,64 @@ pub fn launch_bounds(attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Declares the host launch geometry and resource contract for a kernel.
+///
+/// `#[cuda_module]` uses this opt-in declaration to generate a prepared,
+/// kernel-branded launch path. A prepared launch can be reused without
+/// repeating CUDA capability and function-resource queries, while raw
+/// [`LaunchConfig`](https://docs.rs/cuda-core/latest/cuda_core/struct.LaunchConfig.html)
+/// remains available through an explicitly unsafe generated method.
+///
+/// ```ignore
+/// use cuda_device::{kernel, launch_bounds, launch_contract, DisjointSlice};
+///
+/// #[kernel]
+/// #[launch_bounds(256)]
+/// #[launch_contract(
+///     domain = 1,
+///     block = (256, 1, 1),
+///     dynamic_shared = 0,
+///     min_compute_capability = (8, 0),
+/// )]
+/// pub fn map(mut output: DisjointSlice<f32>) {
+///     // ...
+/// }
+/// ```
+///
+/// `domain` is an author declaration, not body inference: helper calls can
+/// hide which hardware indices a kernel reads. For obvious mismatches,
+/// `#[cuda_module]` cross-checks the declaration against `DisjointSlice` index
+/// spaces and the fixed cluster shape.
+///
+/// Dynamic shared memory may be fixed with `dynamic_shared = BYTES` or bounded
+/// with `dynamic_shared_range = (MIN, MAX)`. The byte extent remains an author
+/// contract because arbitrary pointer arithmetic cannot be inferred. When the
+/// maximum is non-zero, the macro injects a compiler marker whose call is
+/// removed before code generation. The declared `dynamic_shared_alignment`
+/// therefore becomes a minimum alignment in generated PTX without adding
+/// kernel hot-path instructions.
+#[proc_macro_attribute]
+pub fn launch_contract(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as LaunchContractArgs);
+    let mut input = parse_macro_input!(item as ItemFn);
+
+    inject_launch_contract_alignment_marker(&args, &mut input);
+
+    quote! { #input }.into()
+}
+
+fn inject_launch_contract_alignment_marker(args: &LaunchContractArgs, input: &mut ItemFn) {
+    if dynamic_shared_max(args.dynamic_shared) != 0 {
+        let alignment = args.dynamic_shared_alignment as usize;
+        let alignment_marker: syn::Stmt = parse_quote! {
+            ::cuda_device::shared::__dynamic_shared_alignment::<#alignment>();
+        };
+        input.block.stmts.insert(0, alignment_marker);
+    }
+}
+
 /// Arguments for `#[launch_bounds(...)]` attribute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LaunchBoundsArgs {
     max_threads: u32,
     min_blocks: u32,
@@ -2504,8 +4335,8 @@ impl Parse for LaunchBoundsArgs {
                 max_threads: values[0],
                 min_blocks: values[1],
             }),
-            _ => Err(syn::Error::new_spanned(
-                args.first().unwrap(),
+            _ => Err(syn::Error::new(
+                input.span(),
                 "launch_bounds expects 1 or 2 parameters: #[launch_bounds(max_threads)] or #[launch_bounds(max_threads, min_blocks)]",
             )),
         }
@@ -2696,7 +4527,8 @@ fn rewrite_loop_unroll_attrs(input: &mut ItemFn) -> syn::Result<()> {
 ///
 /// - Must be used WITH `#[kernel]` (not standalone)
 /// - Requires sm_90+ (Hopper) or newer GPU
-/// - The `#[cluster_launch]` attribute must come AFTER `#[kernel]`
+/// - May appear before or after `#[kernel]`; generic entry generation forwards
+///   an already-expanded compiler marker to each entry wrapper
 ///
 /// # How It Works
 ///
@@ -2730,7 +4562,7 @@ pub fn cluster_launch(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Inject the cluster config marker at the start of the function body
     let marker_call: syn::Stmt = syn::parse_quote! {
-        cuda_device::cluster::__cluster_config::<#x, #y, #z>();
+        ::cuda_device::cluster::__cluster_config::<#x, #y, #z>();
     };
 
     // Prepend the marker to the function body
@@ -2813,7 +4645,8 @@ impl Parse for ClusterArgs {
 ///
 /// - Must be used WITH `#[kernel]` (not standalone), on a kernel inside a
 ///   `#[cuda_module]` module
-/// - The `#[cooperative_launch]` attribute must come AFTER `#[kernel]`
+/// - May appear before or after `#[kernel]`; `#[cuda_module]` records this
+///   launch-time setting before nested function attributes expand
 /// - The device must support cooperative launch
 ///   (`CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH`)
 /// - The grid must fit on the device in one wave, otherwise the driver
@@ -2951,6 +4784,9 @@ fn generate_device_function(mut input: ItemFn) -> TokenStream {
     if let Some(err) = reject_reserved_name(&input.sig.ident) {
         return err;
     }
+    if let Some(err) = impl_trait_parameter_error(&input, "device function") {
+        return err.to_compile_error().into();
+    }
     if let Err(err) = rewrite_loop_unroll_attrs(&mut input) {
         return err.to_compile_error().into();
     }
@@ -2960,39 +4796,20 @@ fn generate_device_function(mut input: ItemFn) -> TokenStream {
     let vis = input.vis.clone();
     let new_name = format_ident!("{}{}", DEVICE_PREFIX, fn_name);
 
-    // Check if the function has type parameters
-    let has_generics = input
-        .sig
-        .generics
-        .params
-        .iter()
-        .any(|p| matches!(p, GenericParam::Type(_)));
-
-    // Extract parameter names for forwarding
-    let params: Vec<_> = input
-        .sig
-        .inputs
-        .iter()
-        .filter_map(|arg| {
-            if let FnArg::Typed(pat_type) = arg
-                && let Pat::Ident(pat_ident) = &*pat_type.pat
-            {
-                return Some(pat_ident.ident.clone());
-            }
-            None
-        })
-        .collect();
+    // Type and const parameters both create device monomorphizations.
+    let has_generics = has_codegen_generics(&input.sig.generics);
 
     let return_type = &input.sig.output;
     let generics = &input.sig.generics;
     let where_clause = &input.sig.generics.where_clause;
+    let constness = &input.sig.constness;
+    let unsafety = &input.sig.unsafety;
+    let abi = &input.sig.abi;
 
-    // Strip `mut` from wrapper parameters since the wrapper just forwards args.
-    // In Rust, `mut` on a by-value parameter is purely local binding mutability —
-    // it's not part of the function's type signature and callers don't need `mut`
-    // to pass a value. The original (renamed) function keeps `mut` for its body,
-    // but the wrapper only forwards the value and never mutates it locally.
-    let wrapper_inputs = strip_mut_from_inputs(&input.sig.inputs);
+    let (wrapper_inputs, params) = match forwarding_inputs(&input.sig.inputs) {
+        Ok(forwarding) => forwarding,
+        Err(err) => return err.to_compile_error().into(),
+    };
 
     // Rename the original function with the prefix
     input.sig.ident = new_name.clone();
@@ -3011,18 +4828,14 @@ fn generate_device_function(mut input: ItemFn) -> TokenStream {
         // - The wrapper forwards type parameters via turbofish:
         //   `cuda_oxide_device_<hash>_add::<T>(a, b)`.
 
-        // Extract type parameter names for turbofish forwarding (T, U, etc.)
-        let type_param_names: Vec<&syn::Ident> = generics
-            .params
-            .iter()
-            .filter_map(|p| {
-                if let GenericParam::Type(type_param) = p {
-                    Some(&type_param.ident)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let codegen_args = codegen_generic_arguments(generics);
+        let turbofish = quote! { ::<#(#codegen_args),*> };
+        let call = quote! { #new_name #turbofish (#(#params),*) };
+        let call = if unsafety.is_some() {
+            quote! { unsafe { #call } }
+        } else {
+            call
+        };
 
         let expanded = quote! {
             #[inline(never)]
@@ -3030,13 +4843,19 @@ fn generate_device_function(mut input: ItemFn) -> TokenStream {
 
             /// Wrapper for the generic device function with the original name.
             #[inline(always)]
-            #vis fn #fn_name #generics (#(#wrapper_inputs),*) #return_type #where_clause {
-                #new_name::<#(#type_param_names),*>(#(#params),*)
+            #vis #constness #unsafety #abi fn #fn_name #generics (#(#wrapper_inputs),*) #return_type #where_clause {
+                #call
             }
         };
 
         TokenStream::from(expanded)
     } else {
+        let call = quote! { #new_name(#(#params),*) };
+        let call = if unsafety.is_some() {
+            quote! { unsafe { #call } }
+        } else {
+            call
+        };
         // Non-generic device function: simple case.
         let expanded = quote! {
             #[unsafe(no_mangle)]
@@ -3044,8 +4863,8 @@ fn generate_device_function(mut input: ItemFn) -> TokenStream {
 
             /// Wrapper for the device function with the original name.
             #[inline(always)]
-            #vis fn #fn_name #generics (#(#wrapper_inputs),*) #return_type #where_clause {
-                #new_name(#(#params),*)
+            #vis #constness #unsafety #abi fn #fn_name #generics (#(#wrapper_inputs),*) #return_type #where_clause {
+                #call
             }
         };
 
@@ -3362,6 +5181,21 @@ struct CudaLaunchInput {
     cooperative: Option<syn::Expr>,
 }
 
+/// Return the generated sibling of a kernel while preserving its module path
+/// and explicit generic arguments.
+///
+/// For example, `kernels::map::<F, 4>` becomes
+/// `kernels::__map_CudaKernel::<F, 4>` when `sibling_name` is the marker name.
+fn kernel_sibling_path(kernel: &syn::Path, sibling_name: Ident) -> syn::Path {
+    let mut sibling = kernel.clone();
+    sibling
+        .segments
+        .last_mut()
+        .expect("kernel path must have segments")
+        .ident = sibling_name;
+    sibling
+}
+
 impl CudaLaunchInput {
     /// Extract the base kernel name (without generics) and generic arguments
     fn kernel_parts(&self) -> (Ident, Option<&syn::PathArguments>) {
@@ -3473,23 +5307,26 @@ impl Parse for CudaLaunchInput {
 ///   kernel parameter;
 /// - every pointer argument is **device-accessible** (a valid device
 ///   allocation, or host memory reachable via HMM/unified memory) and stays
-///   alive until the kernel finishes.
+///   alive until the kernel finishes;
+/// - the grid, block, dynamic-shared-memory size, cluster dimensions, and
+///   cooperative mode satisfy every indexing, resource, and synchronization
+///   assumption made by the kernel.
 ///
 /// A mismatch is undefined behavior, not a runtime error: too few or
 /// mistyped arguments make the driver read past the end of the args array,
 /// and a bad pointer makes the device dereference junk.
 ///
-/// For kernels embedded in your own crate, prefer `#[cuda_module]`: it
-/// reads the kernel signatures at compile time and generates typed launch
-/// methods, so none of the above can go wrong. This macro's remaining niche
-/// is modules loaded at **runtime by name** (e.g. external PTX files),
-/// where no compile-time signature exists to check.
+/// For kernels embedded in your own crate, prefer `#[cuda_module]` with a
+/// launch contract: it checks the signature and prepares a kernel-branded
+/// geometry/resource proof. This macro's remaining niche is modules loaded at
+/// **runtime by name** (e.g. external PTX files), where no compile-time
+/// contract exists to check.
 ///
 /// # Usage
 ///
 /// ```ignore
-/// // SAFETY: argument count, order, and types match `vecadd`'s signature;
-/// // a_dev, b_dev, c_dev are live device buffers.
+/// // SAFETY: argument count, order, and types match `vecadd`; the buffers stay
+/// // live, and the raw configuration matches vecadd's 1-D index space.
 /// unsafe {
 ///     cuda_launch! {
 ///         kernel: vecadd,
@@ -3532,7 +5369,6 @@ impl Parse for CudaLaunchInput {
 pub fn cuda_launch(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as CudaLaunchInput);
 
-    let _kernel_path = &input.kernel;
     let stream = &input.stream;
     let module = &input.module;
     let config = &input.config;
@@ -3540,12 +5376,20 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
     let cooperative = &input.cooperative;
 
     // Get base kernel name and generic arguments
-    let (kernel_base, generics) = input.kernel_parts();
-
-    let kernel_entry = format_ident!("{}{}", KERNEL_PREFIX, kernel_base);
+    let (kernel_base, _generics) = input.kernel_parts();
 
     // Build the marker type name for CudaKernel lookup
-    let marker_name = format_ident!("__{}_CudaKernel", kernel_base);
+    let marker = kernel_sibling_path(&input.kernel, format_ident!("__{}_CudaKernel", kernel_base));
+    let ptx_name_helper =
+        kernel_sibling_path(&input.kernel, format_ident!("{}_ptx_name", kernel_base));
+    let args_ident = internal_ident("__cuda_oxide_args");
+    let closure_ident = internal_ident("__cuda_oxide_closure");
+    let ptx_name_ident = internal_ident("__cuda_oxide_ptx_name");
+    let function_ident = internal_ident("__cuda_oxide_function");
+    let config_ident = internal_ident("__cuda_oxide_config");
+    let cooperative_ident = internal_ident("__cuda_oxide_cooperative");
+    let error_ident = internal_ident("__cuda_oxide_error");
+    let static_ptx_name_ident = internal_ident("__CUDA_OXIDE_PTX_NAME");
 
     // Check if any argument is a closure (for special handling)
     let has_closure = input
@@ -3575,34 +5419,34 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
         .iter()
         .enumerate()
         .map(|(i, arg)| {
-            let val_name = format_ident!("__arg_{}", i);
+            let val_name = internal_ident(&format!("__cuda_oxide_arg_{i}"));
             match arg {
                 CudaLaunchArg::Direct(expr) => {
                     quote! {
                         let mut #val_name = #expr;
-                        __args.push(&mut #val_name as *mut _ as *mut std::ffi::c_void);
+                        #args_ident.push(&mut #val_name as *mut _ as *mut std::ffi::c_void);
                     }
                 }
                 CudaLaunchArg::SliceWithLen(expr) => {
-                    let ptr_name = format_ident!("__arg_{}_ptr", i);
-                    let len_name = format_ident!("__arg_{}_len", i);
+                    let ptr_name = internal_ident(&format!("__cuda_oxide_arg_{i}_ptr"));
+                    let len_name = internal_ident(&format!("__cuda_oxide_arg_{i}_len"));
                     quote! {
                         let #val_name = &#expr;
                         let mut #ptr_name = #val_name.cu_deviceptr();
                         let mut #len_name = #val_name.len() as u64;
-                        __args.push(&mut #ptr_name as *mut _ as *mut std::ffi::c_void);
-                        __args.push(&mut #len_name as *mut _ as *mut std::ffi::c_void);
+                        #args_ident.push(&mut #ptr_name as *mut _ as *mut std::ffi::c_void);
+                        #args_ident.push(&mut #len_name as *mut _ as *mut std::ffi::c_void);
                     }
                 }
                 CudaLaunchArg::SliceMutWithLen(expr) => {
-                    let ptr_name = format_ident!("__arg_{}_ptr", i);
-                    let len_name = format_ident!("__arg_{}_len", i);
+                    let ptr_name = internal_ident(&format!("__cuda_oxide_arg_{i}_ptr"));
+                    let len_name = internal_ident(&format!("__cuda_oxide_arg_{i}_len"));
                     quote! {
                         let #val_name = &mut #expr;
                         let mut #ptr_name = #val_name.cu_deviceptr();
                         let mut #len_name = #val_name.len() as u64;
-                        __args.push(&mut #ptr_name as *mut _ as *mut std::ffi::c_void);
-                        __args.push(&mut #len_name as *mut _ as *mut std::ffi::c_void);
+                        #args_ident.push(&mut #ptr_name as *mut _ as *mut std::ffi::c_void);
+                        #args_ident.push(&mut #len_name as *mut _ as *mut std::ffi::c_void);
                     }
                 }
                 CudaLaunchArg::Closure { .. } => {
@@ -3621,7 +5465,7 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
                     // HMM).
                     let _ = i;
                     quote! {
-                        ::cuda_host::push_kernel_scalar(&mut __args, &mut __closure);
+                        ::cuda_host::push_kernel_scalar(&mut #args_ident, &mut #closure_ident);
                     }
                 }
             }
@@ -3629,7 +5473,10 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
         .collect();
 
     // Build the instantiate helper name (for closures)
-    let instantiate_name = format_ident!("{}{}", INSTANTIATE_PREFIX, kernel_base);
+    let instantiate = kernel_sibling_path(
+        &input.kernel,
+        format_ident!("{}{}", INSTANTIATE_PREFIX, kernel_base),
+    );
 
     // Generate the launch call — regular, cluster, or cooperative.
     //
@@ -3639,40 +5486,40 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
     let launch_call = if let Some(cdim) = cluster_dim {
         quote! {
             {
-                let __cfg = #config;
+                let #config_ident = #config;
                 cuda_core::launch_kernel_ex_on_stream(
-                    &__func,
-                    __cfg.grid_dim,
-                    __cfg.block_dim,
-                    __cfg.shared_mem_bytes,
+                    &#function_ident,
+                    #config_ident.grid_dim,
+                    #config_ident.block_dim,
+                    #config_ident.shared_mem_bytes,
                     #cdim,
                     (#stream).as_ref(),
-                    &mut __args,
+                    &mut #args_ident,
                 )
             }
         }
     } else if let Some(coop) = cooperative {
         quote! {
             {
-                let __cfg = #config;
-                let __cooperative: bool = #coop;
-                if __cooperative {
+                let #config_ident = #config;
+                let #cooperative_ident: bool = #coop;
+                if #cooperative_ident {
                     cuda_core::launch_kernel_cooperative_on_stream(
-                        &__func,
-                        __cfg.grid_dim,
-                        __cfg.block_dim,
-                        __cfg.shared_mem_bytes,
+                        &#function_ident,
+                        #config_ident.grid_dim,
+                        #config_ident.block_dim,
+                        #config_ident.shared_mem_bytes,
                         (#stream).as_ref(),
-                        &mut __args,
+                        &mut #args_ident,
                     )
                 } else {
                     cuda_core::launch_kernel_on_stream(
-                        &__func,
-                        __cfg.grid_dim,
-                        __cfg.block_dim,
-                        __cfg.shared_mem_bytes,
+                        &#function_ident,
+                        #config_ident.grid_dim,
+                        #config_ident.block_dim,
+                        #config_ident.shared_mem_bytes,
                         (#stream).as_ref(),
-                        &mut __args,
+                        &mut #args_ident,
                     )
                 }
             }
@@ -3680,14 +5527,14 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
     } else {
         quote! {
             {
-                let __cfg = #config;
+                let #config_ident = #config;
                 cuda_core::launch_kernel_on_stream(
-                    &__func,
-                    __cfg.grid_dim,
-                    __cfg.block_dim,
-                    __cfg.shared_mem_bytes,
+                    &#function_ident,
+                    #config_ident.grid_dim,
+                    #config_ident.block_dim,
+                    #config_ident.shared_mem_bytes,
                     (#stream).as_ref(),
-                    &mut __args,
+                    &mut #args_ident,
                 )
             }
         }
@@ -3706,18 +5553,18 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
 
         quote! {
             {
-                let mut __closure = #closure_expr;
-                let __ptx_name: &'static str = #instantiate_name(&__closure);
-                let __func = #module.load_function(__ptx_name).unwrap_or_else(|err| {
+                let mut #closure_ident = #closure_expr;
+                let #ptx_name_ident: &'static str = #instantiate(&#closure_ident);
+                let #function_ident = #module.load_function(#ptx_name_ident).unwrap_or_else(|#error_ident| {
                     panic!(
                         "Failed to load kernel `{}` (expected PTX entry `{}`): {:?}",
                         stringify!(#kernel_base),
-                        __ptx_name,
-                        err,
+                        #ptx_name_ident,
+                        #error_ident,
                     )
                 });
 
-                let mut __args: Vec<*mut std::ffi::c_void> = Vec::new();
+                let mut #args_ident: Vec<*mut std::ffi::c_void> = Vec::new();
                 #(#arg_code)*
 
                 #launch_call
@@ -3726,25 +5573,17 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
     } else if input.is_generic() {
         quote! {
             {
-                let __kernel_ptr = #kernel_entry #generics as *const ();
-                // Caller-unsafe on purpose: the volatile write/read pair that
-                // forces monomorphization is covered by the same `unsafe { }`
-                // block the caller must already supply for the launch itself.
-                let mut __force_mono: *const () = core::ptr::null();
-                core::ptr::write_volatile(&mut __force_mono, __kernel_ptr);
-                let _ = core::ptr::read_volatile(&__force_mono);
-
-                let __ptx_name = <#marker_name #generics as cuda_host::GenericCudaKernel>::ptx_name();
-                let __func = #module.load_function(__ptx_name).unwrap_or_else(|err| {
+                let #ptx_name_ident = #ptx_name_helper();
+                let #function_ident = #module.load_function(#ptx_name_ident).unwrap_or_else(|#error_ident| {
                     panic!(
                         "Failed to load kernel `{}` (expected PTX entry `{}`): {:?}",
                         stringify!(#kernel_base),
-                        __ptx_name,
-                        err,
+                        #ptx_name_ident,
+                        #error_ident,
                     )
                 });
 
-                let mut __args: Vec<*mut std::ffi::c_void> = Vec::new();
+                let mut #args_ident: Vec<*mut std::ffi::c_void> = Vec::new();
                 #(#arg_code)*
 
                 #launch_call
@@ -3753,17 +5592,17 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
     } else {
         quote! {
             {
-                const __PTX_NAME: &str = <#marker_name as cuda_host::CudaKernel>::PTX_NAME;
-                let __func = #module.load_function(__PTX_NAME).unwrap_or_else(|err| {
+                const #static_ptx_name_ident: &str = <#marker as cuda_host::CudaKernel>::PTX_NAME;
+                let #function_ident = #module.load_function(#static_ptx_name_ident).unwrap_or_else(|#error_ident| {
                     panic!(
                         "Failed to load kernel `{}` (expected PTX entry `{}`): {:?}",
                         stringify!(#kernel_base),
-                        __PTX_NAME,
-                        err,
+                        #static_ptx_name_ident,
+                        #error_ident,
                     )
                 });
 
-                let mut __args: Vec<*mut std::ffi::c_void> = Vec::new();
+                let mut #args_ident: Vec<*mut std::ffi::c_void> = Vec::new();
                 #(#arg_code)*
 
                 #launch_call
@@ -3901,17 +5740,33 @@ impl Parse for CudaLaunchAsyncInput {
 /// An `AsyncKernelLaunch` implementing `DeviceOperation`. No GPU work is enqueued
 /// until the caller schedules it.
 ///
+/// # Safety
+///
+/// This is a raw launch API. The caller must ensure that:
+///
+/// - argument count, order, type, size, and alignment match the kernel ABI;
+/// - referenced allocations remain valid and correctly aliased until the lazy
+///   operation completes;
+/// - the scheduled stream belongs to the function's CUDA context; and
+/// - dimensions, block shape, shared memory, and launch mode satisfy every
+///   indexing, resource, and synchronization assumption made by the kernel.
+///
+/// The macro invocation must therefore be inside an `unsafe` block.
+///
 /// # Usage
 ///
 /// ```ignore
 /// use cuda_host::cuda_launch_async;
 /// use cuda_core::LaunchConfig;
 ///
-/// let op = cuda_launch_async! {
-///     kernel: vecadd,
-///     module: module,
-///     config: LaunchConfig::for_num_elems(N as u32),
-///     args: [slice(a_dev), slice(b_dev), slice_mut(c_dev)]
+/// // SAFETY: ABI, lifetimes, geometry, and resources match vecadd.
+/// let op = unsafe {
+///     cuda_launch_async! {
+///         kernel: vecadd,
+///         module: module,
+///         config: LaunchConfig::for_num_elems(N as u32),
+///         args: [slice(a_dev), slice(b_dev), slice_mut(c_dev)]
+///     }
 /// };
 ///
 /// // Synchronous (blocks calling thread):
@@ -3927,12 +5782,20 @@ impl Parse for CudaLaunchAsyncInput {
 #[proc_macro]
 pub fn cuda_launch_async(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as CudaLaunchAsyncInput);
+    expand_cuda_launch_async(input).into()
+}
 
+fn expand_cuda_launch_async(input: CudaLaunchAsyncInput) -> TokenStream2 {
     let module = &input.module;
     let config = &input.config;
-    let (kernel_base, generics) = input.kernel_parts();
-    let marker_name = format_ident!("__{}_CudaKernel", kernel_base);
-    let instantiate_name = format_ident!("{}{}", INSTANTIATE_PREFIX, kernel_base);
+    let (kernel_base, _generics) = input.kernel_parts();
+    let marker = kernel_sibling_path(&input.kernel, format_ident!("__{}_CudaKernel", kernel_base));
+    let ptx_name_helper =
+        kernel_sibling_path(&input.kernel, format_ident!("{}_ptx_name", kernel_base));
+    let instantiate = kernel_sibling_path(
+        &input.kernel,
+        format_ident!("{}{}", INSTANTIATE_PREFIX, kernel_base),
+    );
     let has_closure = input
         .args
         .iter()
@@ -3944,35 +5807,41 @@ pub fn cuda_launch_async(input: TokenStream) -> TokenStream {
             None
         }
     });
+    let closure_ident = internal_ident("__cuda_oxide_closure");
+    let ptx_name_ident = internal_ident("__cuda_oxide_ptx_name");
+    let function_ident = internal_ident("__cuda_oxide_function");
+    let launch_ident = internal_ident("__cuda_oxide_launch");
+    let error_ident = internal_ident("__cuda_oxide_error");
+    let static_ptx_name_ident = internal_ident("__CUDA_OXIDE_PTX_NAME");
 
     let arg_code: Vec<TokenStream2> = input
         .args
         .iter()
         .enumerate()
         .map(|(i, arg)| {
-            let tmp_name = format_ident!("__arg_{}", i);
+            let tmp_name = internal_ident(&format!("__cuda_oxide_arg_{i}"));
             match arg {
                 CudaLaunchArg::Direct(expr) => {
                     quote! {
-                        __launch.push_arg(Box::new(#expr));
+                        #launch_ident.push_scalar_arg(#expr);
                     }
                 }
                 CudaLaunchArg::SliceWithLen(expr) => {
-                    let len_name = format_ident!("__arg_{}_len", i);
+                    let len_name = internal_ident(&format!("__cuda_oxide_arg_{i}_len"));
                     quote! {
                         let #tmp_name = &#expr;
-                        __launch.push_arg(Box::new(#tmp_name.cu_deviceptr()));
+                        #launch_ident.push_arg(Box::new(#tmp_name.cu_deviceptr()));
                         let #len_name = #tmp_name.len() as u64;
-                        __launch.push_arg(Box::new(#len_name));
+                        #launch_ident.push_arg(Box::new(#len_name));
                     }
                 }
                 CudaLaunchArg::SliceMutWithLen(expr) => {
-                    let len_name = format_ident!("__arg_{}_len", i);
+                    let len_name = internal_ident(&format!("__cuda_oxide_arg_{i}_len"));
                     quote! {
                         let #tmp_name = &mut #expr;
-                        __launch.push_arg(Box::new(#tmp_name.cu_deviceptr()));
+                        #launch_ident.push_arg(Box::new(#tmp_name.cu_deviceptr()));
                         let #len_name = #tmp_name.len() as u64;
-                        __launch.push_arg(Box::new(#len_name));
+                        #launch_ident.push_arg(Box::new(#len_name));
                     }
                 }
                 CudaLaunchArg::Closure { .. } => {
@@ -3981,8 +5850,8 @@ pub fn cuda_launch_async(input: TokenStream) -> TokenStream {
                     // at the kernel boundary. ZST closures are omitted
                     // to keep later packet slots aligned.
                     quote! {
-                        if ::core::mem::size_of_val(&__closure) != 0 {
-                            __launch.push_scalar_arg(__closure);
+                        if ::core::mem::size_of_val(&#closure_ident) != 0 {
+                            #launch_ident.push_scalar_arg(#closure_ident);
                         }
                     }
                 }
@@ -3990,79 +5859,67 @@ pub fn cuda_launch_async(input: TokenStream) -> TokenStream {
         })
         .collect();
 
-    let expanded = if has_closure {
+    if has_closure {
         let closure_expr = closure_expr.expect("has_closure but no closure expression");
         quote! {
             {
-                let __closure = #closure_expr;
-                let __ptx_name: &'static str = #instantiate_name(&__closure);
-                let __func = #module.load_function(__ptx_name).unwrap_or_else(|err| {
+                let #closure_ident = #closure_expr;
+                let #ptx_name_ident: &'static str = #instantiate(&#closure_ident);
+                let #function_ident = #module.load_function(#ptx_name_ident).unwrap_or_else(|#error_ident| {
                     panic!(
                         "Failed to load kernel `{}` (expected PTX entry `{}`): {:?}",
                         stringify!(#kernel_base),
-                        __ptx_name,
-                        err,
+                        #ptx_name_ident,
+                        #error_ident,
                     )
                 });
-                let mut __launch = cuda_async::launch::AsyncKernelLaunch::new(
-                    std::sync::Arc::new(__func),
+                let mut #launch_ident = cuda_async::launch::AsyncKernelLaunchBuilder::new(
+                    std::sync::Arc::new(#function_ident),
                 );
                 #(#arg_code)*
-                __launch.set_launch_config(#config);
-                __launch
+                #launch_ident.finalize_unchecked(#config)
             }
         }
     } else if input.is_generic() {
-        let kernel_entry = format_ident!("{}{}", KERNEL_PREFIX, kernel_base);
         quote! {
             {
-                let __kernel_ptr = #kernel_entry #generics as *const ();
-                unsafe {
-                    let mut __force_mono: *const () = core::ptr::null();
-                    core::ptr::write_volatile(&mut __force_mono, __kernel_ptr);
-                    let _ = core::ptr::read_volatile(&__force_mono);
-                }
-                let __ptx_name = <#marker_name #generics as cuda_host::GenericCudaKernel>::ptx_name();
-                let __func = #module.load_function(__ptx_name).unwrap_or_else(|err| {
+                let #ptx_name_ident = #ptx_name_helper();
+                let #function_ident = #module.load_function(#ptx_name_ident).unwrap_or_else(|#error_ident| {
                     panic!(
                         "Failed to load kernel `{}` (expected PTX entry `{}`): {:?}",
                         stringify!(#kernel_base),
-                        __ptx_name,
-                        err,
+                        #ptx_name_ident,
+                        #error_ident,
                     )
                 });
-                let mut __launch = cuda_async::launch::AsyncKernelLaunch::new(
-                    std::sync::Arc::new(__func),
+                let mut #launch_ident = cuda_async::launch::AsyncKernelLaunchBuilder::new(
+                    std::sync::Arc::new(#function_ident),
                 );
                 #(#arg_code)*
-                __launch.set_launch_config(#config);
-                __launch
+                #launch_ident.finalize_unchecked(#config)
             }
         }
     } else {
         quote! {
             {
-                const __PTX_NAME: &str =
-                    <#marker_name as cuda_host::CudaKernel>::PTX_NAME;
-                let __func = #module.load_function(__PTX_NAME).unwrap_or_else(|err| {
+                const #static_ptx_name_ident: &str =
+                    <#marker as cuda_host::CudaKernel>::PTX_NAME;
+                let #function_ident = #module.load_function(#static_ptx_name_ident).unwrap_or_else(|#error_ident| {
                     panic!(
                         "Failed to load kernel `{}` (expected PTX entry `{}`): {:?}",
                         stringify!(#kernel_base),
-                        __PTX_NAME,
-                        err,
+                        #static_ptx_name_ident,
+                        #error_ident,
                     )
                 });
-                let mut __launch = cuda_async::launch::AsyncKernelLaunch::new(
-                    std::sync::Arc::new(__func),
+                let mut #launch_ident = cuda_async::launch::AsyncKernelLaunchBuilder::new(
+                    std::sync::Arc::new(#function_ident),
                 );
                 #(#arg_code)*
-                __launch.set_launch_config(#config);
-                __launch
+                #launch_ident.finalize_unchecked(#config)
             }
         }
-    };
-
-    TokenStream::from(expanded)
+    }
 }
 
 #[cfg(test)]
@@ -4077,6 +5934,46 @@ mod tests {
             .expect("cuda_module expansion failed")
             .to_string()
             .replace(' ', "")
+    }
+
+    #[test]
+    fn generated_kernel_siblings_preserve_qualified_paths_and_generics() {
+        let kernel: syn::Path = parse_quote! { kernels::map::<_, 4> };
+        let instantiate = kernel_sibling_path(&kernel, format_ident!("{}map", INSTANTIATE_PREFIX));
+        let marker = kernel_sibling_path(&kernel, format_ident!("__map_CudaKernel"));
+        let ptx_name = kernel_sibling_path(&kernel, format_ident!("map_ptx_name"));
+
+        let instantiate = quote! { #instantiate }.to_string().replace(' ', "");
+        let marker = quote! { #marker }.to_string().replace(' ', "");
+        let ptx_name = quote! { #ptx_name }.to_string().replace(' ', "");
+        assert_eq!(
+            instantiate,
+            format!("kernels::{}map::<_,4>", INSTANTIATE_PREFIX)
+        );
+        assert_eq!(marker, "kernels::__map_CudaKernel::<_,4>");
+        assert_eq!(ptx_name, "kernels::map_ptx_name::<_,4>");
+    }
+
+    #[test]
+    fn forwarding_inputs_name_every_irrefutable_parameter_pattern() {
+        let function: ItemFn = parse_quote! {
+            fn patterns(_: u32, (left, right): (u16, u16), mut value: u8) {}
+        };
+        let (inputs, names) = forwarding_inputs(&function.sig.inputs).unwrap();
+        let forwarded = quote! {
+            fn wrapper(#(#inputs),*) {
+                target(#(#names),*)
+            }
+        }
+        .to_string()
+        .replace(' ', "");
+
+        assert!(forwarded.contains("__cuda_oxide_arg_0:u32"));
+        assert!(forwarded.contains("__cuda_oxide_arg_1:(u16,u16)"));
+        assert!(forwarded.contains("__cuda_oxide_arg_2:u8"));
+        assert!(
+            forwarded.contains("target(__cuda_oxide_arg_0,__cuda_oxide_arg_1,__cuda_oxide_arg_2)")
+        );
     }
 
     #[test]
@@ -4135,6 +6032,76 @@ mod tests {
             !expanded.contains("launch_kernel_cooperative_on_stream"),
             "cooperative call must not appear without #[cooperative_launch]:\n{expanded}"
         );
+    }
+
+    #[test]
+    fn cuda_module_routes_type_and_const_generics_through_name_helper() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn mixed<'a, T: Copy + 'a, const N: usize>(
+                    input: &'a [T],
+                    output: &mut [T],
+                ) {
+                }
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(
+            expanded.contains("mixed_ptx_name::<T,N>()"),
+            "typed launch must forward type and const arguments to the name helper:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn generic_kernel_routes_entry_directives_without_losing_cfg() {
+        let function: ItemFn = parse_quote! {
+            #[doc = "configured kernel"]
+            #[cfg(feature = "configured")]
+            #[launch_bounds(256, 2)]
+            #[cluster_launch(2, 1, 1)]
+            fn configured<const N: usize>() {}
+        };
+
+        let (implementation, entry, cfg) = route_generic_kernel_attrs(&function.attrs);
+
+        assert!(
+            implementation
+                .iter()
+                .any(|attr| attr_path_ends_with(attr, "doc"))
+        );
+        assert!(
+            implementation
+                .iter()
+                .any(|attr| attr_path_ends_with(attr, "cfg"))
+        );
+        assert!(
+            !implementation
+                .iter()
+                .any(|attr| attr_path_ends_with(attr, "launch_bounds"))
+        );
+        assert!(
+            !implementation
+                .iter()
+                .any(|attr| attr_path_ends_with(attr, "cluster_launch"))
+        );
+
+        assert!(entry.iter().any(|attr| attr_path_ends_with(attr, "cfg")));
+        assert!(
+            entry
+                .iter()
+                .any(|attr| attr_path_ends_with(attr, "launch_bounds"))
+        );
+        assert!(
+            entry
+                .iter()
+                .any(|attr| attr_path_ends_with(attr, "cluster_launch"))
+        );
+        assert!(!entry.iter().any(|attr| attr_path_ends_with(attr, "doc")));
+
+        assert_eq!(cfg.len(), 1);
+        assert!(attr_path_ends_with(&cfg[0], "cfg"));
     }
 
     #[test]
@@ -4199,6 +6166,756 @@ mod tests {
                 .contains("cooperative_launch takes no arguments"),
             "unexpected error message: {error}"
         );
+    }
+
+    #[test]
+    fn nested_inline_module_kernels_generate_namespace_local_launchers() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn top(mut out: DisjointSlice<u32>) {}
+
+                pub mod stage1 {
+                    #[kernel]
+                    pub fn scale(mut out: DisjointSlice<f32>) {}
+                }
+
+                pub mod stage2 {
+                    pub mod inner {
+                        #[kernel]
+                        pub fn shift(mut out: DisjointSlice<f32>) {}
+                    }
+                }
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+        assert!(
+            expanded.contains("pubmodstage1{#[kernel]pubfnscale")
+                && expanded.contains("<__scale_CudaKernelas::cuda_host::CudaKernel>"),
+            "expected the stage1 launcher to resolve its marker locally:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("pubmodinner{#[kernel]pubfnshift")
+                && expanded.contains("<__shift_CudaKernelas::cuda_host::CudaKernel>"),
+            "expected the doubly nested launcher to resolve its marker locally:\n{expanded}"
+        );
+        assert!(
+            expanded.matches("pubstructLoadedModule").count() == 4,
+            "expected root, stage1, stage2, and inner module views:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("from_parent(parent:&super::LoadedModule")
+                && expanded.contains("parent.__generic_functions.clone()"),
+            "expected nested views to share the parent module and cache:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn nested_launch_contract_stays_in_its_namespace_and_taints_root_loading() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                pub mod stage {
+                    #[kernel]
+                    #[launch_contract(domain = 1, block = (64, 1, 1))]
+                    pub fn map(mut out: DisjointSlice<u32>) {}
+                }
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert_eq!(
+            expanded
+                .matches("impl::cuda_core::KernelLaunchContract")
+                .count(),
+            1,
+            "the contract impl must be emitted once in the child namespace:\n{expanded}"
+        );
+        assert_eq!(
+            expanded.matches("fnprepare_map(").count(),
+            1,
+            "the prepared launcher must be emitted once in the child namespace:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("pubunsafefnload("),
+            "a descendant contract must make root artifact binding unsafe:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("pubmodstage{")
+                && expanded.contains("from_parent(parent:&super::LoadedModule"),
+            "main's nested module view must remain intact:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn nested_generic_kernel_uses_local_ptx_name_helper() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn top(mut out: DisjointSlice<u32>) {}
+
+                pub mod stage1 {
+                    #[kernel]
+                    pub fn map<F: Fn(f32) -> f32 + Copy>(f: F, mut out: DisjointSlice<f32>) {}
+                }
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+        assert!(
+            expanded.contains("let__cuda_oxide_ptx_name=map_ptx_name::<F>()"),
+            "expected the generic binding to call the namespace-local ptx-name helper:\n{expanded}"
+        );
+        assert!(
+            !expanded.contains("stage1::map_ptx_name"),
+            "the nested launcher must not resolve its private helper from the parent:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn nested_kernel_tracks_local_and_effective_cfg_availability() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[cfg(feature = "outer")]
+                mod outer {
+                    #[cfg_attr(feature = "inner", cfg(target_os = "linux"), allow(dead_code))]
+                    mod inner {
+                        #[cfg(target_arch = "x86_64")]
+                        #[kernel]
+                        fn nested() {}
+                    }
+                }
+            }
+        };
+        let items = &module.content.expect("inline module").1;
+        let transformed = transform_cuda_module_items(items, &mut Vec::new(), &[], false).unwrap();
+        let kernel = transformed
+            .kernels
+            .iter()
+            .find(|kernel| kernel.fn_name == "nested")
+            .expect("nested kernel was not collected");
+        let local_attrs = &kernel.cfg_attrs;
+        let effective_attrs = &kernel.effective_cfg_attrs;
+        let local = quote!(#(#local_attrs)*).to_string().replace(' ', "");
+        let effective = quote!(#(#effective_attrs)*).to_string().replace(' ', "");
+
+        assert_eq!(local, "#[cfg(target_arch=\"x86_64\")]");
+        assert!(effective.contains("#[cfg(feature=\"outer\")]"));
+        assert!(effective.contains("#[cfg_attr(feature=\"inner\",cfg(target_os=\"linux\"))]"));
+        assert!(!effective.contains("allow(dead_code)"));
+        assert!(effective.ends_with("#[cfg(target_arch=\"x86_64\")]"));
+    }
+
+    #[test]
+    fn conflicting_kernel_names_across_modules_are_rejected() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                pub mod stage1 {
+                    #[kernel]
+                    pub fn step(mut out: DisjointSlice<f32>) {}
+                }
+
+                pub mod stage2 {
+                    #[kernel]
+                    pub fn step(mut out: DisjointSlice<f32>) {}
+                }
+            }
+        };
+        let error = expand_cuda_module(module).expect_err("expected expansion to fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("requires kernel names to be unique")
+                && message.contains("stage1")
+                && message.contains("stage2"),
+            "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
+    fn launch_contract_generates_prepared_and_unsafe_raw_paths() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_bounds(256)]
+                #[launch_contract(
+                    domain = 1,
+                    block = (256, 1, 1),
+                    dynamic_shared = 1024,
+                    dynamic_shared_alignment = 128,
+                    min_compute_capability = (8, 0),
+                )]
+                pub fn map(input: &[u32], mut out: DisjointSlice<u32>) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(expanded.contains("impl::cuda_core::KernelLaunchContractfor__map_CudaKernel"));
+        assert!(expanded.contains("typeConfig=::cuda_core::LaunchConfig1D"));
+        assert!(expanded.contains("fnprepare_map("));
+        assert!(expanded.contains("PreparedLaunch<__map_CudaKernel>"));
+        assert!(expanded.contains("fnmap("));
+        assert!(
+            !expanded.contains("unsafefnmap("),
+            "a safe source kernel must keep its prepared launch method safe: {expanded}"
+        );
+        assert!(
+            expanded
+                .contains("__cuda_oxide_prepared:&::cuda_core::PreparedLaunch<__map_CudaKernel>")
+        );
+        assert!(expanded.contains("unsafefnmap_unchecked("));
+        assert!(expanded.contains("__cuda_oxide_config:::cuda_core::LaunchConfig"));
+        assert!(expanded.contains("min_alignment:128u32"));
+        assert!(expanded.contains("with_min_compute_capability(8u32,0u32)"));
+    }
+
+    #[test]
+    fn uncontracted_sync_launch_is_always_unsafe() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn map(input: &[u32], mut out: DisjointSlice<u32>) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(expanded.contains("pubunsafefnmap("));
+        assert!(expanded.contains("#Safety"));
+        assert!(expanded.contains("unverifiedrawlaunchconfiguration"));
+    }
+
+    #[test]
+    fn unsafe_source_kernel_keeps_prepared_launch_unsafe() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_contract(domain = 1, block = (64, 1, 1))]
+                pub unsafe fn map(mut out: DisjointSlice<u32>) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(expanded.contains("pubunsafefnmap("));
+        assert!(expanded.contains("pubunsafefnmap_unchecked("));
+        #[cfg(feature = "async")]
+        {
+            assert!(expanded.contains("pubunsafefnmap_async"));
+            assert!(expanded.contains("pubunsafefnmap_async_owned"));
+        }
+    }
+
+    #[test]
+    fn contracted_module_requires_provenance_for_every_loader() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_contract(domain = 1, block = (64, 1, 1))]
+                pub fn map(mut out: DisjointSlice<u32>) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(expanded.contains("pubunsafefnload("));
+        assert!(expanded.contains("pubunsafefnload_named("));
+        assert!(expanded.contains("pubunsafefnfrom_module("));
+        assert!(expanded.contains("#Safety"));
+        #[cfg(feature = "async")]
+        {
+            assert!(expanded.contains("pubunsafefnload_async("));
+            assert!(expanded.contains("pubunsafefnload_async_named("));
+        }
+    }
+
+    #[test]
+    fn uncontracted_module_preserves_safe_custom_loaders() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn map(mut out: DisjointSlice<u32>) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(expanded.contains("pubfnload_named("));
+        assert!(expanded.contains("pubfnfrom_module("));
+        assert!(!expanded.contains("pubunsafefnload_named("));
+        assert!(!expanded.contains("pubunsafefnfrom_module("));
+        #[cfg(feature = "async")]
+        assert!(expanded.contains("pubfnload_async_named("));
+    }
+
+    #[test]
+    fn generic_contract_brand_and_prepare_witness_keep_specialization_type() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_bounds(128)]
+                #[launch_contract(domain = 1, dynamic_shared = 0)]
+                pub fn apply<F: Fn(u32) -> u32 + Copy>(op: F, out: *mut u32) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(expanded.contains("KernelLaunchContractfor__apply_CudaKernel<F>"));
+        assert!(expanded.contains("PreparedLaunch<__apply_CudaKernel<F>>"));
+        assert!(expanded.contains("fnprepare_apply_for<F"));
+        assert!(expanded.contains("__cuda_oxide_type_witness_0:&F"));
+        assert!(expanded.contains("BlockRequirement::MaxThreads(128u32)"));
+    }
+
+    #[test]
+    fn generic_kernel_routes_launch_contract_to_entry_only() {
+        let kernel: ItemFn = parse_quote! {
+            #[doc = "kept on the helper"]
+            #[cuda_device::launch_bounds(128)]
+            #[cuda_device::launch_contract(
+                domain = 1,
+                dynamic_shared = 256,
+                dynamic_shared_alignment = 64,
+            )]
+            #[cuda_device::cluster_launch(2, 1, 1)]
+            #[cuda_device::cooperative_launch]
+            pub fn map<T: Copy>(value: T) {}
+        };
+
+        let (implementation, entry, _cfg) = route_generic_kernel_attrs(&kernel.attrs);
+        let entry_names: Vec<_> = entry
+            .iter()
+            .map(|attr| attr.path().segments.last().unwrap().ident.to_string())
+            .collect();
+        let implementation_names: Vec<_> = implementation
+            .iter()
+            .map(|attr| attr.path().segments.last().unwrap().ident.to_string())
+            .collect();
+
+        assert_eq!(
+            entry_names,
+            [
+                "launch_bounds",
+                "launch_contract",
+                "cluster_launch",
+                "cooperative_launch",
+            ]
+        );
+        assert_eq!(implementation_names, ["doc"]);
+    }
+
+    #[test]
+    fn generic_kernel_forwards_only_exact_top_level_configuration_markers() {
+        let kernel: ItemFn = parse_quote! {
+            fn map<T>() {
+                ::cuda_device::thread::__launch_bounds_config::<64, 2>();
+                ::cuda_device::cluster::__cluster_config::<2, 1, 1>();
+                ::cuda_device::shared::__dynamic_shared_alignment::<128>();
+                cuda_device::thread::__launch_bounds_config::<4, 1>();
+                unrelated();
+                other::cuda_device::thread::__launch_bounds_config::<32, 1>();
+                cuda_device::thread::__launch_bounds_config::<16, 1>(7);
+                {
+                    cuda_device::thread::__launch_bounds_config::<8, 1>();
+                }
+            }
+        };
+
+        let markers = top_level_kernel_configuration_markers(&kernel);
+        let forwarded = quote!(#(#markers)*).to_string().replace(' ', "");
+
+        assert_eq!(markers.len(), 3);
+        assert!(forwarded.contains("__launch_bounds_config::<64,2>()"));
+        assert!(forwarded.contains("__cluster_config::<2,1,1>()"));
+        assert!(forwarded.contains("__dynamic_shared_alignment::<128>()"));
+        assert!(!forwarded.contains("unrelated"));
+        assert!(!forwarded.contains("::<4,1>()"));
+        assert!(!forwarded.contains("other::cuda_device"));
+        assert!(!forwarded.contains("::<16,1>(7)"));
+        assert!(!forwarded.contains("::<8,1>()"));
+    }
+
+    #[test]
+    fn launch_contract_injects_one_alignment_marker_only_when_shared_is_used() {
+        let args: LaunchContractArgs =
+            syn::parse_str("domain = 1, dynamic_shared = 256, dynamic_shared_alignment = 64")
+                .unwrap();
+        let mut helper: ItemFn = parse_quote! { fn helper<T>() {} };
+        inject_launch_contract_alignment_marker(&args, &mut helper);
+        let expanded = quote!(#helper).to_string();
+        assert_eq!(expanded.matches("__dynamic_shared_alignment").count(), 1);
+        assert!(expanded.contains("64usize"));
+
+        let zero_args: LaunchContractArgs =
+            syn::parse_str("domain = 1, dynamic_shared = 0").unwrap();
+        let mut zero_helper: ItemFn = parse_quote! { fn zero_helper<T>() {} };
+        inject_launch_contract_alignment_marker(&zero_args, &mut zero_helper);
+        assert!(
+            !quote!(#zero_helper)
+                .to_string()
+                .contains("__dynamic_shared_alignment")
+        );
+    }
+
+    #[test]
+    fn cfg_gated_duplicate_kernel_names_are_rejected_until_ptx_names_are_qualified() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[cfg(feature = "fast")]
+                pub fn step(mut out: DisjointSlice<f32>) {}
+
+                #[kernel]
+                #[cfg(not(feature = "fast"))]
+                pub fn step(mut out: DisjointSlice<f32>) {}
+            }
+        };
+        let error = expand_cuda_module(module).expect_err("bare PTX names still collide");
+        assert!(
+            error
+                .to_string()
+                .contains("PTX entry names are currently bare"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn contract_without_block_or_launch_bounds_is_rejected() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_contract(domain = 1, dynamic_shared = 0)]
+                pub fn missing_block(input: &[u32]) {}
+            }
+        };
+        let error = expand_cuda_module(module).expect_err("contract should fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("requires either an exact `block = (x, y, z)` or #[launch_bounds")
+        );
+    }
+
+    #[test]
+    fn file_backed_modules_and_include_macros_are_preserved_without_being_walked() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn top() {}
+
+                mod helper;
+                include!("helper_items.rs");
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+        assert!(
+            expanded.contains("modhelper;"),
+            "file module was changed: {expanded}"
+        );
+        assert!(
+            expanded.contains("include!(\"helper_items.rs\");"),
+            "include invocation was changed: {expanded}"
+        );
+    }
+
+    #[test]
+    fn loaded_module_is_reserved_in_nested_kernel_namespaces() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn top() {}
+
+                mod child {
+                    struct LoadedModule;
+
+                    #[kernel]
+                    pub fn nested() {}
+                }
+            }
+        };
+        let error = expand_cuda_module(module).expect_err("reserved type name must fail clearly");
+        assert!(
+            error
+                .to_string()
+                .contains("reserves the name `LoadedModule`"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn raw_and_plain_kernel_spellings_share_one_conflict_key() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                mod plain {
+                    #[kernel]
+                    fn step() {}
+                }
+
+                mod raw {
+                    #[kernel]
+                    fn r#step() {}
+                }
+            }
+        };
+        let error = expand_cuda_module(module).expect_err("raw prefix must not evade PTX guard");
+        let message = error.to_string();
+        assert!(
+            message.contains("`step`") && message.contains("plain") && message.contains("raw"),
+            "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
+    fn raw_loaded_module_spelling_is_reserved() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                mod child {
+                    struct r#LoadedModule;
+
+                    #[kernel]
+                    fn nested() {}
+                }
+            }
+        };
+        let error = expand_cuda_module(module).expect_err("raw prefix must not evade reservation");
+        assert!(
+            error
+                .to_string()
+                .contains("reserves the name `LoadedModule`"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn renamed_extern_crate_cannot_claim_loaded_module() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                extern crate core as r#LoadedModule;
+
+                #[kernel]
+                fn root() {}
+            }
+        };
+        let error = expand_cuda_module(module).expect_err("extern-crate rename must be checked");
+        assert!(
+            error
+                .to_string()
+                .contains("reserves the name `LoadedModule`"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn generated_loaded_module_method_names_are_reserved() {
+        let root: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                fn as_cuda_module() {}
+            }
+        };
+        let error = expand_cuda_module(root).expect_err("root accessor name must be reserved");
+        assert!(
+            error.to_string().contains("method name `as_cuda_module`"),
+            "unexpected error message: {error}"
+        );
+
+        let nested: ItemMod = parse_quote! {
+            mod kernels {
+                mod child {
+                    #[kernel]
+                    fn from_parent() {}
+                }
+            }
+        };
+        let error =
+            expand_cuda_module(nested).expect_err("nested constructor name must be reserved");
+        assert!(
+            error.to_string().contains("method name `from_parent`"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn contracted_mut_slice_is_rejected_in_favor_of_disjoint_slice() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_contract(domain = 1, block = (64, 1, 1))]
+                pub fn aliased(out: &mut [u32]) {}
+            }
+        };
+        let error = expand_cuda_module(module).expect_err("mutable slice must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("contracted kernels cannot take `&mut [T]`")
+        );
+    }
+
+    #[test]
+    fn aliased_disjoint_index_space_is_checked_by_rust_type_resolution() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                type Alias = Index2D<128>;
+
+                #[kernel]
+                #[launch_contract(domain = 2, block = (16, 16, 1))]
+                pub fn aliased(mut out: DisjointSlice<u32, Alias>) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(
+            expanded.contains(
+                "for<'__cuda_oxide_disjoint>DisjointSlice<'__cuda_oxide_disjoint,u32,Alias>:"
+            ),
+            "the bound must preserve the original index-space alias: {expanded}"
+        );
+        assert!(expanded.contains("__LaunchContractDisjointSlice<u32,2u8>"));
+    }
+
+    #[test]
+    fn one_dimensional_index_space_is_not_accepted_by_identifier_spelling() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                type Index2D = Index1D;
+
+                #[kernel]
+                #[launch_contract(domain = 2, block = (16, 16, 1))]
+                pub fn wrong_rank(mut out: DisjointSlice<u32, Index2D>) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(
+            expanded.contains(
+                "for<'__cuda_oxide_disjoint>DisjointSlice<'__cuda_oxide_disjoint,u32,Index2D>:"
+            ),
+            "the bound must preserve the misleading alias for Rust to resolve: {expanded}"
+        );
+        assert!(expanded.contains("__LaunchContractDisjointSlice<u32,2u8>"));
+    }
+
+    #[test]
+    fn local_disjoint_slice_lookalike_gets_the_genuine_type_bound() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                struct DisjointSlice<'a, T, IndexSpace = Index1D> {
+                    value: &'a mut T,
+                    index: PhantomData<IndexSpace>,
+                }
+
+                #[kernel]
+                #[launch_contract(domain = 1, block = (64, 1, 1))]
+                pub fn fake(mut out: DisjointSlice<u32>) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(
+            expanded
+                .contains("for<'__cuda_oxide_disjoint>DisjointSlice<'__cuda_oxide_disjoint,u32>:"),
+            "the look-alike must receive the genuine cuda-device trait bound: {expanded}"
+        );
+        assert!(expanded.contains("__LaunchContractDisjointSlice<u32,1u8>"));
+    }
+
+    #[test]
+    fn launch_bounds_accepts_a_two_dimensional_block_with_the_same_product() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_bounds(256)]
+                #[launch_contract(domain = 2, block = (16, 16, 1))]
+                pub fn tiled(input: &[u32]) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+        assert!(expanded.contains("BlockRequirement::Exact((16u32,16u32,1u32))"));
+    }
+
+    #[test]
+    fn exact_block_cannot_exceed_compiled_launch_bounds_thread_count() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_bounds(256)]
+                #[launch_contract(domain = 2, block = (17, 16, 1))]
+                pub fn impossible(input: &[u32]) {}
+            }
+        };
+        let error = expand_cuda_module(module).expect_err("bounds mismatch must fail closed");
+        assert!(error.to_string().contains("272 threads"));
+        assert!(error.to_string().contains("launch_bounds(256)"));
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn contracted_async_methods_return_immutable_wrappers() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_contract(domain = 1, block = (64, 1, 1))]
+                pub fn map(input: &[u32], mut out: DisjointSlice<u32>) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(
+            expanded.contains("PreparedAsyncKernelLaunch<'__cuda_oxide_async,__map_CudaKernel>")
+        );
+        assert!(expanded.contains("PreparedOwnedAsyncKernelLaunch<"));
+        assert!(expanded.contains("fnmap_async_unchecked"));
+        assert!(expanded.contains("fnmap_async_owned_unchecked"));
+        assert!(expanded.matches("unsafe").count() >= 4);
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn uncontracted_async_launch_methods_are_always_unsafe() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn map(input: &[u32], mut out: DisjointSlice<u32>) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(expanded.contains("pubunsafefnmap_async"));
+        assert!(expanded.contains("pubunsafefnmap_async_owned"));
+        assert_eq!(
+            expanded.matches("new_async_kernel_launch_builder").count(),
+            2
+        );
+        assert_eq!(expanded.matches("finalize_unchecked").count(), 2);
+    }
+
+    #[test]
+    fn raw_async_launch_macro_leaves_finalization_caller_unsafe() {
+        let inputs: [CudaLaunchAsyncInput; 3] = [
+            parse_quote! {
+                kernel: kernels::map,
+                module: module,
+                config: config,
+                args: []
+            },
+            parse_quote! {
+                kernel: kernels::map::<u32>,
+                module: module,
+                config: config,
+                args: []
+            },
+            parse_quote! {
+                kernel: kernels::map,
+                module: module,
+                config: config,
+                args: [|value: u32| value]
+            },
+        ];
+
+        for input in inputs {
+            let expanded = expand_cuda_launch_async(input).to_string().replace(' ', "");
+            assert!(expanded.contains("AsyncKernelLaunchBuilder::new"));
+            assert!(expanded.contains(".finalize_unchecked(config)"));
+            assert!(!expanded.contains("set_launch_config"));
+            assert!(
+                !expanded.contains("unsafe{"),
+                "the macro must not hide its raw-launch safety obligation: {expanded}"
+            );
+        }
     }
 
     /// Runs the per-loop `#[unroll]` visitor over `func`'s body and returns the

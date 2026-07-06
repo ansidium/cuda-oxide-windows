@@ -51,7 +51,7 @@ Pointers and slices carry an NVPTX address space:
 
 ## Operations
 
-54 operations across 11 modules:
+55 operations across 11 modules:
 
 | Module         | Ops | Description                                                                             |
 |----------------|-----|-----------------------------------------------------------------------------------------|
@@ -62,7 +62,7 @@ Pointers and slices carry an NVPTX address space:
 | `arithmetic`   | 15  | add/sub/mul/div/rem, checked variants, bitwise, shifts                                  |
 | `comparison`   | 6   | lt, le, gt, ge, eq, ne                                                                  |
 | `aggregate`    | 8   | construct/extract/insert for structs, tuples, and arrays; field and element address     |
-| `enum_ops`     | 3   | construct_enum, get_discriminant, enum_payload                                          |
+| `enum_ops`     | 4   | construct_enum, get_discriminant, set_discriminant, enum_payload                        |
 | `cast`         | 1   | type conversions (kind tracked via `MirCastKindAttr`)                                   |
 | `storage`      | 2   | storage_live, storage_dead (lifetime markers)                                           |
 | `call`         | 1   | function calls                                                                          |

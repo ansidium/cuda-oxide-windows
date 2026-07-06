@@ -14,6 +14,7 @@
 //! cargo oxide run vecadd              # build + run an example
 //! cargo oxide build vecadd            # build only
 //! cargo oxide pipeline vecadd         # verbose pipeline dump
+//! cargo oxide sanitize vecadd         # run under NVIDIA Compute Sanitizer
 //! cargo oxide debug vecadd --tui      # build + cuda-gdb
 //! cargo oxide new my_kernel            # scaffold a standalone project
 //! cargo oxide new my_kernel --async   # scaffold with async template
@@ -22,7 +23,7 @@
 //! cargo oxide setup                   # explicitly build/install backend
 //! ```
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 mod backend;
@@ -77,6 +78,36 @@ enum Commands {
         /// Also settable via CUDA_OXIDE_NO_FMA=1.
         #[arg(long)]
         no_fmad: bool,
+    },
+    /// Build and run an example or project under NVIDIA Compute Sanitizer
+    Sanitize {
+        /// Example name (required in workspace, optional for standalone projects)
+        example: Option<String>,
+        /// Compute Sanitizer tool to run
+        #[arg(long, value_enum, default_value_t = SanitizerTool::Memcheck)]
+        tool: SanitizerTool,
+        /// Target architecture (e.g., sm_90, sm_100, sm_120). When omitted,
+        /// `sanitize` uses the same local-GPU target detection as `run`.
+        #[arg(long)]
+        arch: Option<String>,
+        /// Comma-separated list of features to enable
+        #[arg(long)]
+        features: Option<String>,
+        /// Pick a specific binary in a multi-bin package
+        #[arg(long)]
+        bin: Option<String>,
+        /// Show verbose compilation output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Disable implicit FMA contraction in device codegen.
+        /// Also settable via CUDA_OXIDE_NO_FMA=1.
+        #[arg(long)]
+        no_fmad: bool,
+        /// Additional arguments passed to compute-sanitizer before the binary.
+        /// Use a second `--` inside this list to pass arguments to the target
+        /// program after the binary.
+        #[arg(last = true, num_args = 0.., allow_hyphen_values = true)]
+        sanitizer_args: Vec<String>,
     },
     /// Build an example or project (compile only, don't run)
     Build {
@@ -136,7 +167,8 @@ enum Commands {
     ///
     /// Produces the SIMT artifact a tile or C++ kernel links against
     /// (NVVM IR emission followed by libNVVM `-gen-lto`), writing
-    /// `<crate>.ltoir`. See the Tile-to-SIMT interop tracker (#96).
+    /// `<crate>.ltoir` plus target/options sidecars. See the Tile-to-SIMT
+    /// interop tracker (#96).
     EmitLtoir {
         /// Crate name (required in workspace, optional for standalone projects)
         example: Option<String>,
@@ -153,6 +185,10 @@ enum Commands {
         /// Show verbose compilation output
         #[arg(short, long)]
         verbose: bool,
+        /// Disable implicit FMA contraction in both libNVVM and nvJitLink.
+        /// Also settable via CUDA_OXIDE_NO_FMA=1.
+        #[arg(long)]
+        no_fmad: bool,
     },
     /// Show the full compilation pipeline (MIR -> PTX/NVVM IR) with verbose output
     Pipeline {
@@ -179,6 +215,12 @@ enum Commands {
         /// in the environment for a non-interactive override.
         #[arg(long)]
         arch: Option<String>,
+        /// Cargo features to enable
+        #[arg(long)]
+        features: Option<String>,
+        /// Specific binary target to build and debug
+        #[arg(long)]
+        bin: Option<String>,
         /// Use cgdb frontend (better source view, vim keys)
         #[arg(long)]
         cgdb: bool,
@@ -204,6 +246,32 @@ enum Commands {
     Doctor,
     /// Build and cache the codegen backend
     Setup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SanitizerTool {
+    Memcheck,
+    Racecheck,
+    Initcheck,
+    Synccheck,
+}
+
+impl SanitizerTool {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Memcheck => "memcheck",
+            Self::Racecheck => "racecheck",
+            Self::Initcheck => "initcheck",
+            Self::Synccheck => "synccheck",
+        }
+    }
+}
+
+fn split_sanitizer_and_application_args(args: &[String]) -> (Vec<String>, Vec<String>) {
+    match args.iter().position(|arg| arg == "--") {
+        Some(separator) => (args[..separator].to_vec(), args[separator + 1..].to_vec()),
+        None => (args.to_vec(), Vec::new()),
+    }
 }
 
 fn has_passthrough_separator(args: &[String]) -> bool {
@@ -258,6 +326,33 @@ fn main() {
                 &example,
                 verbose,
                 emit_nvvm_ir,
+                arch.as_deref(),
+                features.as_deref(),
+                bin.as_deref(),
+                no_fmad,
+            );
+        }
+        Commands::Sanitize {
+            example,
+            tool,
+            arch,
+            features,
+            bin,
+            verbose,
+            no_fmad,
+            sanitizer_args,
+        } => {
+            let ctx = commands::resolve_context();
+            let example = resolve_example_name(example, &ctx, "sanitize");
+            let (sanitizer_args, application_args) =
+                split_sanitizer_and_application_args(&sanitizer_args);
+            commands::codegen_sanitize(
+                &ctx,
+                &example,
+                tool.as_str(),
+                &sanitizer_args,
+                &application_args,
+                verbose,
                 arch.as_deref(),
                 features.as_deref(),
                 bin.as_deref(),
@@ -352,6 +447,7 @@ fn main() {
             features,
             output,
             verbose,
+            no_fmad,
         } => {
             let ctx = commands::resolve_context();
             let example = resolve_example_name(example, &ctx, "emit-ltoir");
@@ -362,6 +458,7 @@ fn main() {
                 features.as_deref(),
                 output.as_deref(),
                 verbose,
+                no_fmad,
             );
         }
         Commands::Pipeline {
@@ -378,12 +475,22 @@ fn main() {
         Commands::Debug {
             example,
             arch,
+            features,
+            bin,
             cgdb,
             tui,
         } => {
             let ctx = commands::resolve_context();
             let example = resolve_example_name(example, &ctx, "debug");
-            commands::codegen_debug(&ctx, &example, arch.as_deref(), cgdb, tui);
+            commands::codegen_debug(
+                &ctx,
+                &example,
+                arch.as_deref(),
+                features.as_deref(),
+                bin.as_deref(),
+                cgdb,
+                tui,
+            );
         }
         Commands::Fmt { check } => {
             let ctx = commands::resolve_context();
@@ -512,6 +619,95 @@ mod tests {
             panic!("expected build command");
         };
         assert!(cargo_args.is_empty());
+    }
+
+    #[test]
+    fn sanitize_parser_accepts_tool_and_trailing_sanitizer_args() {
+        let cli = Cli::try_parse_from([
+            "cargo-oxide",
+            "sanitize",
+            "vecadd",
+            "--tool",
+            "racecheck",
+            "--",
+            "--kernel-name",
+            "kns=vecadd",
+        ])
+        .expect("sanitize command should parse");
+
+        let Commands::Sanitize {
+            example,
+            tool,
+            sanitizer_args,
+            ..
+        } = cli.command
+        else {
+            panic!("expected sanitize command");
+        };
+        assert_eq!(example.as_deref(), Some("vecadd"));
+        assert_eq!(tool, SanitizerTool::Racecheck);
+        assert_eq!(sanitizer_args, strings(&["--kernel-name", "kns=vecadd"]));
+    }
+
+    #[test]
+    fn sanitize_args_split_at_second_separator_for_application_args() {
+        let raw_args = strings(&[
+            "--leak-check",
+            "full",
+            "--",
+            "--case",
+            "oob",
+            "--verbose-target",
+        ]);
+
+        let (sanitizer_args, application_args) = split_sanitizer_and_application_args(&raw_args);
+
+        assert_eq!(sanitizer_args, strings(&["--leak-check", "full"]));
+        assert_eq!(
+            application_args,
+            strings(&["--case", "oob", "--verbose-target"])
+        );
+    }
+
+    #[test]
+    fn sanitize_parser_defaults_to_memcheck() {
+        let cli = Cli::try_parse_from(["cargo-oxide", "sanitize", "vecadd"])
+            .expect("sanitize command should parse");
+
+        let Commands::Sanitize { tool, .. } = cli.command else {
+            panic!("expected sanitize command");
+        };
+        assert_eq!(tool, SanitizerTool::Memcheck);
+    }
+
+    #[test]
+    fn debug_parser_accepts_bin_and_features() {
+        let cli = Cli::try_parse_from([
+            "cargo-oxide",
+            "debug",
+            "my_app",
+            "--bin",
+            "debug-target",
+            "--features",
+            "foo,bar",
+            "--tui",
+        ])
+        .expect("debug command should parse");
+
+        let Commands::Debug {
+            example,
+            features,
+            bin,
+            tui,
+            ..
+        } = cli.command
+        else {
+            panic!("expected debug command");
+        };
+        assert_eq!(example.as_deref(), Some("my_app"));
+        assert_eq!(bin.as_deref(), Some("debug-target"));
+        assert_eq!(features.as_deref(), Some("foo,bar"));
+        assert!(tui);
     }
 
     #[test]

@@ -60,7 +60,7 @@
 //! | [`wgmma`]    | Warpgroup MMA             | Inline PTX      | SM 90+  |
 //! | [`tcgen05`]  | 5th-gen Tensor Core       | Inline PTX      | SM 100+ |
 //! | [`tma`]      | Tensor Memory Access      | Inline PTX      | SM 90+  |
-//! | [`stmatrix`] | Matrix store              | Inline PTX      | SM 80+  |
+//! | [`stmatrix`] | Matrix store              | Inline PTX      | SM 90+  |
 //! | [`common`]   | Shared helpers            | -               | -       |
 //!
 //! # Adding New Intrinsics
@@ -81,9 +81,11 @@ pub mod convert;
 pub mod cp_async;
 pub mod debug;
 pub mod dotprod;
+pub mod ldmatrix;
 pub mod mbarrier;
 pub mod stmatrix;
 pub mod tcgen05;
 pub mod tma;
 pub mod warp;
 pub mod wgmma;
+pub mod wmma;

@@ -316,8 +316,24 @@ fn build_tools(example_dir: &Path) -> Result<(), String> {
     let tools_dir = example_dir.join("tools");
     let compile_ltoir = tools_dir.join("compile_ltoir");
     let link_ltoir = tools_dir.join("link_ltoir");
+    let compile_source = tools_dir.join("compile_ltoir.c");
+    let link_source = tools_dir.join("link_ltoir.c");
+    let options_header = tools_dir.join("compile_options.h");
+    let build_script = tools_dir.join("build_tools.sh");
 
-    if compile_ltoir.exists() && link_ltoir.exists() {
+    let compile_sources = [
+        compile_source.as_path(),
+        options_header.as_path(),
+        build_script.as_path(),
+    ];
+    let link_sources = [
+        link_source.as_path(),
+        options_header.as_path(),
+        build_script.as_path(),
+    ];
+    if !file_needs_rebuild(&compile_ltoir, &compile_sources)
+        && !file_needs_rebuild(&link_ltoir, &link_sources)
+    {
         return Ok(());
     }
 
@@ -380,6 +396,7 @@ fn build_external_ltoir(example_dir: &Path) -> Result<(), String> {
 /// `cargo oxide run device_ffi_test --emit-nvvm-ir --arch=<your_arch>`  (e.g., sm_120)
 fn compile_cuda_oxide_ltoir(example_dir: &Path) -> Result<(), String> {
     let ll_file = example_dir.join("device_ffi_test.ll");
+    let options_file = example_dir.join("device_ffi_test.options");
     let ltoir_file = example_dir.join("device_ffi_test.ltoir");
     let tools_dir = example_dir.join("tools");
 
@@ -392,7 +409,7 @@ fn compile_cuda_oxide_ltoir(example_dir: &Path) -> Result<(), String> {
         ));
     }
 
-    if !file_needs_rebuild(&ltoir_file, &[&ll_file]) {
+    if !file_needs_rebuild(&ltoir_file, &[&ll_file, &options_file]) {
         return Ok(());
     }
 
@@ -563,13 +580,15 @@ fn test_simple_device_funcs_runner(
         shared_mem_bytes: 0,
     };
 
-    module
-        .test_simple_device_funcs(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_simple_device_funcs(
             (stream).as_ref(),
             config,
             d_output.cu_deviceptr() as *mut f32,
         )
-        .expect("Kernel launch failed");
+    }
+    .expect("Kernel launch failed");
 
     let h_output = d_output.to_host_vec(&stream).unwrap();
 
@@ -625,14 +644,16 @@ fn test_cub_warp_reduce_runner(
         shared_mem_bytes: 0,
     };
 
-    module
-        .test_cub_warp_reduce(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_cub_warp_reduce(
             (stream).as_ref(),
             config,
             d_input.cu_deviceptr() as *const f32,
             d_output.cu_deviceptr() as *mut f32,
         )
-        .expect("Kernel launch failed");
+    }
+    .expect("Kernel launch failed");
 
     let h_output = d_output.to_host_vec(&stream).unwrap();
 
@@ -686,8 +707,9 @@ fn test_mixed_attrs_runner(
         shared_mem_bytes: 0,
     };
 
-    module
-        .test_mixed_attrs(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_mixed_attrs(
             (stream).as_ref(),
             config,
             d_a.cu_deviceptr() as *const f32,
@@ -695,7 +717,8 @@ fn test_mixed_attrs_runner(
             d_output.cu_deviceptr() as *mut f32,
             vec_size,
         )
-        .expect("Kernel launch failed");
+    }
+    .expect("Kernel launch failed");
 
     let h_output = d_output.to_host_vec(&stream).unwrap();
 
@@ -736,13 +759,15 @@ fn test_smem_alignment_cross_module_runner(
         shared_mem_bytes: 256, // Enough for the test
     };
 
-    module
-        .test_smem_alignment_cross_module(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_smem_alignment_cross_module(
             (stream).as_ref(),
             config,
             d_output.cu_deviceptr() as *mut u64,
         )
-        .expect("Kernel launch failed");
+    }
+    .expect("Kernel launch failed");
 
     // Synchronize to flush printf output
     stream.synchronize().expect("Sync failed");

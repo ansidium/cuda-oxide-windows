@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "cuda-oxide-codegen"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Experimental rustc-independent cuda-oxide PTX backend"
+
+[dependencies]
+pliron = { workspace = true }
+thiserror = { workspace = true }
+dialect-mir = { workspace = true }
+dialect-nvvm = { workspace = true }
+mir-lower = { workspace = true }
+mir-transforms = { workspace = true }
+llvm-export = { workspace = true }
+libnvvm-sys = { workspace = true }
+nvvm-transforms = { workspace = true }
