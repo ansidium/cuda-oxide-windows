@@ -611,10 +611,8 @@ impl CudaFunction {
         // bindings. Its C layout stores the id at offset 0 and the value union
         // at offset 8; clusterDim.x/y/z occupy the first three u32 values in
         // that union. This matches the launch helpers in cuda-core's root.
-        let cluster_attribute_id = u32::try_from(
-            cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION,
-        )
-        .map_err(|_| DriverError(cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE))?;
+        let cluster_attribute_id =
+            cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION as u32;
         let mut cluster_attribute: cuda_bindings::CUlaunchAttribute_st =
             unsafe { std::mem::zeroed() };
         unsafe {
