@@ -61,6 +61,15 @@
 //! cached `.so` unloadable regardless of mtimes. A cache predating the
 //! fingerprint file defers to the mtime checks (a `cargo-oxide` reinstall or
 //! `rm -rf ~/.cargo/cuda-oxide` heals those).
+//!
+//! ## Concurrent cache transactions
+//!
+//! Cache validation, invalidation, pinned fetch, backend build, publication,
+//! and fingerprint publication run under one OS-backed exclusive file lock.
+//! The lock file is never interpreted as state and is intentionally retained:
+//! the OS releases the lock when its handle or process closes, so a crashed
+//! writer cannot poison the cache. Every new holder double-checks the cache
+//! after acquiring the lock before deciding whether to rebuild it.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -70,6 +79,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::platform;
 
 const BACKEND_CRATE_NAME: &str = "rustc_codegen_cuda";
+const BACKEND_CACHE_LOCK_FILE: &str = ".backend-cache.lock";
 const WINDOWS_MSVC_LINKER_ENV: &str = "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER";
 const WINDOWS_MSVC_LLD_LINKER: &str = "lld-link";
 
@@ -79,6 +89,69 @@ pub(crate) const PINNED_SOURCE_REPOSITORY: &str =
 // embedding a commit's own SHA is impossible. It must nevertheless contain
 // the complete backend and library migration for the pinned nightly.
 pub(crate) const PINNED_SOURCE_REVISION: &str = "285f587c1df658df453dd9137ed91746914b3447";
+
+struct BackendCacheLock {
+    file: std::fs::File,
+}
+
+impl BackendCacheLock {
+    fn acquire(cache_dir: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(cache_dir).map_err(|error| {
+            format!(
+                "create backend cache directory {}: {error}",
+                cache_dir.display()
+            )
+        })?;
+
+        let lock_path = cache_dir.join(BACKEND_CACHE_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| format!("open backend cache lock {}: {error}", lock_path.display()))?;
+
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                eprintln!(
+                    "Another cargo-oxide process is preparing the backend cache; waiting for it."
+                );
+                file.lock().map_err(|error| {
+                    format!("lock backend cache {}: {error}", lock_path.display())
+                })?;
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(format!(
+                    "try to lock backend cache {}: {error}",
+                    lock_path.display()
+                ));
+            }
+        }
+
+        Ok(Self { file })
+    }
+}
+
+impl Drop for BackendCacheLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            // Closing the file immediately after Drop still releases an OS
+            // lock. Report the explicit-unlock failure without proceeding
+            // under an assumed lock or deleting the persistent lock file.
+            eprintln!("Warning: failed to unlock the backend cache: {error}");
+        }
+    }
+}
+
+fn with_locked_backend_cache<T>(
+    cache_dir: &Path,
+    transaction: impl FnOnce(&Path) -> T,
+) -> Result<T, String> {
+    let _lock = BackendCacheLock::acquire(cache_dir)?;
+    Ok(transaction(cache_dir))
+}
 
 /// Finds the workspace root by walking up from CWD looking for Cargo.toml
 /// with a `crates/rustc-codegen-cuda` directory.
@@ -145,49 +218,62 @@ pub fn find_or_build_backend(workspace_root: &Path, configured_backend: Option<&
         return build_backend_from_source(&codegen_crate);
     }
 
-    // 5. Cached backend. Only honored when it isn't older than the running
-    //    cargo-oxide binary; see the module-level comment about issue #49.
-    if let Some(cache_dir) = cache_directory() {
-        let cached_backend = cache_dir.join(&backend_filename);
-        if cached_backend.exists() {
-            let source_root = cache_dir.join("src");
-            if !source_checkout_matches_revision(&source_root) {
-                eprintln!(
-                    "Cached backend source does not match pinned revision {}; \
-                     re-fetching it at {}.",
-                    PINNED_SOURCE_REVISION,
-                    cache_dir.display()
-                );
-                invalidate_cache(&cache_dir, &backend_filename);
-            } else {
-                let source_dir = source_root.join("crates/rustc-codegen-cuda");
-                match cached_backend_status(&cached_backend, Some(&source_dir)) {
-                    CacheStatus::Fresh => return cached_backend,
-                    CacheStatus::StaleVsBinary => invalidate_cache(&cache_dir, &backend_filename),
-                    CacheStatus::StaleVsToolchain => {
-                        eprintln!(
-                            "Cached backend was built against a different Rust \
-                             toolchain; re-fetching pinned source and rebuilding at {}.",
-                            cache_dir.display()
-                        );
-                        invalidate_cache(&cache_dir, &backend_filename);
-                    }
-                    CacheStatus::StaleVsSource => {
-                        // The pinned checkout is still the exact source of
-                        // truth, so rebuild the library from it in place.
-                        eprintln!(
-                            "Cached backend source at {} is newer than the cached \
-                             library; rebuilding from it in place.",
-                            source_dir.display()
-                        );
-                    }
+    let cache_dir = cache_directory().unwrap_or_else(|| {
+        eprintln!("Error: Cannot determine cache directory.");
+        eprintln!("Set CARGO_HOME or HOME environment variable.");
+        std::process::exit(1);
+    });
+
+    with_locked_backend_cache(&cache_dir, |locked_cache_dir| {
+        find_or_build_cached_backend(locked_cache_dir, &backend_filename)
+    })
+    .unwrap_or_else(|error| {
+        eprintln!("Failed to lock the cuda-oxide backend cache: {error}");
+        std::process::exit(1);
+    })
+}
+
+/// Double-check and, when needed, rebuild the cache while its transaction lock
+/// is held by [`find_or_build_backend`].
+fn find_or_build_cached_backend(cache_dir: &Path, backend_filename: &str) -> PathBuf {
+    let cached_backend = cache_dir.join(backend_filename);
+    if cached_backend.exists() {
+        let source_root = cache_dir.join("src");
+        if !source_checkout_matches_revision(&source_root) {
+            eprintln!(
+                "Cached backend source does not match pinned revision {}; \
+                 re-fetching it at {}.",
+                PINNED_SOURCE_REVISION,
+                cache_dir.display()
+            );
+            invalidate_cache(cache_dir, backend_filename);
+        } else {
+            let source_dir = source_root.join("crates/rustc-codegen-cuda");
+            match cached_backend_status(&cached_backend, Some(&source_dir)) {
+                CacheStatus::Fresh => return cached_backend,
+                CacheStatus::StaleVsBinary => invalidate_cache(cache_dir, backend_filename),
+                CacheStatus::StaleVsToolchain => {
+                    eprintln!(
+                        "Cached backend was built against a different Rust \
+                         toolchain; re-fetching pinned source and rebuilding at {}.",
+                        cache_dir.display()
+                    );
+                    invalidate_cache(cache_dir, backend_filename);
+                }
+                CacheStatus::StaleVsSource => {
+                    // The pinned checkout is still the exact source of truth,
+                    // so rebuild the library from it in place.
+                    eprintln!(
+                        "Cached backend source at {} is newer than the cached \
+                         library; rebuilding from it in place.",
+                        source_dir.display()
+                    );
                 }
             }
         }
     }
 
-    // 5. Auto-fetch from git
-    auto_fetch_and_build()
+    auto_fetch_and_build(cache_dir, backend_filename)
 }
 
 /// Returns where the backend dynamic library lives (or would live), with NO side
@@ -685,19 +771,9 @@ fn dirs_path() -> Option<PathBuf> {
 /// This is the last-resort discovery path for external users who don't have
 /// the repo checked out locally. Only the exact pinned commit is fetched at
 /// depth one; a moving default branch never participates in the build.
-fn auto_fetch_and_build() -> PathBuf {
-    let host_target = active_host_target();
-    let backend_filename = backend_filename_for_target(&host_target);
-    let cache_dir = cache_directory().unwrap_or_else(|| {
-        eprintln!("Error: Cannot determine cache directory.");
-        eprintln!("Set CARGO_HOME or HOME environment variable.");
-        std::process::exit(1);
-    });
-
+fn auto_fetch_and_build(cache_dir: &Path, backend_filename: &str) -> PathBuf {
     let src_dir = cache_dir.join("src");
-    let backend_path = cache_dir.join(&backend_filename);
-
-    std::fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
+    let backend_path = cache_dir.join(backend_filename);
 
     if !source_checkout_matches_revision(&src_dir) {
         eprintln!(
@@ -721,7 +797,7 @@ fn auto_fetch_and_build() -> PathBuf {
     let built_backend = build_backend_from_source(&codegen_crate);
     if built_backend.exists() {
         std::fs::copy(&built_backend, &backend_path).expect("Failed to copy backend to cache");
-        write_toolchain_fingerprint(&cache_dir);
+        write_toolchain_fingerprint(cache_dir);
         eprintln!("✓ Backend cached at {}", backend_path.display());
     }
 
@@ -1054,6 +1130,9 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
     use std::time::{Duration, SystemTime};
 
     /// The codegen backend is part of the cuda-oxide toolchain, not the
@@ -1109,6 +1188,88 @@ mod tests {
         assert!(!is_full_git_revision(
             "z123456789abcdef0123456789abcdef01234567"
         ));
+    }
+
+    #[test]
+    fn concurrent_first_run_cache_transactions_build_once_after_double_check() {
+        let cache_dir = tempdir();
+        let ready_marker = cache_dir.join("backend-ready");
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let (first_locked_tx, first_locked_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+
+        let first_cache_dir = cache_dir.clone();
+        let first_ready_marker = ready_marker.clone();
+        let first_build_count = Arc::clone(&build_count);
+        let first = thread::spawn(move || {
+            with_locked_backend_cache(&first_cache_dir, |_| {
+                assert!(!first_ready_marker.exists());
+                first_build_count.fetch_add(1, Ordering::SeqCst);
+                first_locked_tx.send(()).unwrap();
+                release_first_rx.recv().unwrap();
+                std::fs::write(first_ready_marker, b"ready").unwrap();
+            })
+            .unwrap();
+        });
+
+        first_locked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first cache transaction did not acquire the lock");
+
+        let (second_probe_tx, second_probe_rx) = mpsc::channel();
+        let (retry_second_tx, retry_second_rx) = mpsc::channel();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second_cache_dir = cache_dir.clone();
+        let second_ready_marker = ready_marker.clone();
+        let second_build_count = Arc::clone(&build_count);
+        let second = thread::spawn(move || {
+            let probe = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(second_cache_dir.join(BACKEND_CACHE_LOCK_FILE))
+                .unwrap();
+            let lock_was_held = matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+            second_probe_tx.send(lock_was_held).unwrap();
+            drop(probe);
+
+            retry_second_rx.recv().unwrap();
+            with_locked_backend_cache(&second_cache_dir, |_| {
+                let observed_first_result = second_ready_marker.exists();
+                if !observed_first_result {
+                    second_build_count.fetch_add(1, Ordering::SeqCst);
+                    std::fs::write(&second_ready_marker, b"ready").unwrap();
+                }
+                second_done_tx.send(observed_first_result).unwrap();
+            })
+            .unwrap();
+        });
+
+        let second_observed_os_lock = second_probe_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second cache transaction did not probe the lock");
+        release_first_tx.send(()).unwrap();
+        first.join().unwrap();
+        retry_second_tx.send(()).unwrap();
+        second.join().unwrap();
+        let second_observed_first_result = second_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second cache transaction did not finish");
+
+        assert!(
+            second_observed_os_lock,
+            "a concurrent first-run process must observe the OS lock"
+        );
+        assert!(
+            second_observed_first_result,
+            "the second holder must double-check and reuse the first result"
+        );
+        assert_eq!(
+            build_count.load(Ordering::SeqCst),
+            1,
+            "concurrent first-run transactions must publish exactly one build"
+        );
+
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]

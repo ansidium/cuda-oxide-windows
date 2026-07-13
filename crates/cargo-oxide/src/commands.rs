@@ -36,7 +36,9 @@ pub struct OxideConfig {
 pub struct Context {
     /// Absolute path to the workspace root (contains top-level `Cargo.toml`).
     pub workspace_root: PathBuf,
-    /// Path to `crates/rustc-codegen-cuda` (backend source tree).
+    /// Backend source tree in workspace mode; the standalone project root
+    /// otherwise. Standalone command handlers must not treat this as backend
+    /// source.
     pub codegen_crate: PathBuf,
     /// Path to `crates/rustc-codegen-cuda/examples/`.
     pub examples_dir: PathBuf,
@@ -2560,19 +2562,24 @@ fn cuda_header_candidates(toolkit: &str, arch: &str) -> Vec<PathBuf> {
 // Setup command
 // =============================================================================
 
-/// Explicitly build (or rebuild) the codegen backend.
+/// Report the codegen backend prepared while resolving the command context.
 ///
-/// Normally the backend is built automatically on every `run`/`build`/`pipeline`
-/// invocation. `setup` exists for first-time setup, CI, or after pulling new
-/// changes when you want to rebuild without running an example.
+/// [`resolve_context`] is the single backend materialization boundary. In
+/// standalone mode `ctx.codegen_crate` is the user's project, not cuda-oxide
+/// source, so attempting another build here would compile the wrong crate. In
+/// workspace mode it would merely duplicate the build already performed by
+/// context resolution.
 pub fn setup(ctx: &Context) {
-    println!("Building cuda-oxide codegen backend...");
-    println!();
+    if !ctx.backend_so.is_file() {
+        eprintln!(
+            "Error: resolved cuda-oxide backend does not exist: {}",
+            ctx.backend_so.display()
+        );
+        std::process::exit(1);
+    }
 
-    backend::build_backend_from_source(&ctx.codegen_crate);
-
-    println!();
-    println!("✓ Backend is ready. You can now use:");
+    println!("✓ Backend is ready: {}", ctx.backend_so.display());
+    println!("You can now use:");
     println!("  cargo oxide run <example>");
     println!("  cargo oxide build <example>");
 }
