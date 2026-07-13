@@ -14,7 +14,8 @@
 //! 4. Local repo (detected by presence of `crates/rustc-codegen-cuda`)
 //! 5. Cached backend at `~/.cargo/cuda-oxide/<platform filename>`,
 //!    but only when it isn't older than the running `cargo-oxide` binary
-//! 6. Auto-fetch from git and build (one-time, or after a stale-cache miss)
+//! 6. Auto-fetch the pinned Windows-fork revision and build (one-time, or
+//!    after a stale-cache miss)
 //!
 //! ## Cache staleness (issue #49)
 //!
@@ -24,8 +25,8 @@
 //! that the user has just upgraded `cargo-oxide` and the cached backend
 //! no longer matches the binary loading it. When step 5 detects that, we
 //! drop both the cached backend *and* the cached source tree so that step 6
-//! re-clones fresh and rebuilds, rather than rebuilding from a clone that
-//! was taken whenever the user first installed.
+//! re-fetches the embedded revision and rebuilds, rather than trusting a
+//! checkout created by a different CLI revision.
 //!
 //! ## Cache staleness vs. source (backend source advances)
 //!
@@ -41,10 +42,9 @@
 //!
 //! The two stale signals call for different recovery. A binary upgrade means
 //! the cached source may no longer match the new binary, so we drop the
-//! source tree and re-clone fresh (above). A source advance means the cached
-//! source IS the newer truth, so we rebuild the `.so` from that existing
-//! source in place; re-cloning would throw away the very source that
-//! triggered the rebuild. Binary staleness takes precedence when both fire.
+//! source tree and re-fetch the pinned revision (above). A newer mtime within
+//! an otherwise clean, exact checkout means the same pinned source should be
+//! rebuilt in place. Binary staleness takes precedence when both fire.
 //!
 //! ## Cache staleness vs. toolchain (the active rustc changes)
 //!
@@ -56,7 +56,7 @@
 //! `librustc_driver-<hash>.so: cannot open shared object file`. To catch this
 //! we record the active toolchain fingerprint (`rustc -vV`) next to the cached
 //! `.so` at build time and compare it on every lookup; a recorded fingerprint
-//! that differs from the active toolchain forces a fresh re-clone and rebuild.
+//! that differs from the active toolchain forces a pinned-source re-fetch and rebuild.
 //! This check has the highest precedence, since a toolchain mismatch makes the
 //! cached `.so` unloadable regardless of mtimes. A cache predating the
 //! fingerprint file defers to the mtime checks (a `cargo-oxide` reinstall or
@@ -65,13 +65,20 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::platform;
 
 const BACKEND_CRATE_NAME: &str = "rustc_codegen_cuda";
 const WINDOWS_MSVC_LINKER_ENV: &str = "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER";
 const WINDOWS_MSVC_LLD_LINKER: &str = "lld-link";
+
+pub(crate) const PINNED_SOURCE_REPOSITORY: &str =
+    "https://github.com/ansidium/cuda-oxide-windows.git";
+// This source commit may intentionally precede the cargo-oxide CLI commit:
+// embedding a commit's own SHA is impossible. It must nevertheless contain
+// the complete backend and library migration for the pinned nightly.
+pub(crate) const PINNED_SOURCE_REVISION: &str = "285f587c1df658df453dd9137ed91746914b3447";
 
 /// Finds the workspace root by walking up from CWD looking for Cargo.toml
 /// with a `crates/rustc-codegen-cuda` directory.
@@ -143,28 +150,37 @@ pub fn find_or_build_backend(workspace_root: &Path, configured_backend: Option<&
     if let Some(cache_dir) = cache_directory() {
         let cached_backend = cache_dir.join(&backend_filename);
         if cached_backend.exists() {
-            let source_dir = cache_dir.join("src/crates/rustc-codegen-cuda");
-            match cached_backend_status(&cached_backend, Some(&source_dir)) {
-                CacheStatus::Fresh => return cached_backend,
-                CacheStatus::StaleVsBinary => invalidate_cache(&cache_dir, &backend_filename),
-                CacheStatus::StaleVsToolchain => {
-                    eprintln!(
-                        "Cached backend was built against a different Rust \
-                         toolchain; re-cloning and rebuilding at {}.",
-                        cache_dir.display()
-                    );
-                    invalidate_cache(&cache_dir, &backend_filename);
-                }
-                CacheStatus::StaleVsSource => {
-                    // The cached source advanced; rebuild the backend from it
-                    // place. We do NOT invalidate the cache here, so the
-                    // auto-fetch step below skips the clone (the source tree is
-                    // still present) and rebuilds from the existing source.
-                    eprintln!(
-                        "Cached backend source at {} is newer than the cached \
-                         library; rebuilding from it in place.",
-                        source_dir.display()
-                    );
+            let source_root = cache_dir.join("src");
+            if !source_checkout_matches_revision(&source_root) {
+                eprintln!(
+                    "Cached backend source does not match pinned revision {}; \
+                     re-fetching it at {}.",
+                    PINNED_SOURCE_REVISION,
+                    cache_dir.display()
+                );
+                invalidate_cache(&cache_dir, &backend_filename);
+            } else {
+                let source_dir = source_root.join("crates/rustc-codegen-cuda");
+                match cached_backend_status(&cached_backend, Some(&source_dir)) {
+                    CacheStatus::Fresh => return cached_backend,
+                    CacheStatus::StaleVsBinary => invalidate_cache(&cache_dir, &backend_filename),
+                    CacheStatus::StaleVsToolchain => {
+                        eprintln!(
+                            "Cached backend was built against a different Rust \
+                             toolchain; re-fetching pinned source and rebuilding at {}.",
+                            cache_dir.display()
+                        );
+                        invalidate_cache(&cache_dir, &backend_filename);
+                    }
+                    CacheStatus::StaleVsSource => {
+                        // The pinned checkout is still the exact source of
+                        // truth, so rebuild the library from it in place.
+                        eprintln!(
+                            "Cached backend source at {} is newer than the cached \
+                             library; rebuilding from it in place.",
+                            source_dir.display()
+                        );
+                    }
                 }
             }
         }
@@ -218,7 +234,7 @@ pub fn backend_so_candidate(workspace_root: &Path, configured_backend: Option<&P
 }
 
 /// Why the cached backend is out of date, or that it is current. The two
-/// stale variants drive different recovery (re-clone vs. rebuild in place);
+/// stale variants drive different recovery (re-fetch vs. rebuild in place);
 /// see the module-level comment.
 #[derive(Debug, PartialEq, Eq)]
 enum CacheStatus {
@@ -227,12 +243,13 @@ enum CacheStatus {
     /// The running `cargo-oxide` binary is newer than the cache: the user
     /// upgraded the binary, so the cached source may no longer match it.
     StaleVsBinary,
-    /// The cached backend source is newer than the cached `.so`: the source
-    /// was advanced in place and the `.so` should be rebuilt from it.
+    /// The exact cached backend checkout has source mtimes newer than the
+    /// cached `.so`, so the `.so` should be rebuilt from it.
     StaleVsSource,
     /// The cached `.so` was built against a different Rust toolchain than the
     /// active one: it links a `librustc_driver` hash that no longer resolves,
-    /// so it must be re-cloned and rebuilt. Highest precedence: an unloadable
+    /// so the pinned source must be re-fetched and rebuilt. Highest precedence:
+    /// an unloadable
     /// `.so` is stale regardless of mtimes.
     StaleVsToolchain,
 }
@@ -242,7 +259,7 @@ enum CacheStatus {
 /// (the developer advanced the source). When `source_dir` is `None`, or no
 /// source inputs can be found under it, only the binary check applies.
 /// Binary staleness takes precedence when both fire, since a binary upgrade
-/// wants a fresh clone (which also picks up the newest source).
+/// requires a clean checkout of the embedded source revision.
 ///
 /// Conservative on errors: if we can't stat the cached `.so`, we report
 /// [`CacheStatus::Fresh`] so a working cache is never invalidated on a failed
@@ -377,7 +394,7 @@ fn visit_files(dir: &Path, f: &mut dyn FnMut(&Path)) {
 
 /// Drop both the cached `.so` and the cached source tree at `cache_dir`.
 ///
-/// Removing `src/` is what forces the auto-fetch step to re-clone instead
+/// Removing `src/` is what forces the auto-fetch step to re-fetch instead
 /// of rebuilding from a checkout that was taken at first-install time.
 /// Both removals are best-effort; if either fails (e.g. permissions), we
 /// fall through to step 4, which will fail loudly with a clear error.
@@ -441,7 +458,7 @@ fn backend_build_command(
     let codegen_crate = absolute_path(codegen_crate);
     let target_dir = codegen_crate.join("target");
     let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--lib"]);
+    cmd.args(["build", "--locked", "--lib"]);
     if backend_build_profile(host_target) == "release" {
         cmd.arg("--release");
     }
@@ -662,11 +679,12 @@ fn dirs_path() -> Option<PathBuf> {
         })
 }
 
-/// Clones the cuda-oxide repo into the cache directory and builds the backend.
+/// Fetches the pinned cuda-oxide Windows-fork revision into the cache directory
+/// and builds the backend.
 ///
 /// This is the last-resort discovery path for external users who don't have
-/// the repo checked out locally. The clone is shallow (`--depth 1`) to keep
-/// the download small.
+/// the repo checked out locally. Only the exact pinned commit is fetched at
+/// depth one; a moving default branch never participates in the build.
 fn auto_fetch_and_build() -> PathBuf {
     let host_target = active_host_target();
     let backend_filename = backend_filename_for_target(&host_target);
@@ -681,22 +699,16 @@ fn auto_fetch_and_build() -> PathBuf {
 
     std::fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
 
-    if !src_dir.join("Cargo.toml").exists() {
-        eprintln!("Backend not found. Fetching cuda-oxide source (one-time setup)...");
+    if !source_checkout_matches_revision(&src_dir) {
+        eprintln!(
+            "Backend not found. Fetching cuda-oxide source revision {} (one-time setup)...",
+            PINNED_SOURCE_REVISION
+        );
         eprintln!();
-        let status = Command::new("git")
-            .args([
-                "clone",
-                "--depth",
-                "1",
-                "https://github.com/NVlabs/cuda-oxide.git",
-                src_dir.to_str().unwrap(),
-            ])
-            .status()
-            .expect("Failed to run git clone. Is git installed?");
-
-        if !status.success() {
-            eprintln!("Failed to clone cuda-oxide repository.");
+        if let Err(error) =
+            fetch_source_at_revision(PINNED_SOURCE_REPOSITORY, PINNED_SOURCE_REVISION, &src_dir)
+        {
+            eprintln!("Failed to fetch pinned cuda-oxide source: {error}");
             eprintln!(
                 "You can manually set CUDA_OXIDE_BACKEND=/path/to/{}",
                 backend_filename
@@ -714,6 +726,160 @@ fn auto_fetch_and_build() -> PathBuf {
     }
 
     backend_path
+}
+
+fn is_full_git_revision(revision: &str) -> bool {
+    revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn source_checkout_matches_revision(source_dir: &Path) -> bool {
+    source_checkout_matches_revision_at(source_dir, PINNED_SOURCE_REVISION)
+}
+
+fn source_checkout_matches_revision_at(source_dir: &Path, revision: &str) -> bool {
+    if !is_full_git_revision(revision) || !source_dir.join("Cargo.toml").is_file() {
+        return false;
+    }
+
+    let head = git_stdout(source_dir, &["rev-parse", "HEAD"]);
+    if !matches!(head.as_deref(), Some(value) if value.eq_ignore_ascii_case(revision)) {
+        return false;
+    }
+
+    matches!(
+        git_stdout(source_dir, &["status", "--porcelain=v1"]),
+        Some(status) if status.is_empty()
+    )
+}
+
+fn git_stdout(source_dir: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(source_dir)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn checked_git(command: &mut Command, action: &str) -> Result<(), String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("{action}: failed to start git: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    let detail_suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    };
+    Err(format!(
+        "{action}: git exited with {}{detail_suffix}",
+        output.status
+    ))
+}
+
+fn fetch_source_at_revision(
+    repository: &str,
+    revision: &str,
+    source_dir: &Path,
+) -> Result<(), String> {
+    if !is_full_git_revision(revision) {
+        return Err(format!(
+            "embedded source revision must be a full 40-character Git SHA, got `{revision}`"
+        ));
+    }
+
+    let parent = source_dir
+        .parent()
+        .ok_or_else(|| format!("source path has no parent: {}", source_dir.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create cache directory {}: {error}", parent.display()))?;
+
+    if source_dir.exists() {
+        match std::fs::remove_dir_all(source_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "remove stale source checkout {}: {error}",
+                    source_dir.display()
+                ));
+            }
+        }
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staging_dir = parent.join(format!("src.fetch-{}-{nonce}", std::process::id()));
+
+    let result = (|| {
+        let mut init = Command::new("git");
+        init.args(["init", "--quiet"]).arg(&staging_dir);
+        checked_git(&mut init, "initialize source cache")?;
+
+        let mut add_remote = Command::new("git");
+        add_remote
+            .arg("-C")
+            .arg(&staging_dir)
+            .args(["remote", "add", "origin", repository]);
+        checked_git(&mut add_remote, "configure source remote")?;
+
+        let mut fetch = Command::new("git");
+        fetch.arg("-C").arg(&staging_dir).args([
+            "fetch",
+            "--depth=1",
+            "--no-tags",
+            "origin",
+            revision,
+        ]);
+        checked_git(&mut fetch, "fetch pinned source revision")?;
+
+        let mut checkout = Command::new("git");
+        checkout.arg("-C").arg(&staging_dir).args([
+            "checkout",
+            "--detach",
+            "--quiet",
+            "FETCH_HEAD",
+        ]);
+        checked_git(&mut checkout, "check out pinned source revision")?;
+
+        if !source_checkout_matches_revision_at(&staging_dir, revision) {
+            return Err(format!(
+                "fetched checkout did not verify as clean revision {revision}"
+            ));
+        }
+
+        if let Err(error) = std::fs::rename(&staging_dir, source_dir) {
+            // A concurrent cargo-oxide process may have published the same
+            // exact checkout first. Accept only that verified outcome.
+            if source_checkout_matches_revision_at(source_dir, revision) {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+            } else {
+                return Err(format!(
+                    "publish source checkout {} -> {}: {error}",
+                    staging_dir.display(),
+                    source_dir.display()
+                ));
+            }
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+    result
 }
 
 /// Returns the active rustc sysroot path (e.g., `~/.rustup/toolchains/nightly-...`).
@@ -929,7 +1095,66 @@ mod tests {
             args.iter()
                 .any(|arg| arg == "--message-format=json-render-diagnostics")
         );
+        assert!(args.iter().any(|arg| arg == "--locked"));
         assert!(!args.iter().any(|arg| arg == "--release"));
+    }
+
+    #[test]
+    fn full_git_revision_validation_rejects_floating_refs() {
+        assert!(is_full_git_revision(
+            "0123456789abcdef0123456789abcdef01234567"
+        ));
+        assert!(!is_full_git_revision("main"));
+        assert!(!is_full_git_revision("0123456789abcdef"));
+        assert!(!is_full_git_revision(
+            "z123456789abcdef0123456789abcdef01234567"
+        ));
+    }
+
+    #[test]
+    fn source_fetch_checks_out_exact_revision_not_repository_head() {
+        let root = tempdir();
+        let repository = root.join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        test_git(&repository, &["init", "--quiet"]);
+        test_git(&repository, &["config", "user.name", "cuda-oxide tests"]);
+        test_git(
+            &repository,
+            &["config", "user.email", "cuda-oxide-tests@example.invalid"],
+        );
+
+        std::fs::write(repository.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::write(repository.join("revision.txt"), "first\n").unwrap();
+        test_git(&repository, &["add", "Cargo.toml", "revision.txt"]);
+        test_git(&repository, &["commit", "--quiet", "-m", "first"]);
+        let pinned_revision = test_git(&repository, &["rev-parse", "HEAD"]);
+
+        std::fs::write(repository.join("revision.txt"), "second\n").unwrap();
+        test_git(&repository, &["add", "revision.txt"]);
+        test_git(&repository, &["commit", "--quiet", "-m", "second"]);
+        let moving_head = test_git(&repository, &["rev-parse", "HEAD"]);
+        assert_ne!(pinned_revision, moving_head);
+
+        let checkout = root.join("checkout");
+        fetch_source_at_revision(repository.to_str().unwrap(), &pinned_revision, &checkout)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("revision.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "first\n"
+        );
+        assert!(source_checkout_matches_revision_at(
+            &checkout,
+            &pinned_revision
+        ));
+
+        std::fs::write(checkout.join("revision.txt"), "modified\n").unwrap();
+        assert!(
+            !source_checkout_matches_revision_at(&checkout, &pinned_revision),
+            "a dirty cache checkout must never qualify as exact source"
+        );
     }
 
     #[test]
@@ -1134,7 +1359,7 @@ mod tests {
     }
 
     /// When BOTH the running binary and the cached source postdate the `.so`,
-    /// the binary signal wins so recovery re-clones fresh rather than
+    /// the binary signal wins so recovery re-fetches pinned source rather than
     /// rebuilding from a source tree that a binary upgrade may have outdated.
     #[test]
     fn binary_staleness_takes_precedence_over_source() {
@@ -1225,7 +1450,8 @@ mod tests {
 
     /// The toolchain check has the highest precedence: a differing fingerprint
     /// wins even when the cache is also stale-vs-binary, because an unloadable
-    /// `.so` must be re-cloned regardless of why else it is stale.
+    /// `.so` must be rebuilt from re-fetched pinned source regardless of why
+    /// else it is stale.
     #[test]
     fn toolchain_staleness_takes_precedence_over_binary() {
         let year = Duration::from_secs(365 * 24 * 60 * 60);
@@ -1258,6 +1484,21 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    fn test_git(repository: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
     fn write_with_mtime(path: &Path, contents: &[u8], mtime: SystemTime) {

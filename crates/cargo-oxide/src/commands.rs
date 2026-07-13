@@ -3332,12 +3332,50 @@ fn show_generated_artifacts(example_dir: &Path, example: &str) {
 // cargo oxide new -- standalone project scaffolding
 // =========================================================================
 
-const GIT_REPO: &str = "https://github.com/NVlabs/cuda-oxide.git";
+const GIT_REPO: &str = backend::PINNED_SOURCE_REPOSITORY;
+const GIT_REV: &str = backend::PINNED_SOURCE_REVISION;
 
 const RUST_TOOLCHAIN_TOML: &str = r#"[toolchain]
-channel = "nightly-2026-04-03"
-components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "llvm-tools"]
+channel = "nightly-2026-05-22"
+components = ["rust-src", "rustc-dev", "rust-analyzer", "rustfmt", "clippy", "llvm-tools"]
 "#;
+
+fn scaffold_cargo_toml(name: &str, async_mode: bool) -> String {
+    if async_mode {
+        format!(
+            r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+cuda-device = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
+cuda-host = {{ git = "{GIT_REPO}", rev = "{GIT_REV}", features = ["async"] }}
+cuda-core = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
+cuda-async = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
+cuda-bindings = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
+tokio = {{ version = "1", features = ["rt", "rt-multi-thread", "macros"] }}
+"#
+        )
+    } else {
+        format!(
+            r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+cuda-device = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
+cuda-host = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
+cuda-core = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
+"#
+        )
+    }
+}
 
 /// Scaffold a new standalone cuda-oxide project.
 pub fn scaffold_new(name: &str, async_mode: bool) {
@@ -3353,40 +3391,7 @@ pub fn scaffold_new(name: &str, async_mode: bool) {
         std::process::exit(1);
     });
 
-    let cargo_toml = if async_mode {
-        format!(
-            r#"[package]
-name = "{name}"
-version = "0.1.0"
-edition = "2024"
-
-[workspace]
-
-[dependencies]
-cuda-device = {{ git = "{GIT_REPO}" }}
-cuda-host = {{ git = "{GIT_REPO}", features = ["async"] }}
-cuda-core = {{ git = "{GIT_REPO}" }}
-cuda-async = {{ git = "{GIT_REPO}" }}
-cuda-bindings = {{ git = "{GIT_REPO}" }}
-tokio = {{ version = "1", features = ["rt", "rt-multi-thread", "macros"] }}
-"#
-        )
-    } else {
-        format!(
-            r#"[package]
-name = "{name}"
-version = "0.1.0"
-edition = "2024"
-
-[workspace]
-
-[dependencies]
-cuda-device = {{ git = "{GIT_REPO}" }}
-cuda-host = {{ git = "{GIT_REPO}" }}
-cuda-core = {{ git = "{GIT_REPO}" }}
-"#
-        )
-    };
+    let cargo_toml = scaffold_cargo_toml(name, async_mode);
 
     let main_rs = if async_mode {
         r#"use cuda_device::{kernel, thread, DisjointSlice};
@@ -3685,6 +3690,46 @@ fn executable_candidate_names(name: &str, pathext: Option<&OsStr>, target: &str)
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn scaffold_manifests_pin_every_cuda_oxide_dependency() {
+        for (async_mode, expected_dependencies) in [
+            (false, ["cuda-device", "cuda-host", "cuda-core"].as_slice()),
+            (
+                true,
+                [
+                    "cuda-device",
+                    "cuda-host",
+                    "cuda-core",
+                    "cuda-async",
+                    "cuda-bindings",
+                ]
+                .as_slice(),
+            ),
+        ] {
+            let manifest = scaffold_cargo_toml("pin-test", async_mode);
+            let parsed = toml::from_str::<toml::Value>(&manifest).unwrap();
+            let dependencies = parsed["dependencies"].as_table().unwrap();
+
+            for name in expected_dependencies {
+                let dependency = dependencies[*name].as_table().unwrap();
+                assert_eq!(dependency["git"].as_str(), Some(GIT_REPO));
+                assert_eq!(dependency["rev"].as_str(), Some(GIT_REV));
+                assert!(dependency.get("branch").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn scaffold_toolchain_includes_rustfmt() {
+        let parsed = toml::from_str::<toml::Value>(RUST_TOOLCHAIN_TOML).unwrap();
+        let components = parsed["toolchain"]["components"].as_array().unwrap();
+        assert!(
+            components
+                .iter()
+                .any(|component| component.as_str() == Some("rustfmt"))
+        );
+    }
 
     fn command_env(cmd: &Command, key: &str) -> Option<String> {
         cmd.get_envs()
