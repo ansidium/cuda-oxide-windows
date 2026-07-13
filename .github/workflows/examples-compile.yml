@@ -80,6 +80,8 @@ jobs:
           export LIBRARY_PATH="${sysroot}/lib:${LIBRARY_PATH:-}"
           export LD_LIBRARY_PATH="${sysroot}/lib:${LD_LIBRARY_PATH:-}"
 
+          cargo build --locked -p cargo-oxide
+          export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
           scripts/smoketest.sh --compile-only --no-color
 
       - name: Upload failure logs

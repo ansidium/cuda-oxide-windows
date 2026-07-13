@@ -214,8 +214,7 @@ fn statement_is_noop(kind: &mir::StatementKind) -> bool {
         | StatementKind::Coverage(_)
         | StatementKind::PlaceMention(_)
         | StatementKind::FakeRead(..)
-        | StatementKind::AscribeUserType { .. }
-        | StatementKind::Retag(..) => true,
+        | StatementKind::AscribeUserType { .. } => true,
 
         // MIR rvalues are pure (they compute a value; only the
         // assignment's destination writes anything), so an assignment

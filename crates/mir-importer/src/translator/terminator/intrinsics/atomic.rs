@@ -131,10 +131,8 @@ fn parse_atomic_type_name(type_name: &str) -> Option<AtomicTypeInfo> {
         (AtomicScope::Block, rest)
     } else if let Some(rest) = type_name.strip_prefix("SystemAtomic") {
         (AtomicScope::System, rest)
-    } else if let Some(rest) = type_name.strip_prefix("DeviceAtomic") {
-        (AtomicScope::Device, rest)
     } else {
-        return None;
+        (AtomicScope::Device, type_name.strip_prefix("DeviceAtomic")?)
     };
 
     let (bit_width, is_float, is_signed) = match base {

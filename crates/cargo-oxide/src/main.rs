@@ -32,9 +32,8 @@ mod platform;
 
 /// Top-level CLI structure parsed by clap.
 ///
-/// The binary is named `cargo-oxide` so that `cargo oxide <subcommand>` works
-/// as a cargo subcommand. The workspace alias in `.cargo/config.toml` also
-/// routes `cargo oxide` here when run inside the repo.
+/// The binary is named `cargo-oxide` so that an installed copy makes
+/// `cargo oxide <subcommand>` work as a Cargo subcommand.
 #[derive(Parser)]
 #[command(
     name = "cargo-oxide",
@@ -295,7 +294,7 @@ fn use_build_passthrough(
 fn main() {
     // Handle both invocation methods:
     // 1. Cargo subcommand: `cargo oxide run vecadd` → argv = ["cargo-oxide", "oxide", "run", "vecadd"]
-    // 2. Cargo alias:      `cargo oxide run vecadd` → argv = ["target/.../cargo-oxide", "run", "vecadd"]
+    // 2. Direct binary:    `cargo-oxide run vecadd` → argv = ["cargo-oxide", "run", "vecadd"]
     let args: Vec<String> = std::env::args().collect();
     let effective_args = if args.get(1).map(|s| s.as_str()) == Some("oxide") {
         let mut filtered = vec![args[0].clone()];

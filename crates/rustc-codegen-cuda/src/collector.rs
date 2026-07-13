@@ -125,9 +125,9 @@
 //! with human-readable base names derived from the `#[kernel]` macro.
 
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
-use rustc_middle::mir::mono::{CodegenUnit, MonoItem};
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::{ConstOperand, ConstValue, Location, TerminatorKind};
+use rustc_middle::mono::{CodegenUnit, MonoItem};
 use rustc_middle::ty::{Instance, InstanceKind, Ty, TyCtxt, TyKind, TypeVisitableExt, TypingEnv};
 use rustc_span::Span;
 use std::collections::{HashMap, HashSet, VecDeque};

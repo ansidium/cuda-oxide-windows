@@ -887,7 +887,6 @@ pub fn translate_statement(
         // Codegen-irrelevant statements: borrow-check / type-system / coverage
         // hints that have no runtime effect. Skipping is correct.
         mir::StatementKind::FakeRead(..)
-        | mir::StatementKind::Retag(..)
         | mir::StatementKind::PlaceMention(..)
         | mir::StatementKind::AscribeUserType { .. }
         | mir::StatementKind::Coverage(..)

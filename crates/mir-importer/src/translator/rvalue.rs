@@ -701,7 +701,7 @@ pub fn translate_rvalue(
                 ),
             }
         }
-        mir::Rvalue::Use(operand) => {
+        mir::Rvalue::Use(operand, _with_retag) => {
             // Use just copies/moves a value - no operation needed, just pass through
             // The operand translation may insert field extraction operations
             let (val, last_inserted) =

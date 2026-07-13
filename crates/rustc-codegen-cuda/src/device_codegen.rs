@@ -504,14 +504,15 @@ pub fn generate_device_code<'tcx>(
             let fn_sig = tcx.fn_sig(decl.def_id).instantiate_identity();
             let fn_sig = fn_sig.skip_binder();
 
-            if !matches!(fn_sig.abi, rustc_abi::ExternAbi::C { unwind: false }) {
+            if !matches!(fn_sig.abi(), rustc_abi::ExternAbi::C { unwind: false }) {
                 return Err(DeviceCodegenError::InvalidDeviceExternSignature(format!(
                     "`{}` uses ABI {:?}; device externs must use `extern \"C\"` without unwinding",
-                    decl.export_name, fn_sig.abi
+                    decl.export_name,
+                    fn_sig.abi()
                 )));
             }
 
-            if fn_sig.c_variadic {
+            if fn_sig.c_variadic() {
                 return Err(DeviceCodegenError::InvalidDeviceExternSignature(format!(
                     "`{}` is variadic; variadic device externs are not supported",
                     decl.export_name

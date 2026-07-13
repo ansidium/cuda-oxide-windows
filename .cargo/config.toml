@@ -1,8 +1,3 @@
-# Custom cargo aliases for cuda-oxide
-
-[alias]
-oxide = "run --package cargo-oxide --"
-
 # Environment variables for all builds
 [env]
 # libmathdx installation path (for libmathdx-sys crate)

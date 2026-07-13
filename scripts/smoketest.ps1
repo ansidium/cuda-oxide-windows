@@ -68,15 +68,27 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 
 Write-SmokePass "preflight"
 
-Invoke-SmokeCommand "cargo build -p cargo-oxide" @("cargo", "build", "-p", "cargo-oxide")
+$cargoMetadataJson = & cargo metadata --format-version 1 --no-deps
+if ($LASTEXITCODE -ne 0) {
+    Write-SmokeFail "cargo metadata" "exit code $LASTEXITCODE"
+    exit $LASTEXITCODE
+}
+$cargoMetadata = $cargoMetadataJson | ConvertFrom-Json
+
+$cargoOxide = Join-Path $cargoMetadata.target_directory "debug\cargo-oxide.exe"
+Invoke-SmokeCommand "cargo build --locked -p cargo-oxide" @("cargo", "build", "--locked", "-p", "cargo-oxide")
+if (-not (Test-Path -LiteralPath $cargoOxide -PathType Leaf)) {
+    Write-SmokeFail "cargo-oxide path" "local binary was not produced at $cargoOxide"
+    exit 2
+}
 
 if (-not $SkipDoctor) {
-    Invoke-SmokeCommand "cargo oxide doctor" @("cargo", "oxide", "doctor")
+    Invoke-SmokeCommand "cargo oxide doctor" @($cargoOxide, "doctor")
 } else {
     Write-SmokeSkip "cargo oxide doctor" "SkipDoctor was set"
 }
 
-Invoke-SmokeCommand "cargo oxide build $Example" @("cargo", "oxide", "build", $Example)
+Invoke-SmokeCommand "cargo oxide build $Example" @($cargoOxide, "build", $Example)
 
 if ($BuildOnly) {
     Write-SmokeSkip "cargo oxide run $Example" "BuildOnly was set"
@@ -90,5 +102,5 @@ if (-not (Test-NvidiaGpu)) {
     exit 0
 }
 
-Invoke-SmokeCommand "cargo oxide run $Example" @("cargo", "oxide", "run", $Example)
+Invoke-SmokeCommand "cargo oxide run $Example" @($cargoOxide, "run", $Example)
 Write-Host "SMOKE SUMMARY: PASS"

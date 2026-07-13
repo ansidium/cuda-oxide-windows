@@ -79,16 +79,16 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Build cargo-oxide
-        run: cargo build -p cargo-oxide
+        run: cargo build --locked -p cargo-oxide
 
       - name: Test oxide-artifacts object feature
         run: cargo test -p oxide-artifacts --features object
 
       - name: Build codegen backend
-        run: cargo oxide setup
+        run: .\target\debug\cargo-oxide.exe setup
 
       - name: Compile vecadd
-        run: cargo oxide build vecadd --arch sm_75
+        run: .\target\debug\cargo-oxide.exe build vecadd --arch sm_75
 
   windows-cuda-compile:
     name: Windows CUDA compile (manual best effort)
@@ -134,11 +134,14 @@ jobs:
         shell: pwsh
         run: .\.github\scripts\install-libffi.ps1
 
+      - name: Build cargo-oxide
+        run: cargo build --locked -p cargo-oxide
+
       - name: Build codegen backend
-        run: cargo oxide setup
+        run: .\target\debug\cargo-oxide.exe setup
 
       - name: Compile vecadd
-        run: cargo oxide build vecadd --arch sm_75
+        run: .\target\debug\cargo-oxide.exe build vecadd --arch sm_75
 
   windows-gpu-smoke:
     name: Windows GPU smoke (self-hosted best effort)

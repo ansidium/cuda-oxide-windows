@@ -165,8 +165,8 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 if ! cargo oxide --help >/dev/null 2>&1; then
-    echo "error: 'cargo oxide' subcommand missing; build it with:" >&2
-    echo "         cargo build -p cargo-oxide --release" >&2
+    echo "error: 'cargo oxide' subcommand missing; install this checkout with:" >&2
+    echo "         cargo install --locked --path crates/cargo-oxide" >&2
     exit 2
 fi
 
