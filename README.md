@@ -151,12 +151,18 @@ cargo oxide debug vecadd --tui
 
 #### cargo-oxide
 
-Inside the cuda-oxide repo, `cargo oxide` works out of the box via a workspace alias.
-
-For use outside the repo (your own projects), install it with the pinned nightly toolchain:
+Install the subcommand from the current checkout before using `cargo oxide`
+while developing cuda-oxide:
 
 ```bash
-cargo +nightly-2026-04-03 install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide
+cargo +nightly-2026-05-22 install --locked --path crates/cargo-oxide
+```
+
+To use the published repository version from another project, install it from
+Git instead:
+
+```bash
+cargo +nightly-2026-05-22 install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 7144e14e928fecaa40e9f4677f972bfdb73f6cf5 cargo-oxide
 ```
 
 On first run, `cargo-oxide` will automatically fetch and build the codegen backend.
@@ -167,7 +173,7 @@ If you have Nix with flakes enabled, `nix develop` in the repo gives you a repro
 
 ```bash
 nix develop                                       # full dev shell in this repo
-nix run github:NVlabs/cuda-oxide#new my-project   # bootstrap a project
+nix run .#new -- my-project                       # bootstrap from this exact checkout
 ```
 
 #### Rust
@@ -175,8 +181,8 @@ nix run github:NVlabs/cuda-oxide#new my-project   # bootstrap a project
 ```bash
 # Toolchain installed automatically via rust-toolchain.toml
 # Manual install if needed:
-rustup toolchain install nightly-2026-04-03
-rustup component add rust-src rustc-dev --toolchain nightly-2026-04-03
+rustup toolchain install nightly-2026-05-22
+rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain nightly-2026-05-22
 ```
 
 #### CUDA

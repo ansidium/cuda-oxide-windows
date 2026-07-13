@@ -51,6 +51,7 @@ npx -y @devcontainers/cli up --workspace-folder .
 Then run commands inside it with:
 
 ```bash
+npx -y @devcontainers/cli exec --workspace-folder . cargo install --locked --path crates/cargo-oxide
 npx -y @devcontainers/cli exec --workspace-folder . cargo oxide doctor
 npx -y @devcontainers/cli exec --workspace-folder . cargo oxide run vecadd
 ```
@@ -79,10 +80,10 @@ nix develop
 cargo oxide run vecadd
 ```
 
-To bootstrap a new project without cloning:
+From an exact checkout of the Windows fork, bootstrap a new project with:
 
 ```bash
-nix run github:NVlabs/cuda-oxide#new my-project
+nix run .#new -- my-project
 cd my-project && nix develop
 ```
 
@@ -242,8 +243,8 @@ The workspace ships a `rust-toolchain.toml` that pins the exact nightly version 
 If you need to install it manually:
 
 ```bash
-rustup toolchain install nightly-2026-04-03
-rustup component add rust-src rustc-dev rust-analyzer --toolchain nightly-2026-04-03
+rustup toolchain install nightly-2026-05-22
+rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain nightly-2026-05-22
 ```
 
 The two extra components are required by the codegen backend:
@@ -264,12 +265,17 @@ variables and validation commands are listed in
 
 `cargo-oxide` is the cargo subcommand that drives the entire build pipeline (`cargo oxide run`, `build`, `debug`, `pipeline`, etc.).
 
-**Inside the cuda-oxide repo**, it works out of the box via a workspace alias -- no extra install step.
+**Inside the cuda-oxide repo**, install the current checkout so the
+`cargo-oxide` executable exactly matches the sources you are testing:
+
+```bash
+cargo +nightly-2026-05-22 install --locked --path crates/cargo-oxide
+```
 
 **For use outside the repo** (your own projects), install it with the pinned nightly toolchain:
 
 ```bash
-cargo +nightly-2026-04-03 install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide
+cargo +nightly-2026-05-22 install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 7144e14e928fecaa40e9f4677f972bfdb73f6cf5 cargo-oxide
 ```
 
 On first run, `cargo-oxide` will automatically fetch and build the codegen backend. Subsequent runs reuse the cached build.
@@ -309,5 +315,5 @@ If everything is configured correctly, this compiles a Rust kernel to PTX, launc
 - `No working llc-21 or llc-22 found on PATH` -- install LLVM 21+ (`sudo apt install llvm-21`), add `/usr/lib/llvm-21/bin` to your `PATH`, or set `CUDA_OXIDE_LLC=/usr/bin/llc-21`.
 - `'stddef.h' file not found` when building host `cuda-bindings` -- install clang dev headers: `sudo apt install clang-21` (or `libclang-common-21-dev`).
 - `cuda.h not found` -- Set `CUDA_TOOLKIT_PATH` to your CUDA install root, or ensure `/usr/local/cuda/include/cuda.h` exists.
-- `rust-src component missing` -- Run `rustup component add rust-src --toolchain nightly-2026-04-03`.
+- `rust-src component missing` -- Run `rustup component add rust-src --toolchain nightly-2026-05-22`.
 :::

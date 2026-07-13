@@ -20,7 +20,8 @@ The supported Rust target is `x86_64-pc-windows-msvc`.
 - CUDA Toolkit 12.x or 13.x.
 - Visual Studio 2022 Build Tools with the MSVC x64 toolchain and Windows SDK.
 - Rust nightly pinned by `rust-toolchain.toml`.
-- Rust components: `rust-src`, `rustc-dev`, and `llvm-tools`.
+- Rust components: `rust-src`, `rustc-dev`, `rust-analyzer`, `rustfmt`,
+  `clippy`, and `llvm-tools`.
 - Clang and libclang for `bindgen`.
 
 ## Release Archive
@@ -45,9 +46,9 @@ install it automatically when you run Cargo from the repository root, but the
 manual commands are:
 
 ```powershell
-rustup toolchain install nightly-2026-04-03
-rustup component add rust-src rustc-dev llvm-tools --toolchain nightly-2026-04-03
-rustup target add x86_64-pc-windows-msvc --toolchain nightly-2026-04-03
+rustup toolchain install nightly-2026-05-22
+rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain nightly-2026-05-22
+rustup target add x86_64-pc-windows-msvc --toolchain nightly-2026-05-22
 ```
 
 ## Visual Studio and Clang
@@ -86,10 +87,10 @@ cargo -V
 nvcc --version
 clang --version
 
-cargo build -p cargo-oxide
-cargo oxide doctor
-cargo oxide build vecadd
-cargo oxide run vecadd
+cargo build --locked -p cargo-oxide
+.\target\debug\cargo-oxide.exe doctor
+.\target\debug\cargo-oxide.exe build vecadd
+.\target\debug\cargo-oxide.exe run vecadd
 ```
 
 `cargo oxide build vecadd` is the build-only check. `cargo oxide run vecadd`

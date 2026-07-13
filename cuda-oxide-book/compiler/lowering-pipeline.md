@@ -552,7 +552,7 @@ that cuda-oxide emits.
 | 4th      | `llc-21` on `PATH`                                        | Distro / `apt.llvm.org` install of LLVM 21.                           |
 | 5th      | `llc` on `PATH`                                           | Reporting fallback only; rejected at runtime if older than LLVM 21.   |
 
-The pinned Rust toolchain (`nightly-2026-04-03`) ships LLVM 22 with NVPTX
+The pinned Rust toolchain (`nightly-2026-05-22`) ships LLVM 22 with NVPTX
 enabled, so `rustup component add llvm-tools` is the recommended onboarding
 path. The PATH probes for `llc-22` / `llc-21` are kept as a fallback for
 users with an existing LLVM install. If none of the probes succeed the

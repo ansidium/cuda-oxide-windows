@@ -287,8 +287,8 @@ cuda-oxide pins to an exact nightly release via `rust-toolchain.toml`:
 
 ```toml
 [toolchain]
-channel = "nightly-2026-04-03"
-components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "llvm-tools"]
+channel = "nightly-2026-05-22"
+components = ["rust-src", "rustc-dev", "rust-analyzer", "rustfmt", "clippy", "llvm-tools"]
 ```
 
 This pin guarantees reproducible builds: anyone who clones the repository

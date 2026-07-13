@@ -10,7 +10,7 @@ from a fresh checkout. If you just want to run an example, the
 
 | Dependency       | Version                       | Purpose                                                     |
 |:-----------------|:----------------------------- |:------------------------------------------------------------|
-| **Rust nightly** | `nightly-2026-04-03` (pinned) | Compiler toolchain with `rustc-dev` for the codegen backend |
+| **Rust nightly** | `nightly-2026-05-22` (pinned) | Compiler toolchain with `rustc-dev` for the codegen backend |
 | **CUDA Toolkit** | 12.x+                         | Driver API, `nvcc`, PTX assembler                           |
 | **Clang**        | 21+ (`clang-21` pkg)          | `bindgen` in host `cuda-bindings` needs clang's headers     |
 | **Linux**        | Tested on Ubuntu 24.04        | Upstream-compatible path                                    |
@@ -27,8 +27,9 @@ checklist and [FORK.md](../../FORK.md) for fork policy.
 ## Clone the repository
 
 ```bash
-git clone https://github.com/NVlabs/cuda-oxide.git
-cd cuda-oxide
+git clone https://github.com/ansidium/cuda-oxide-windows.git
+git -C cuda-oxide-windows checkout --detach 7144e14e928fecaa40e9f4677f972bfdb73f6cf5
+cd cuda-oxide-windows
 ```
 
 ## Install the Rust toolchain
@@ -39,15 +40,15 @@ components. Rustup picks it up automatically:
 ```toml
 # rust-toolchain.toml (already in the repo root)
 [toolchain]
-channel = "nightly-2026-04-03"
-components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "llvm-tools"]
+channel = "nightly-2026-05-22"
+components = ["rust-src", "rustc-dev", "rust-analyzer", "rustfmt", "clippy", "llvm-tools"]
 ```
 
 If you need to install manually:
 
 ```bash
-rustup toolchain install nightly-2026-04-03
-rustup component add rust-src rustc-dev --toolchain nightly-2026-04-03
+rustup toolchain install nightly-2026-05-22
+rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain nightly-2026-05-22
 ```
 
 `rust-src` provides the standard library source for cross-compilation and
@@ -68,7 +69,7 @@ required for `ptxas` and header files, but you will not be able to run kernels.
 ## Install LLVM (usually optional)
 
 The codegen pipeline emits LLVM IR and invokes `llc` to produce PTX. The
-pinned Rust toolchain (`nightly-2026-04-03`) already ships LLVM 22 with the
+pinned Rust toolchain (`nightly-2026-05-22`) already ships LLVM 22 with the
 NVPTX backend enabled via the `llvm-tools` component, so the recommended
 path is:
 
@@ -152,10 +153,16 @@ build process. `cargo-oxide` handles building it transparently.
 ## Install cargo-oxide
 
 `cargo-oxide` is the cargo subcommand that drives the full compilation
-pipeline. Inside the repo, it works via a workspace alias. For standalone use, install it with the pinned nightly toolchain:
+pipeline. Install the current checkout before testing it in the repository:
 
 ```bash
-cargo +nightly-2026-04-03 install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide
+cargo +nightly-2026-05-22 install --locked --path crates/cargo-oxide
+```
+
+For standalone use, install it from Git with the pinned nightly toolchain:
+
+```bash
+cargo +nightly-2026-05-22 install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 7144e14e928fecaa40e9f4677f972bfdb73f6cf5 cargo-oxide
 ```
 
 On first run, `cargo-oxide` automatically fetches and builds the codegen backend
@@ -180,11 +187,11 @@ and prints a success message.
 On Windows MSVC, the release-readiness smoke path is:
 
 ```powershell
-cargo build -p cargo-oxide
+cargo build --locked -p cargo-oxide
 cargo test -p oxide-artifacts --features object
-cargo oxide doctor
-cargo oxide build vecadd
-cargo oxide run vecadd
+.\target\debug\cargo-oxide.exe doctor
+.\target\debug\cargo-oxide.exe build vecadd
+.\target\debug\cargo-oxide.exe run vecadd
 .\scripts\smoketest.ps1
 ```
 
@@ -275,7 +282,7 @@ cuda-oxide/
 
 `error[E0463]: can't find crate for rustc_middle`
 : You are missing the `rustc-dev` component. Run:
-  `rustup component add rustc-dev --toolchain nightly-2026-04-03`.
+  `rustup component add rustc-dev --toolchain nightly-2026-05-22`.
 
 CUDA driver version mismatch
 : The toolkit version (compile-time) and driver version (runtime) must be

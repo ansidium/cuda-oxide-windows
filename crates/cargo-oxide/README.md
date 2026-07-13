@@ -6,14 +6,19 @@ Replaces the previous `xtask` pattern with a proper cargo subcommand that works 
 
 ## Installation
 
-**Internal developers** (inside the cuda-oxide repo): no installation needed. The workspace alias makes `cargo oxide` work immediately.
+**Internal developers** (inside the cuda-oxide repo): install the current
+checkout so `cargo oxide` and the sources under test cannot drift apart:
+
+```bash
+cargo +nightly-2026-05-22 install --locked --path crates/cargo-oxide
+```
 
 **External users**:
 
 Install with the project's pinned nightly toolchain:
 
 ```bash
-cargo +nightly-2026-04-03 install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide
+cargo +nightly-2026-05-22 install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 7144e14e928fecaa40e9f4677f972bfdb73f6cf5 cargo-oxide
 ```
 
 On first run, `cargo-oxide` will automatically fetch and build the codegen backend if it's not already available.

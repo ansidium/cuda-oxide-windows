@@ -18,6 +18,7 @@
 
   outputs =
     {
+      self,
       nixpkgs,
       flake-utils,
       rust-overlay,
@@ -25,6 +26,10 @@
       ...
     }:
     let
+      # A clean Git flake carries its immutable revision. The fallback is
+      # filled by the post-migration pin commit for archive/path evaluations.
+      resolvedSelfRevision = self.rev or "7144e14e928fecaa40e9f4677f972bfdb73f6cf5";
+
       # Template flake for user projects. Extends cuda-oxide's devShell via
       # inputsFrom so users can add their own packages while inheriting the full
       # CUDA + Rust environment (including the shellHook that wires up the host
@@ -35,7 +40,9 @@
           description = "A cuda-oxide project";
 
           inputs = {
-            cuda-oxide.url = "github:NVlabs/cuda-oxide";
+            # Pin the exact source revision of the `nix run .#new` flake;
+            # never inherit a moving default branch here.
+            cuda-oxide.url = "github:ansidium/cuda-oxide-windows/${resolvedSelfRevision}";
             nixpkgs.follows = "cuda-oxide/nixpkgs";
             flake-utils.follows = "cuda-oxide/flake-utils";
           };
@@ -66,7 +73,7 @@
 
       userFlake = builtins.toFile "flake.nix" userFlakeContent;
 
-      # Directory used by `nix flake init -t github:NVlabs/cuda-oxide`.
+      # Directory used by the revision-pinned `nix flake init -t` command.
       # Content is system-independent; x86_64-linux is chosen arbitrarily.
       templateSrc = nixpkgs.legacyPackages.x86_64-linux.writeTextDir "flake.nix" userFlakeContent;
     in
