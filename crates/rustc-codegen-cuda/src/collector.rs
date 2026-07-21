@@ -152,13 +152,14 @@ enum CollectDecision {
 // single source of truth for the cuda_oxide_* naming contract; see its
 // crate-level docs for the layered API and the hash-suffix rationale.
 //
-// Each prefix ends with the magic suffix `246e25db_`, which makes a
+// Each prefix contains the magic component `246e25db_`, which makes a
 // substring like "cuda_oxide_kernel_" — without the hash — never falsely
 // match. The mutual-exclusion guarantee between `DEVICE_PREFIX` and
 // `DEVICE_EXTERN_PREFIX` means we no longer need the historical
 // "test extern first" ordering dance that lived here previously.
 use reserved_oxide_symbols::{
-    device_extern_base_name, is_device_extern_symbol, is_device_symbol, is_kernel_symbol,
+    device_extern_base_name, is_current_device_symbol, is_current_kernel_symbol,
+    is_device_extern_symbol, is_device_symbol, is_kernel_symbol, is_ptx_merge_required_marker,
     kernel_base_name,
 };
 
@@ -298,6 +299,14 @@ pub struct CollectionResult<'tcx> {
 
     /// External device function declarations (no MIR, emit as `declare`).
     pub device_externs: Vec<DeviceExternDecl>,
+
+    /// Whether this crate needs the run-time loader to merge PTX bundles.
+    ///
+    /// This is true for a `#[cuda_module]` containing a generic kernel and
+    /// for a concrete specialization of a generic kernel imported from a
+    /// dependency. Cubin materialization must reject this case until it can
+    /// reproduce the same cross-crate linking semantics.
+    pub requires_ptx_bundle_merge: bool,
 }
 
 /// Counts kernel functions across all codegen units.
@@ -341,17 +350,46 @@ pub fn count_device_fns_in_cgus<'tcx>(tcx: TyCtxt<'tcx>, cgus: &[CodegenUnit<'tc
     count
 }
 
+/// Find a device-code root emitted before the scoped Cargo cache protocol.
+///
+/// This deliberately inspects both local and external `DefId`s. A generic
+/// kernel defined by an older macro may have no monomorphized root in its
+/// defining crate; its first concrete `MonoItem` then appears only in a
+/// downstream consumer. Recognizing the legacy name there prevents that
+/// consumer from seeding a cache entry that would stay fresh across device
+/// output or architecture changes.
+pub fn unsupported_codegen_protocol_root_in_cgus<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    cgus: &[CodegenUnit<'tcx>],
+) -> Option<String> {
+    cgus.iter().find_map(|cgu| {
+        cgu.items().iter().find_map(|(item, _data)| {
+            let MonoItem::Fn(instance) = item else {
+                return None;
+            };
+            let def_id = instance.def_id();
+            let item_name = tcx.opt_item_name(def_id)?;
+            unsupported_codegen_protocol_root(item_name.as_str()).then(|| tcx.def_path_str(def_id))
+        })
+    })
+}
+
+fn unsupported_codegen_protocol_root(name: &str) -> bool {
+    (is_kernel_symbol(name) && !is_current_kernel_symbol(name))
+        || (is_device_symbol(name) && !is_current_device_symbol(name))
+}
+
 /// Checks if a function is a kernel entry point.
 ///
 /// Detection is based on the `KERNEL_PREFIX` substring (currently
-/// `cuda_oxide_kernel_246e25db_`) which the `#[kernel]` macro adds to
+/// `cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_`) which the `#[kernel]` macro adds to
 /// renamed functions:
 ///
 /// ```text
 /// User writes:        Macro expands to:
 /// ┌─────────────────┐  ┌────────────────────────────────────────────────┐
 /// │ #[kernel]       │  │ #[no_mangle]                                   │
-/// │ fn add_one(...) │ ⇒│ pub fn cuda_oxide_kernel_246e25db_add_one(...) │
+/// │ fn add_one(...) │ ⇒│ pub fn cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_add_one(...) │
 /// └─────────────────┘  └────────────────────────────────────────────────┘
 /// ```
 pub fn is_kernel_function(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
@@ -679,6 +717,12 @@ pub fn collect_device_functions<'tcx>(
     verbose: bool,
 ) -> CollectionResult<'tcx> {
     let mut collector = DeviceCollector::new(tcx, verbose);
+    let mut requires_ptx_bundle_merge = cgus.iter().any(|cgu| {
+        cgu.items().iter().any(|(item, _data)| match item {
+            MonoItem::Static(def_id) => is_ptx_merge_required_marker(&tcx.def_path_str(*def_id)),
+            _ => false,
+        })
+    });
 
     // Find all kernel entry points
     for cgu in cgus {
@@ -714,6 +758,15 @@ pub fn collect_device_functions<'tcx>(
                     }
                     continue;
                 }
+
+                // A downstream monomorphization of a generic kernel may be
+                // present even when the defining crate's private module
+                // marker is not. Such modules use the all-PTX-bundles loader,
+                // so strict ahead-of-time cubin materialization cannot safely
+                // compile only this crate's artifact.
+                requires_ptx_bundle_merge |= tcx
+                    .generics_of(instance.def_id())
+                    .requires_monomorphization(tcx);
 
                 let name = tcx.def_path_str(instance.def_id());
                 // Extract the kernel base name by stripping the reserved
@@ -780,7 +833,9 @@ pub fn collect_device_functions<'tcx>(
     }
 
     // Process the worklist to collect all reachable functions
-    collector.collect()
+    let mut result = collector.collect();
+    result.requires_ptx_bundle_merge = requires_ptx_bundle_merge;
+    result
 }
 
 /// Worklist-based collector for device-reachable functions.
@@ -936,6 +991,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         CollectionResult {
             functions: self.result,
             device_externs: self.device_externs,
+            requires_ptx_bundle_merge: false,
         }
     }
 
@@ -2067,4 +2123,56 @@ pub fn dump_device_mir_info<'tcx>(tcx: TyCtxt<'tcx>, functions: &[CollectedFunct
         }
     }
     eprintln!("=================================\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use reserved_oxide_symbols::{
+        DEVICE_PREFIX, KERNEL_PREFIX, LEGACY_DEVICE_PREFIX, LEGACY_KERNEL_PREFIX,
+        PTX_MERGE_REQUIRED_PREFIX, is_ptx_merge_required_marker, ptx_merge_required_marker,
+    };
+
+    use super::unsupported_codegen_protocol_root;
+
+    #[test]
+    fn ptx_merge_marker_matches_only_the_final_path_component() {
+        let marker = ptx_merge_required_marker("map");
+        assert!(is_ptx_merge_required_marker(&marker));
+        assert!(is_ptx_merge_required_marker(&format!(
+            "crate_name::kernels::{marker}"
+        )));
+        assert!(!is_ptx_merge_required_marker(&format!(
+            "crate_name::prefix_{marker}"
+        )));
+        assert!(!is_ptx_merge_required_marker(PTX_MERGE_REQUIRED_PREFIX));
+        assert!(!is_ptx_merge_required_marker("crate_name::ordinary_static"));
+    }
+
+    #[test]
+    fn scoped_cache_protocol_rejects_legacy_local_and_external_roots() {
+        assert!(!unsupported_codegen_protocol_root(&format!(
+            "local::{KERNEL_PREFIX}map"
+        )));
+        assert!(!unsupported_codegen_protocol_root(&format!(
+            "local::{DEVICE_PREFIX}helper"
+        )));
+        assert!(unsupported_codegen_protocol_root(&format!(
+            "legacy::{LEGACY_KERNEL_PREFIX}map"
+        )));
+        assert!(unsupported_codegen_protocol_root(&format!(
+            "dependency::{LEGACY_KERNEL_PREFIX}generic_kernel"
+        )));
+        assert!(unsupported_codegen_protocol_root(&format!(
+            "legacy::{LEGACY_DEVICE_PREFIX}helper"
+        )));
+        assert!(unsupported_codegen_protocol_root(&format!(
+            "{LEGACY_KERNEL_PREFIX}codegen_v1_map"
+        )));
+        assert!(unsupported_codegen_protocol_root(&format!(
+            "crate::{KERNEL_PREFIX}module::{LEGACY_KERNEL_PREFIX}map"
+        )));
+        assert!(!unsupported_codegen_protocol_root(
+            "ordinary::host_function"
+        ));
+    }
 }
