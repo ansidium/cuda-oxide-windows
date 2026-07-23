@@ -28,7 +28,7 @@ checklist and [FORK.md](../../FORK.md) for fork policy.
 
 ```bash
 git clone https://github.com/ansidium/cuda-oxide-windows.git
-git -C cuda-oxide-windows checkout --detach 0ecbaad62dc5f6a5151b504f973fac5d82e8f81a
+git -C cuda-oxide-windows checkout --detach 9c9fd03c8d393b63be4f138329b7c1702a09f62e
 cd cuda-oxide-windows
 ```
 
@@ -162,7 +162,7 @@ cargo +stable install --locked --path crates/cargo-oxide
 For standalone use, install it from Git with the stable toolchain:
 
 ```bash
-cargo +stable install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 0ecbaad62dc5f6a5151b504f973fac5d82e8f81a cargo-oxide
+cargo +stable install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 9c9fd03c8d393b63be4f138329b7c1702a09f62e cargo-oxide
 ```
 
 On first run, `cargo-oxide` automatically fetches and builds the codegen backend

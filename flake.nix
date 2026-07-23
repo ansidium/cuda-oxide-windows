@@ -28,7 +28,7 @@
     let
       # A clean Git flake carries its immutable revision. The fallback is
       # filled by the post-migration pin commit for archive/path evaluations.
-      resolvedSelfRevision = self.rev or "0ecbaad62dc5f6a5151b504f973fac5d82e8f81a";
+      resolvedSelfRevision = self.rev or "9c9fd03c8d393b63be4f138329b7c1702a09f62e";
 
       # Template flake for user projects. Extends cuda-oxide's devShell via
       # inputsFrom so users can add their own packages while inheriting the full
