@@ -10,7 +10,7 @@ from a fresh checkout. If you just want to run an example, the
 
 | Dependency       | Version                       | Purpose                                                     |
 |:-----------------|:----------------------------- |:------------------------------------------------------------|
-| **Rust nightly** | `nightly-2026-05-22` (pinned) | Compiler toolchain with `rustc-dev` for the codegen backend |
+| **Rust**         | Latest stable                 | Compiler toolchain with `rustc-dev` for the codegen backend |
 | **CUDA Toolkit** | 12.x+                         | Driver API, `nvcc`, PTX assembler                           |
 | **Clang**        | 21+ (`clang-21` pkg)          | `bindgen` in host `cuda-bindings` needs clang's headers     |
 | **Linux**        | Tested on Ubuntu 24.04        | Upstream-compatible path                                    |
@@ -34,21 +34,21 @@ cd cuda-oxide-windows
 
 ## Install the Rust toolchain
 
-The repo ships a `rust-toolchain.toml` that pins the exact nightly version and
-components. Rustup picks it up automatically:
+The repo ships a `rust-toolchain.toml` that selects the stable channel and
+required components. Rustup picks it up automatically:
 
 ```toml
 # rust-toolchain.toml (already in the repo root)
 [toolchain]
-channel = "nightly-2026-05-22"
+channel = "stable"
 components = ["rust-src", "rustc-dev", "rust-analyzer", "rustfmt", "clippy", "llvm-tools"]
 ```
 
 If you need to install manually:
 
 ```bash
-rustup toolchain install nightly-2026-05-22
-rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain nightly-2026-05-22
+rustup update stable
+rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain stable
 ```
 
 `rust-src` provides the standard library source for cross-compilation and
@@ -69,8 +69,8 @@ required for `ptxas` and header files, but you will not be able to run kernels.
 ## Install LLVM (usually optional)
 
 The codegen pipeline emits LLVM IR and invokes `llc` to produce PTX. The
-pinned Rust toolchain (`nightly-2026-05-22`) already ships LLVM 22 with the
-NVPTX backend enabled via the `llvm-tools` component, so the recommended
+stable Rust toolchain ships LLVM 22 with the NVPTX backend enabled via the
+`llvm-tools` component, so the recommended
 path is:
 
 ```bash
@@ -146,7 +146,7 @@ cargo build
 
 ```{note}
 The codegen backend (`crates/rustc-codegen-cuda/`) is intentionally **not** a
-workspace member because it requires special nightly features and a different
+workspace member because it requires compiler-internal APIs and a different
 build process. `cargo-oxide` handles building it transparently.
 ```
 
@@ -156,13 +156,13 @@ build process. `cargo-oxide` handles building it transparently.
 pipeline. Install the current checkout before testing it in the repository:
 
 ```bash
-cargo +nightly-2026-05-22 install --locked --path crates/cargo-oxide
+cargo +stable install --locked --path crates/cargo-oxide
 ```
 
-For standalone use, install it from Git with the pinned nightly toolchain:
+For standalone use, install it from Git with the stable toolchain:
 
 ```bash
-cargo +nightly-2026-05-22 install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 0ecbaad62dc5f6a5151b504f973fac5d82e8f81a cargo-oxide
+cargo +stable install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 0ecbaad62dc5f6a5151b504f973fac5d82e8f81a cargo-oxide
 ```
 
 On first run, `cargo-oxide` automatically fetches and builds the codegen backend
@@ -282,7 +282,7 @@ cuda-oxide/
 
 `error[E0463]: can't find crate for rustc_middle`
 : You are missing the `rustc-dev` component. Run:
-  `rustup component add rustc-dev --toolchain nightly-2026-05-22`.
+  `rustup component add rustc-dev --toolchain stable`.
 
 CUDA driver version mismatch
 : The toolkit version (compile-time) and driver version (runtime) must be
@@ -291,5 +291,5 @@ CUDA driver version mismatch
 
 `cargo oxide doctor` fails on codegen backend
 : The backend is built on first use. If the build fails, check that
-  `rust-src` is installed and that the nightly version matches
+  `rust-src` is installed and that the active compiler matches
   `rust-toolchain.toml`.

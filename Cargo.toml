@@ -2,7 +2,10 @@
 resolver = "3"
 members = [
     # Core crates
+    "crates/cuda-intrinsics",
+    "crates/cuda-intrinsics-gen",
     "crates/cuda-device",
+    "crates/cuda-artifact-finalizer",
     "crates/cuda-host",
     "crates/cuda-macros",
     "crates/llvm-export",
@@ -61,6 +64,7 @@ cuda-oxide-codegen = { path = "crates/cuda-oxide-codegen" }
 mir-transforms = { path = "crates/mir-transforms" }
 nvvm-transforms = { path = "crates/nvvm-transforms" }
 cuda-device = { path = "crates/cuda-device" }
+cuda-artifact-finalizer = { path = "crates/cuda-artifact-finalizer" }
 cuda-host = { path = "crates/cuda-host" }
 cuda-macros = { path = "crates/cuda-macros" }
 cuda-bindings = { path = "crates/cuda-bindings" }
@@ -84,6 +88,9 @@ log = "0.4"
 half = "2.7"
 libloading = "0.8"
 sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
 
 # llvm-export deps
 rustc-hash = "2.0"
@@ -94,3 +101,9 @@ dyn-clone = "1.0"
 quote = "1.0"
 syn = { version = "2.0", features = ["full", "visit", "visit-mut"] }
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
+
+# `cargo oxide` runs through the workspace's dev-profile Cargo alias. Its
+# backend fingerprint hashes a large debug shared object on every invocation;
+# optimize only SHA-256 so exact content fingerprinting remains inexpensive.
+[profile.dev.package.sha2]
+opt-level = 3

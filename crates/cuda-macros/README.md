@@ -86,13 +86,27 @@ extern "C" {
 
 Occupancy hints for register allocation. It may appear before or after
 `#[kernel]`; generic kernels forward its compiler marker to every generated
-entry.
+entry. The first value is a maximum, not an exact block size.
 
 ```rust
 #[kernel]
 #[launch_bounds(256, 2)]  // max 256 threads, min 2 blocks per SM
 pub fn optimized(out: DisjointSlice<f32>) { ... }
 // PTX: .entry optimized .maxntid 256 .minnctapersm 2 { ... }
+```
+
+The values may come from a policy type. With a launch contract, the host checks
+the concrete maximum for the selected policy before launching:
+
+```rust
+#[kernel]
+#[launch_bounds(P::MAX_THREADS, P::MIN_BLOCKS)]
+#[launch_contract(domain = 1)]
+pub fn transform<P: TransformPolicy>(out: DisjointSlice<f32>) { ... }
+
+let prepared = module.prepare_transform::<SmallPolicy>(
+    LaunchConfig1D::new(blocks, 64, 0),
+)?;
 ```
 
 ### `#[launch_contract(...)]`
@@ -134,8 +148,9 @@ maximum total threads per block. For example, a limit of 256 accepts both
 promise; the alignment is a compiler-visible minimum and is merged with any
 higher `DynamicSharedArray<T, ALIGN>` request in the body or a reachable local
 helper. Prelinked external helpers retain their separately compiled alignment.
-Contract values are integer literals in this initial API; specialization const
-expressions are not accepted yet.
+Launch-contract fields remain integer literals. The maximum supplied by
+`#[launch_bounds]` may be a generic const expression and is evaluated for each
+kernel specialization.
 
 `domain` is deliberately explicit because calls through device helpers defeat
 AST inference. `#[cuda_module]` adds a sealed trait bound to the complete
@@ -387,11 +402,30 @@ unsafe {
 }
 ```
 
-The initial surface supports zero or one `out`, up to 16 `in` operands, and
-`clobber("memory")`. `options(register_only)` requires an `out` operand and
-cannot be combined with clobbers. `options(may_diverge)` must be paired with
-`register_only`. Multiple outputs, read-write operands, and the `"C"`
-constraint are not implemented yet.
+The surface supports up to 8 `out` operands, up to 16 `in` operands, and
+`clobber("memory")`. Every `out` constraint must be `=`-prefixed (e.g.
+`"=r"`); with two or more `out` operands the snippet returns a tuple under
+the hood, destructured into the output places in declaration order:
+
+```rust
+let sum: u32;
+let prod: u32;
+unsafe {
+    ptx_asm!(
+        "add.u32 %0, %2, %3; mul.lo.u32 %1, %2, %3;",
+        out("=r") sum,
+        out("=r") prod,
+        in("r") x,
+        in("r") y,
+        options(register_only),
+    );
+}
+```
+
+`options(register_only)` requires an `out` operand and cannot be combined
+with clobbers. `options(may_diverge)` must be paired with `register_only`.
+More than 8 outputs, read-write operands, and the `"C"` constraint are not
+implemented yet.
 
 ## Source Layout
 

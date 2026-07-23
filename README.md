@@ -28,6 +28,7 @@ The workspace combines:
 - single-source compilation -- host and device code live in the same file, built with one `cargo oxide build`
 - a rustc codegen backend that compiles `#[kernel]` functions to CUDA PTX
 - device-side abstractions (type-safe indexing, shared memory, scoped atomics, barriers, TMA, warp/cluster ops)
+- compile-time kernel policies for separate tuned specializations without runtime policy arguments
 - a host-side runtime for memory management, pinned host transfers, and kernel launching (`cuda-core`, `cuda-async`)
 - a rust-native compilation pipeline using [Pliron](https://github.com/vaivaswatha/pliron), an MLIR-like IR framework in Rust (Rust → Rust MIR → Pliron IR → LLVM IR → PTX)
 
@@ -142,10 +143,10 @@ cargo oxide debug vecadd --tui
 ### Requirements
 
 - **cargo-oxide** — cargo subcommand that drives the build pipeline (`cargo oxide run`, `build`, `sanitize`, `debug`, etc.)
-- **Rust nightly** with `rust-src` and `rustc-dev` and `llvm-tools` components (pinned in `rust-toolchain.toml`)
+- **Latest stable Rust** with `rust-src`, `rustc-dev`, and `llvm-tools` components (selected by `rust-toolchain.toml`)
 - **CUDA Toolkit** (12.x+)
 - **Clang + libclang dev headers** (`clang-21` / `libclang-common-21-dev`) — needed by `bindgen` when building the host `cuda-bindings` crate
-- **Linux** (tested on Ubuntu 24.04)
+- **Linux** (tested on Ubuntu 24.04) or **Windows x86_64 MSVC**
 
 ### Install
 
@@ -155,21 +156,21 @@ Install the subcommand from the current checkout before using `cargo oxide`
 while developing cuda-oxide:
 
 ```bash
-cargo +nightly-2026-05-22 install --locked --path crates/cargo-oxide
+cargo +stable install --locked --path crates/cargo-oxide
 ```
 
 To use the published repository version from another project, install it from
 Git instead:
 
 ```bash
-cargo +nightly-2026-05-22 install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 0ecbaad62dc5f6a5151b504f973fac5d82e8f81a cargo-oxide
+cargo +stable install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 0ecbaad62dc5f6a5151b504f973fac5d82e8f81a cargo-oxide
 ```
 
 On first run, `cargo-oxide` will automatically fetch and build the codegen backend.
 
 #### Nix (alternative)
 
-If you have Nix with flakes enabled, `nix develop` in the repo gives you a reproducible shell with CUDA 13, LLVM 22, Clang, and the pinned Rust nightly — no manual apt installs. The shellHook auto-discovers host NVIDIA drivers on NixOS and non-NixOS systems.
+If you have Nix with flakes enabled, `nix develop` in the repo gives you a reproducible shell with CUDA 13, LLVM 22, Clang, and Rust — no manual apt installs. The shellHook auto-discovers host NVIDIA drivers on NixOS and non-NixOS systems.
 
 ```bash
 nix develop                                       # full dev shell in this repo
@@ -180,10 +181,14 @@ nix run .#new -- my-project                       # bootstrap from this exact ch
 
 ```bash
 # Toolchain installed automatically via rust-toolchain.toml
-# Manual install if needed:
-rustup toolchain install nightly-2026-05-22
-rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain nightly-2026-05-22
+# Update and install components manually if needed:
+rustup update stable
+rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain stable
 ```
+
+The codegen backend and device crates use compiler-internal and unstable APIs.
+The repository and generated projects enable those APIs through
+`.cargo/config.toml` while keeping the compiler channel on stable.
 
 #### CUDA
 

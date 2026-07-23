@@ -19,7 +19,7 @@ The supported Rust target is `x86_64-pc-windows-msvc`.
 - NVIDIA GPU and a driver compatible with the installed CUDA Toolkit.
 - CUDA Toolkit 12.x or 13.x.
 - Visual Studio 2022 Build Tools with the MSVC x64 toolchain and Windows SDK.
-- Rust nightly pinned by `rust-toolchain.toml`.
+- Latest stable Rust selected by `rust-toolchain.toml`.
 - Rust components: `rust-src`, `rustc-dev`, `rust-analyzer`, `rustfmt`,
   `clippy`, and `llvm-tools`.
 - Clang and libclang for `bindgen`.
@@ -41,14 +41,14 @@ the CLI can discover the backend without `CUDA_OXIDE_BACKEND`. A matching
 
 ## Rust Toolchain
 
-The repository pins the nightly toolchain in `rust-toolchain.toml`. Rustup will
-install it automatically when you run Cargo from the repository root, but the
+The repository selects the stable toolchain in `rust-toolchain.toml`. Rustup
+will install it automatically when you run Cargo from the repository root, but the
 manual commands are:
 
 ```powershell
-rustup toolchain install nightly-2026-05-22
-rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain nightly-2026-05-22
-rustup target add x86_64-pc-windows-msvc --toolchain nightly-2026-05-22
+rustup update stable
+rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain stable
+rustup target add x86_64-pc-windows-msvc --toolchain stable
 ```
 
 ## Visual Studio and Clang

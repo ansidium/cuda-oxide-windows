@@ -205,7 +205,7 @@ that retains type information, making it an ideal starting point for a GPU
 backend.
 
 The problem: MIR is an *internal* representation. Its data structures change
-between nightly versions with no stability guarantees. A backend that reads
+between compiler versions with no stability guarantees. A backend that reads
 internal MIR directly would break every time `rustc` refactors a field name or
 reorders an enum variant -- which happens more often than you might hope.
 `rustc_public` solves this by providing a versioned, stable API that bridges

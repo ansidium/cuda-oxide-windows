@@ -1,6 +1,6 @@
 # f16_stress
 
-Small stress test for Rust nightly's primitive `f16` support in cuda-oxide.
+Small stress test for Rust's unstable primitive `f16` support in cuda-oxide.
 
 It checks that `f16` works as a real floating-point type through the device pipeline:
 

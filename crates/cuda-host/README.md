@@ -132,6 +132,11 @@ a 2-D configuration cannot be passed to a 1-D contract. The prepared value is
 also branded with the exact kernel specialization, so `reduce::<f32>` and
 `reduce::<f64>` are not interchangeable. Generic closures can use the generated
 `prepare_{kernel}_for(&closure, config)` helper to infer their anonymous type.
+If `#[launch_bounds]` uses a policy constant, each specialization has its own
+host-side maximum. For example, `prepare_transform::<SmallPolicy>` can enforce
+64 threads while `prepare_transform::<WidePolicy>` enforces 256. This is a
+maximum, not an exact size; declare `block = (x, y, z)` when the full shape must
+match.
 
 For contracted kernels, raw `LaunchConfig` is available only through generated
 unsafe methods such as `reduce_unchecked`. Uncontracted generated methods are
@@ -295,6 +300,20 @@ selection and the pre-Blackwell to Blackwell PTX bridge do not use this cache.
 The first compiler/linker handles are retained for the process lifetime;
 restart the process to select another toolkit or after replacing one in place.
 Remove the `.oxide-artifacts` directory to clear all cached entries.
+
+The driver-independent `cuda-artifact-finalizer` crate owns the shared
+libNVVM/nvJitLink policy. Runtime loading and build-time materialization
+therefore use the same target, FMA, debug, input-order, provenance, and cubin
+validation rules.
+
+Deferred NVVM IR and LTOIR keep those policies in `<module>.options`. Existing
+v1 sidecars record FMA contraction and imply no debug information; v2 sidecars
+also record line-table or full-debug preservation. Missing sidecars on legacy,
+unversioned artifacts retain the historical default of FMA enabled and no
+debug information. In-memory callers can use the
+`*_with_compile_options` helpers to carry the complete policy. The older
+`*_with_options(..., allow_fma_contraction)` helpers remain available and use
+no debug information.
 
 ## Tiling Utilities (tcgen05)
 

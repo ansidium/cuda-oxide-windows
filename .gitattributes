@@ -1,0 +1,2 @@
+intrinsics/** text eol=lf
+intrinsics/probes/*.ll whitespace=-blank-at-eof

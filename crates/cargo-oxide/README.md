@@ -10,15 +10,15 @@ Replaces the previous `xtask` pattern with a proper cargo subcommand that works 
 checkout so `cargo oxide` and the sources under test cannot drift apart:
 
 ```bash
-cargo +nightly-2026-05-22 install --locked --path crates/cargo-oxide
+cargo +stable install --locked --path crates/cargo-oxide
 ```
 
 **External users**:
 
-Install with the project's pinned nightly toolchain:
+Install with the stable toolchain:
 
 ```bash
-cargo +nightly-2026-05-22 install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 0ecbaad62dc5f6a5151b504f973fac5d82e8f81a cargo-oxide
+cargo +stable install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 0ecbaad62dc5f6a5151b504f973fac5d82e8f81a cargo-oxide
 ```
 
 On first run, `cargo-oxide` will automatically fetch and build the codegen backend if it's not already available.
@@ -30,6 +30,7 @@ cargo oxide new my_project          # scaffold a new cuda-oxide project
 cargo oxide new my_project --async  # scaffold with async template (tokio + cuda-async)
 cargo oxide run vecadd              # build + run an example
 cargo oxide build vecadd            # compile only (no run)
+cargo oxide build vecadd --materialize-cubin --arch sm_120  # embed native cubin
 cargo oxide emit-ltoir vecadd --arch sm_100  # device code -> .ltoir (Tile/SIMT interop)
 cargo oxide build -- -p my_app      # arbitrary cargo build through cuda-oxide
 cargo oxide test                    # cargo test with cuda-oxide defaults
@@ -48,6 +49,7 @@ cargo oxide setup                   # explicitly build the codegen backend
 
 | Flag                         | Applies to                       | Description                                     |
 |------------------------------|----------------------------------|-------------------------------------------------|
+| `--materialize-cubin`        | run, sanitize, build, test, pipeline, debug | Finalize and embed target-specific native GPU code during the host build |
 | `--emit-nvvm-ir`             | run, build, pipeline             | Generate NVVM IR for libNVVM                    |
 | `--arch <sm_XX>`             | run, sanitize, build, test, pipeline, emit-ltoir | Target architecture override |
 | `--features <F>`             | run, sanitize, debug, build, build passthrough, emit-ltoir | Comma-separated cargo features to enable |
@@ -76,6 +78,28 @@ For NVVM IR and LTOIR, cuda-oxide records the policy in matching `.options`
 and versioned `.target` files and passes `-fma=0` through libNVVM and
 nvJitLink. Keep both sidecars with the artifact when another build system
 consumes it.
+
+`--materialize-cubin` moves the remaining libNVVM and nvJitLink work into the
+host build. The executable embeds a native cubin, so deployment does not need
+libNVVM, nvJitLink, or a first-load compilation step. This trades portability
+for startup simplicity: the cubin is pinned to the requested architecture and
+cannot use cuda-oxide's load-time PTX bridge on a newer GPU.
+
+```bash
+cargo oxide build vecadd --materialize-cubin --arch sm_120
+```
+
+A concrete architecture and a build-host CUDA Toolkit (libNVVM, nvJitLink, and
+libdevice) are required. cargo-oxide fingerprints the exact compiler inputs and
+rechecks them inside the backend; use the wrapper flag instead of setting
+`CUDA_OXIDE_MATERIALIZE_CUBIN` around raw Cargo. That variable is an internal
+wrapper/backend signal, not a supported user interface: raw Cargo may reuse a
+previous artifact without running the backend, and a backend invocation without
+the wrapper's fingerprint is rejected. Generic `#[cuda_module]`
+kernels, `#[device] extern` declarations, and metadata-interop examples are
+rejected because their run-time multi-artifact linking is not yet represented
+by this single-cubin path. Materialization is also a final-output mode, so it
+cannot be combined with `--emit-nvvm-ir` or `emit-ltoir`.
 
 ## Commands
 
@@ -171,10 +195,12 @@ package with several targets, embedded bundles still use the package name, so
 an excluded target's loader could otherwise find a selected sibling target's
 bundle.
 
-Passthrough builds include the effective codegen settings and backend build in
-Cargo's rustc fingerprint. Changing the target, output mode, FMA policy, owner
-list, configured codegen environment, or backend `.so` therefore regenerates
-device artifacts instead of reusing a stale Cargo result.
+Passthrough builds use two Cargo cache boundaries. The exact backend `.so`
+identity is global because that backend compiles every crate. CUDA procedural
+macros track target, output mode, FMA policy, owner list, materializer
+provenance, and configured codegen environment only in crates that can own or
+instantiate device code. Changing those settings therefore regenerates device
+artifacts without recompiling unrelated host-only dependencies.
 
 ### `cargo oxide emit-ltoir <crate>`
 
@@ -232,7 +258,11 @@ package has multiple binaries and no unambiguous default.
 
 ### `cargo oxide new <name> [--async]`
 
-Scaffolds a new standalone cuda-oxide project with `Cargo.toml`, `rust-toolchain.toml`, and a working `src/main.rs` containing a vector addition kernel. The default template uses `#[cuda_module]` with typed synchronous launch methods; `--async` generates a template with `tokio`, `cuda-async`, and typed lazy `DeviceOperation` launches.
+Scaffolds a new standalone cuda-oxide project with `Cargo.toml`,
+`rust-toolchain.toml`, `.cargo/config.toml`, and a working `src/main.rs`
+containing a vector addition kernel. The default template uses
+`#[cuda_module]` with typed synchronous launch methods; `--async` generates a
+template with `tokio`, `cuda-async`, and typed lazy `DeviceOperation` launches.
 
 ```bash
 cargo oxide new my_kernel
@@ -246,7 +276,7 @@ Formats all crates in the workspace: root workspace, `rustc-codegen-cuda`, and a
 
 ### `cargo oxide doctor`
 
-Validates that your environment is correctly set up: Rust nightly toolchain,
+Validates that your environment is correctly set up: stable Rust toolchain,
 CUDA headers (`cuda.h`), CUDA toolkit (`nvcc`, libNVVM, nvJitLink,
 libdevice), LLVM (`llc`), clang/libclang, the NVIDIA driver / GPU, and the
 codegen backend `.so`. Every check reports what was found or how to fix it.

@@ -6,10 +6,10 @@ This section walks through installing cuda-oxide, creating a project, writing a 
 
 ## Install cargo-oxide
 
-If you haven't already, install the build tool with the pinned nightly toolchain:
+If you haven't already, install the build tool with the stable toolchain:
 
 ```bash
-cargo +nightly-2026-05-22 install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 0ecbaad62dc5f6a5151b504f973fac5d82e8f81a cargo-oxide
+cargo +stable install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev 0ecbaad62dc5f6a5151b504f973fac5d82e8f81a cargo-oxide
 ```
 
 Verify that your environment is set up correctly:
@@ -36,7 +36,9 @@ This generates a ready-to-run project:
 ```text
 my_first_kernel/
 ├── Cargo.toml          # dependencies on cuda-device, cuda-host, cuda-core
-├── rust-toolchain.toml # pins the required nightly toolchain
+├── rust-toolchain.toml # selects the stable toolchain
+├── .cargo/
+│   └── config.toml     # enables required compiler APIs
 └── src/
     └── main.rs          # kernel + host code in one file
 ```

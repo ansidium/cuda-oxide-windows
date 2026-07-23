@@ -2,13 +2,11 @@
 
 ## Unreleased
 
-- Moved the pinned compiler from `nightly-2026-04-03` (Rust 1.96 nightly) to
-  `nightly-2026-05-22` (`rustc 1.97.0-nightly e96c36b6f`) and aligned the root,
-  codegen-backend, devcontainer, CLI scaffold, CI, README, and book references.
-- Adapted `rustc_public` MIR retag handling and the private codegen-backend API
-  to Rust 1.97; the Windows RTX 4080 `vecadd` smoke still passes 1024/1024.
+- Switched the workspace, devcontainer, CLI scaffold, CI, and documentation
+  from a dated nightly pin to the latest stable Rust channel.
+- Adapted the MIR importer and private codegen-backend API to stable Rust 1.97.
 - Merged `main` with
-  `upstream/main@d63a0a8d3fef2db450ee342bdcd862a7829c3cbb`.
+  `upstream/main@8d02eac17e56d5ed5ad3713fc498a2591d810919`.
 - Added a weekly upstream sync workflow for `main`; failed syncs open or update
   one issue.
 - Strengthened the hosted Windows no-GPU canary so the regular `windows`
@@ -55,7 +53,7 @@
 - NVIDIA GPU and a driver compatible with the installed CUDA Toolkit.
 - CUDA Toolkit 12.x or 13.x.
 - Visual Studio 2022 Build Tools with MSVC x64 and Windows SDK.
-- Rust nightly from `rust-toolchain.toml`.
+- Stable Rust from `rust-toolchain.toml`.
 - Rust components: `rust-src`, `rustc-dev`, `llvm-tools`.
 - Clang/libclang for `bindgen`.
 

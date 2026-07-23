@@ -276,38 +276,29 @@ already explicit. The `mir-importer` crate translates this into Pliron IR
 (an MLIR-like framework), and from there the
 [lowering pipeline](lowering-pipeline.md) takes it the rest of the way to PTX.
 
-## Nightly pinning
+## Stable compiler tracking
 
 Even with `rustc_public` providing a stable *API*, the bridge layer
 (`rustc_public_bridge`) is still compiled against the compiler's internals
-and is not independently versioned. In practice, this means a specific
-version of cuda-oxide works with a specific nightly.
+and is not independently versioned. Compiler updates can therefore require
+small compatibility changes in cuda-oxide.
 
-cuda-oxide pins to an exact nightly release via `rust-toolchain.toml`:
+cuda-oxide follows the stable channel via `rust-toolchain.toml`:
 
 ```toml
 [toolchain]
-channel = "nightly-2026-05-22"
+channel = "stable"
 components = ["rust-src", "rustc-dev", "rust-analyzer", "rustfmt", "clippy", "llvm-tools"]
 ```
 
-This pin guarantees reproducible builds: anyone who clones the repository
-gets the same compiler, the same MIR shapes, and the same bridge behavior.
-When updating the pin, the process is:
+The backend cache records the full active compiler fingerprint and rebuilds
+when that fingerprint changes. Stable compiler updates are accepted only after
+the test and compile gates pass.
 
-1. Bump the nightly date in `rust-toolchain.toml`.
-2. Fix any `rustc_public` API changes (usually minor -- that is the whole
-   point of the stable API).
-3. Run the full test suite to verify that all examples still compile and
-   produce correct PTX.
-4. Celebrate, or revert and try next week's nightly.
-
-```{note}
-As `rustc_public` matures and moves toward a crates.io release, the coupling
-to a specific nightly will loosen. The long-term goal is for cuda-oxide to
-work with any sufficiently recent stable Rust toolchain -- but we are not
-there yet.
-```
+The workspace configuration enables the compiler-internal APIs required by
+the backend and device crates. This does not make those APIs stable; it keeps
+the selected compiler channel stable while preserving the existing backend
+architecture.
 
 ---
 

@@ -11,18 +11,23 @@
 
 use crate::error::PipelineError;
 use crate::export::{
-    DeviceExternDecl, export_llvm_ir, module_uses_libdevice, render_llvm_ir, resolve_nvvm_target,
-    unresolved_external_symbols, validate_nvvm_debug_support,
+    DeviceExternDecl, export_llvm_ir, module_uses_libdevice, render_llvm_ir,
+    resolve_nvvm_target_with_generated, unresolved_external_symbols, validate_nvvm_debug_support,
 };
+use crate::generated::{
+    GeneratedMarkerPolicy, collect_generated_intrinsic_requirements_for_backend,
+};
+use crate::generated_intrinsic_targets::GeneratedIntrinsicBackend;
 use crate::llvm_tools::LlvmToolchain;
 use crate::lower::{add_device_extern_declarations, lower_to_llvm};
 use crate::options::BackendOptions;
 use crate::prep::{MirPreparation, prepare_mir_module};
-use crate::ptx::{GeneratedPtx, generate_ptx, generate_ptx_with_toolchain};
+use crate::ptx::{PtxModule, generate_ptx, generate_ptx_with_toolchain};
 use crate::target::detect_features_in_llvm_text;
 use crate::verify::verify_operation;
 use llvm_export::export::{DebugKind, NvvmIrDialect};
 use pliron::context::{Context, Ptr};
+use pliron::linked_list::ContainsLinkedList;
 use pliron::operation::Operation;
 use pliron::printable::Printable;
 use std::path::{Path, PathBuf};
@@ -83,6 +88,7 @@ pub struct ModulePipelineRequest<'a> {
     toolchain: ToolchainPolicy<'a>,
     files: OutputFiles<'a>,
     trace: PipelineTrace,
+    generated_marker_policy: GeneratedMarkerPolicy,
 }
 
 impl<'a> ModulePipelineRequest<'a> {
@@ -104,6 +110,7 @@ impl<'a> ModulePipelineRequest<'a> {
             toolchain: ToolchainPolicy::Discover,
             files,
             trace,
+            generated_marker_policy: GeneratedMarkerPolicy::Required,
         }
     }
 
@@ -121,6 +128,7 @@ impl<'a> ModulePipelineRequest<'a> {
             toolchain: ToolchainPolicy::Explicit(toolchain),
             files,
             trace: PipelineTrace::default(),
+            generated_marker_policy: GeneratedMarkerPolicy::Optional,
         }
     }
 }
@@ -203,30 +211,90 @@ pub fn compile_translated_module(
         add_device_extern_declarations(ctx, module, request.device_externs)?;
     }
 
+    // Discover libdevice.10.bc early so the backend decision can account for
+    // IR-level linking. When available, `needs_libdevice` no longer forces the
+    // NVVM IR path — the PTX path links libdevice at the LLVM IR level instead.
+    // "Available" requires BOTH the bitcode file and a same-major `llvm-link`
+    // for the `llc` this compilation will use: deciding from file existence
+    // alone would commit to the PTX path and then ship PTX with unresolved
+    // `.extern .func __nv_*` (a cuModuleLoad-time failure) whenever the
+    // linker is missing. Without either piece, libdevice kernels fall back
+    // to the NVVM IR path as they did before IR-level linking existed.
+    let libdevice_path = libnvvm_sys::find_libdevice().ok();
+    let can_ir_link_libdevice = libdevice_path.is_some()
+        && match request.toolchain {
+            ToolchainPolicy::Discover => {
+                crate::llvm_tools::libdevice_ir_linking_available(request.backend)
+            }
+            ToolchainPolicy::Explicit(toolchain) => toolchain.llvm_link.is_some(),
+        };
+
+    // Choose the intrinsic ABI while calls are still typed MIR. Generated
+    // intrinsics may have different LLVM signatures for `llc` and libNVVM, so
+    // discovering NVVM mode only after lowering is too late.
+    let backend_selection =
+        select_pre_lowering_backend(ctx, module, request.output_policy, can_ir_link_libdevice);
+    let generated_requirements = collect_generated_intrinsic_requirements_for_backend(
+        ctx,
+        module,
+        request.generated_marker_policy,
+        match backend_selection.intrinsic_backend {
+            mir_lower::IntrinsicBackend::LlvmNvptx => GeneratedIntrinsicBackend::LlvmNvptx,
+            mir_lower::IntrinsicBackend::LibNvvm => GeneratedIntrinsicBackend::LibNvvm,
+        },
+    )?;
+
     if request.trace.verbose {
         request
             .trace
             .emit("\n=== Lowering dialect-mir → LLVM dialect ===");
     }
-    lower_to_llvm(ctx, module, !request.backend.no_fma)?;
+    lower_to_llvm(
+        ctx,
+        module,
+        !request.backend.no_fma,
+        backend_selection.intrinsic_backend,
+    )?;
 
-    let needs_libdevice = module_uses_libdevice(ctx, module);
-    let emit_nvvm_ir = should_emit_nvvm_ir(request.output_policy, needs_libdevice);
+    let lowered_module_uses_libdevice = module_uses_libdevice(ctx, module);
+    if lowered_module_uses_libdevice != backend_selection.needs_libdevice {
+        return Err(PipelineError::Lowering(format!(
+            "libdevice backend selection changed during MIR lowering: typed MIR detection was {}, but lowered LLVM detection was {}; refusing to continue with a backend chosen from inconsistent requirements",
+            backend_selection.needs_libdevice, lowered_module_uses_libdevice
+        )));
+    }
+    let needs_libdevice = backend_selection.needs_libdevice;
+    let emit_nvvm_ir = backend_selection.emit_nvvm_ir;
     let requested_nvvm_ir = matches!(
         request.output_policy,
         OutputPolicy::ExternalLinkAllowed {
             request_nvvm_ir: true
         }
     );
-    if needs_libdevice && !requested_nvvm_ir && emit_nvvm_ir && request.trace.verbose {
-        request.trace.emit(
-            "\n=== Detected CUDA libdevice (`__nv_*`) calls; \
-             auto-emitting NVVM IR (skip llc) ===",
-        );
+    if needs_libdevice && request.trace.verbose {
+        if !emit_nvvm_ir && can_ir_link_libdevice {
+            request.trace.emit(format!(
+                "\n=== Detected CUDA libdevice (`__nv_*`) calls; \
+                 linking libdevice.10.bc at IR level ({}) ===",
+                libdevice_path.as_ref().unwrap().display()
+            ));
+        } else if !requested_nvvm_ir && emit_nvvm_ir {
+            request.trace.emit(
+                "\n=== Detected CUDA libdevice (`__nv_*`) calls; \
+                 auto-emitting NVVM IR (skip llc) ===",
+            );
+        }
     }
 
     // NVVM pointer syntax depends on the target. Detect the feature floor from
     // the same pre-legalization text the ordinary PTX path would inspect.
+    //
+    // Two full-text renders happen here (`export_llvm_ir` below does its own
+    // render for the real artifact): deliberate, not an oversight. This
+    // preview runs pre-legalization; the real export runs post-legalization
+    // (which mutates the module for the chosen NVVM dialect) through a
+    // different export config. Caching one render for the other would be
+    // unsound.
     let automatic_features = if emit_nvvm_ir {
         let preview = render_llvm_ir(
             ctx,
@@ -242,10 +310,11 @@ pub fn compile_translated_module(
     };
 
     let (nvvm_target, nvvm_dialect) = if emit_nvvm_ir {
-        let target = resolve_nvvm_target(
+        let target = resolve_nvvm_target_with_generated(
             request.backend.target_arch.as_deref(),
             request.backend.device_arch_hint.as_deref(),
             automatic_features,
+            &generated_requirements,
         )?;
         let dialect = if target.uses_legacy_llvm() {
             NvvmIrDialect::LegacyLlvm7
@@ -270,7 +339,11 @@ pub fn compile_translated_module(
                     .emit("\n=== Legalizing NVVM bit-intrinsic widths ===");
             }
         }
-        nvvm_transforms::legalize_for_nvvm(ctx, module, dialect)
+        let capability = nvvm_target
+            .as_ref()
+            .expect("an NVVM dialect is only selected alongside a resolved NVVM target")
+            .capability();
+        nvvm_transforms::legalize_for_nvvm(ctx, module, dialect, capability)
             .map_err(|error| PipelineError::Lowering(error.disp(ctx).to_string()))?;
     }
 
@@ -302,7 +375,7 @@ pub fn compile_translated_module(
             .emit(format!("\n=== Exporting to LLVM IR ({mode} mode) ==="));
     }
     remove_stale_files(request.files.stale_before_export)?;
-    export_llvm_ir(
+    let exported = export_llvm_ir(
         ctx,
         module,
         request.device_externs,
@@ -341,24 +414,33 @@ pub fn compile_translated_module(
     if request.trace.verbose {
         request.trace.emit("\n=== Generating PTX ===");
     }
+    let ptx_libdevice = if needs_libdevice && can_ir_link_libdevice {
+        libdevice_path.as_deref()
+    } else {
+        None
+    };
+    let ptx_module = PtxModule {
+        llvm_ir: request.files.llvm_ir,
+        output: request.files.ptx,
+        public_symbols: &exported.public_symbols,
+    };
     let generated = match request.toolchain {
         ToolchainPolicy::Discover => generate_ptx(
-            request.files.llvm_ir,
-            request.files.ptx,
+            ptx_module,
             request.debug_kind,
             request.backend,
             request.trace.sink,
+            &generated_requirements,
+            ptx_libdevice,
         )?,
-        ToolchainPolicy::Explicit(toolchain) => GeneratedPtx {
-            target: generate_ptx_with_toolchain(
-                request.files.llvm_ir,
-                request.files.ptx,
-                request.debug_kind,
-                request.backend,
-                toolchain,
-            )?,
-            diagnostics: Vec::new(),
-        },
+        ToolchainPolicy::Explicit(toolchain) => generate_ptx_with_toolchain(
+            ptx_module,
+            request.debug_kind,
+            request.backend,
+            toolchain,
+            &generated_requirements,
+            ptx_libdevice,
+        )?,
     };
     if request.trace.verbose {
         request.trace.emit(format!(
@@ -374,10 +456,94 @@ pub fn compile_translated_module(
     })
 }
 
-fn should_emit_nvvm_ir(policy: OutputPolicy, needs_libdevice: bool) -> bool {
+/// Backend decision made from the typed module before MIR lowering starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreLoweringBackendSelection {
+    /// Whether a typed MIR call requires CUDA libdevice.
+    needs_libdevice: bool,
+    /// Whether the pipeline must stop at NVVM IR instead of invoking `llc`.
+    emit_nvvm_ir: bool,
+    /// Intrinsic ABI to use during MIR-to-LLVM conversion.
+    intrinsic_backend: mir_lower::IntrinsicBackend,
+}
+
+fn select_pre_lowering_backend(
+    ctx: &Context,
+    module: Ptr<Operation>,
+    output_policy: OutputPolicy,
+    can_ir_link_libdevice: bool,
+) -> PreLoweringBackendSelection {
+    // The rustc frontend supplies typed MIR, while the standalone frontend may
+    // also supply an already-lowered LLVM declaration in the same module.
+    // Inspect both representations before choosing an intrinsic ABI.
+    let needs_libdevice =
+        typed_mir_uses_libdevice(ctx, module) || module_uses_libdevice(ctx, module);
+    let emit_nvvm_ir = should_emit_nvvm_ir(output_policy, needs_libdevice, can_ir_link_libdevice);
+    let intrinsic_backend = if emit_nvvm_ir {
+        mir_lower::IntrinsicBackend::LibNvvm
+    } else {
+        mir_lower::IntrinsicBackend::LlvmNvptx
+    };
+
+    PreLoweringBackendSelection {
+        needs_libdevice,
+        emit_nvvm_ir,
+        intrinsic_backend,
+    }
+}
+
+fn typed_mir_uses_libdevice(ctx: &Context, module: Ptr<Operation>) -> bool {
+    typed_op_uses_libdevice(ctx, module)
+}
+
+fn typed_op_uses_libdevice(ctx: &Context, op: Ptr<Operation>) -> bool {
+    if let Some(call) = Operation::get_op::<dialect_mir::ops::MirCallOp>(op, ctx)
+        && let Some(callee_attr) = call.get_attr_callee(ctx)
+    {
+        let callee: String = (*callee_attr).clone().into();
+        if callee.starts_with("__nv_")
+            || dialect_mir::rust_intrinsics::is_libdevice_backed_placeholder(&callee)
+        {
+            return true;
+        }
+    }
+
+    let op_ref = op.deref(ctx);
+    for region in op_ref.regions() {
+        let region_ref = region.deref(ctx);
+        for block in region_ref.iter(ctx) {
+            let block_ref = block.deref(ctx);
+            for child_op in block_ref.iter(ctx) {
+                if typed_op_uses_libdevice(ctx, child_op) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Determines whether the pipeline should emit NVVM IR instead of PTX.
+///
+/// When `can_ir_link_libdevice` is true, `__nv_*` calls will be resolved by
+/// linking `libdevice.10.bc` at the LLVM IR level (via `llvm-link`), so
+/// `needs_libdevice` alone no longer forces the NVVM IR path. This avoids the
+/// legacy LLVM 7 dialect that cannot represent f16 on pre-Blackwell targets.
+fn should_emit_nvvm_ir(
+    policy: OutputPolicy,
+    needs_libdevice: bool,
+    can_ir_link_libdevice: bool,
+) -> bool {
     match policy {
         OutputPolicy::SelfContainedPtx => false,
-        OutputPolicy::ExternalLinkAllowed { request_nvvm_ir } => request_nvvm_ir || needs_libdevice,
+        OutputPolicy::ExternalLinkAllowed { request_nvvm_ir } => {
+            if request_nvvm_ir {
+                return true;
+            }
+            // Fall back to NVVM IR only when the kernel needs libdevice AND
+            // we cannot resolve the calls via IR-level linking.
+            needs_libdevice && !can_ir_link_libdevice
+        }
     }
 }
 
@@ -410,10 +576,64 @@ fn remove_stale_files(paths: &[PathBuf]) -> Result<(), PipelineError> {
 mod tests {
     use super::*;
 
+    fn typed_mir_test_module(ctx: &mut Context, callees: &[&str]) -> Ptr<Operation> {
+        use pliron::basic_block::BasicBlock;
+        use pliron::builtin::attributes::{StringAttr, TypeAttr};
+        use pliron::builtin::op_interfaces::SymbolOpInterface;
+        use pliron::builtin::types::FunctionType;
+        use pliron::op::Op;
+
+        dialect_mir::register(ctx);
+        dialect_nvvm::register(ctx);
+        let module = pliron::builtin::ops::ModuleOp::new(ctx, "test".try_into().unwrap());
+        let module_op = module.get_operation();
+
+        let function_type = FunctionType::get(ctx, vec![], vec![]);
+        let function_op = Operation::new(
+            ctx,
+            dialect_mir::ops::MirFuncOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            1,
+        );
+        let function =
+            dialect_mir::ops::MirFuncOp::new(ctx, function_op, TypeAttr::new(function_type.into()));
+        function.set_symbol_name(ctx, "kernel".try_into().unwrap());
+
+        let body = function_op.deref(ctx).get_region(0);
+        let block = BasicBlock::new(ctx, None, vec![]);
+        block.insert_at_back(body, ctx);
+        for callee in callees {
+            let call_op = Operation::new(
+                ctx,
+                dialect_mir::ops::MirCallOp::get_concrete_op_info(),
+                vec![],
+                vec![],
+                vec![],
+                0,
+            );
+            let call = dialect_mir::ops::MirCallOp::new(call_op);
+            call.set_attr_callee(ctx, StringAttr::new((*callee).to_string()));
+            call_op.insert_at_back(block, ctx);
+        }
+
+        crate::lower::append_to_module(ctx, module_op, function_op);
+        module_op
+    }
+
     #[test]
     fn standalone_never_silently_switches_to_a_linkable_artifact() {
-        assert!(!should_emit_nvvm_ir(OutputPolicy::SelfContainedPtx, false));
-        assert!(!should_emit_nvvm_ir(OutputPolicy::SelfContainedPtx, true));
+        assert!(!should_emit_nvvm_ir(
+            OutputPolicy::SelfContainedPtx,
+            false,
+            false
+        ));
+        assert!(!should_emit_nvvm_ir(
+            OutputPolicy::SelfContainedPtx,
+            true,
+            false
+        ));
     }
 
     #[test]
@@ -424,9 +644,98 @@ mod tests {
         let requested = OutputPolicy::ExternalLinkAllowed {
             request_nvvm_ir: true,
         };
-        assert!(!should_emit_nvvm_ir(automatic, false));
-        assert!(should_emit_nvvm_ir(automatic, true));
-        assert!(should_emit_nvvm_ir(requested, false));
+        // No libdevice, no IR linking available → PTX path.
+        assert!(!should_emit_nvvm_ir(automatic, false, false));
+        // Libdevice needed, no IR linking → falls back to NVVM IR.
+        assert!(should_emit_nvvm_ir(automatic, true, false));
+        // Explicit NVVM IR request always wins.
+        assert!(should_emit_nvvm_ir(requested, false, false));
+    }
+
+    #[test]
+    fn ir_linking_avoids_nvvm_ir_for_libdevice() {
+        let automatic = OutputPolicy::ExternalLinkAllowed {
+            request_nvvm_ir: false,
+        };
+        // Libdevice needed, IR linking available → PTX path (not NVVM IR).
+        assert!(!should_emit_nvvm_ir(automatic, true, true));
+        // No libdevice needed, IR linking available → PTX path (unchanged).
+        assert!(!should_emit_nvvm_ir(automatic, false, true));
+        // Explicit NVVM IR request still forces NVVM IR even with IR linking.
+        let requested = OutputPolicy::ExternalLinkAllowed {
+            request_nvvm_ir: true,
+        };
+        assert!(should_emit_nvvm_ir(requested, false, true));
+    }
+
+    #[test]
+    fn typed_libdevice_without_ir_linking_falls_back_to_nvvm() {
+        let mut ctx = Context::new();
+        let module =
+            typed_mir_test_module(&mut ctx, &[dialect_mir::rust_intrinsics::CALLEE_SIN_F32]);
+        // No IR-level linking: libdevice forces NVVM IR (legacy behavior).
+        let selection = select_pre_lowering_backend(
+            &ctx,
+            module,
+            OutputPolicy::ExternalLinkAllowed {
+                request_nvvm_ir: false,
+            },
+            false,
+        );
+        assert!(selection.needs_libdevice);
+        assert!(selection.emit_nvvm_ir);
+        assert_eq!(
+            selection.intrinsic_backend,
+            mir_lower::IntrinsicBackend::LibNvvm
+        );
+    }
+
+    #[test]
+    fn typed_libdevice_with_ir_linking_stays_on_ptx_path() {
+        let mut ctx = Context::new();
+        let module =
+            typed_mir_test_module(&mut ctx, &[dialect_mir::rust_intrinsics::CALLEE_SIN_F32]);
+        // IR-level linking available: libdevice does NOT force NVVM IR.
+        let selection = select_pre_lowering_backend(
+            &ctx,
+            module,
+            OutputPolicy::ExternalLinkAllowed {
+                request_nvvm_ir: false,
+            },
+            true,
+        );
+        assert!(selection.needs_libdevice);
+        assert!(!selection.emit_nvvm_ir);
+        assert_eq!(
+            selection.intrinsic_backend,
+            mir_lower::IntrinsicBackend::LlvmNvptx
+        );
+    }
+
+    #[test]
+    fn explicit_nvvm_and_standalone_ptx_choose_distinct_intrinsic_abis() {
+        let mut ctx = Context::new();
+        let ordinary =
+            typed_mir_test_module(&mut ctx, &[dialect_mir::rust_intrinsics::CALLEE_FADD_FAST]);
+        let nvvm = select_pre_lowering_backend(
+            &ctx,
+            ordinary,
+            OutputPolicy::ExternalLinkAllowed {
+                request_nvvm_ir: true,
+            },
+            false,
+        );
+        assert!(!nvvm.needs_libdevice);
+        assert!(nvvm.emit_nvvm_ir);
+        assert_eq!(nvvm.intrinsic_backend, mir_lower::IntrinsicBackend::LibNvvm);
+
+        let standalone =
+            select_pre_lowering_backend(&ctx, ordinary, OutputPolicy::SelfContainedPtx, false);
+        assert!(!standalone.emit_nvvm_ir);
+        assert_eq!(
+            standalone.intrinsic_backend,
+            mir_lower::IntrinsicBackend::LlvmNvptx
+        );
     }
 
     #[test]

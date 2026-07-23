@@ -21,7 +21,7 @@ auto-fetch discovery.
 ## Requirements
 
 - Windows 10/11 x86_64.
-- Rustup with the nightly toolchain pinned by the cuda-oxide repository.
+- Rustup with the stable toolchain selected by the cuda-oxide repository.
 - CUDA Toolkit 12.x or 13.x, including `nvcc`, `cuda.h`, `cuda.lib`,
   `nvvm64_*.dll`, `nvJitLink_*.dll`, and `libdevice.10.bc`.
 - Visual Studio 2022 Build Tools with MSVC x64 and a Windows SDK.

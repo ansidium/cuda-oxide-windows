@@ -54,7 +54,7 @@
 //!   - `tma`: Tensor memory access
 //!   - `memory`: SharedArray indexing, stmatrix
 
-mod drop_glue;
+pub mod drop_glue;
 pub mod helpers;
 pub mod intrinsics;
 
@@ -66,13 +66,6 @@ use crate::translator::values::{ValueMap, maybe_ptr_coerce};
 use dialect_mir::ops::{
     MirAssertOp, MirCondBranchOp, MirConstantOp, MirEqOp, MirGotoOp, MirNotOp, MirReturnOp,
     MirUnrollHintOp,
-};
-use dialect_nvvm::ops::{
-    ReadPtxSregCtaidXOp, ReadPtxSregCtaidYOp, ReadPtxSregDynamicSmemSizeOp, ReadPtxSregGridIdOp,
-    ReadPtxSregLanemaskEqOp, ReadPtxSregLanemaskGeOp, ReadPtxSregLanemaskGtOp,
-    ReadPtxSregLanemaskLeOp, ReadPtxSregLanemaskLtOp, ReadPtxSregNsmIdOp, ReadPtxSregNtidXOp,
-    ReadPtxSregNtidYOp, ReadPtxSregNwarpIdOp, ReadPtxSregSmIdOp, ReadPtxSregTidXOp,
-    ReadPtxSregTidYOp, ReadPtxSregTotalSmemSizeOp, ReadPtxSregWarpIdOp,
 };
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::OperandSegmentInterface;
@@ -113,6 +106,7 @@ pub fn translate_terminator(
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
     block_map: &[Ptr<BasicBlock>],
+    rustc_mono_successors: &[usize],
     legaliser: &mut Legaliser,
 ) -> TranslationResult<Ptr<Operation>> {
     let loc = span_to_location(ctx, term.span);
@@ -159,16 +153,29 @@ pub fn translate_terminator(
             legaliser,
         ),
 
-        mir::TerminatorKind::SwitchInt { discr, targets } => translate_switch(
-            ctx, body, discr, targets, block_ptr, prev_op, value_map, block_map, loc,
-        ),
+        mir::TerminatorKind::SwitchInt { discr, targets } => match rustc_mono_successors {
+            // rustc evaluated this switch for the concrete instance. Emit
+            // that exact edge instead of evaluating the converted public MIR
+            // a second time.
+            [target] => translate_goto(ctx, *target, block_ptr, prev_op, block_map, loc),
+            [] => input_err!(
+                loc,
+                TranslationErr::invalid_op(
+                    "rustc supplied no successor for a reachable SwitchInt".to_string()
+                )
+            ),
+            _ => translate_switch(
+                ctx, body, discr, targets, block_ptr, prev_op, value_map, block_map, loc,
+            ),
+        },
 
         mir::TerminatorKind::Drop {
             place,
             target,
             unwind,
         } => translate_drop(
-            ctx, body, place, *target, unwind, block_ptr, prev_op, block_map, loc,
+            ctx, body, place, *target, unwind, block_ptr, prev_op, value_map, block_map, legaliser,
+            loc,
         ),
 
         mir::TerminatorKind::Unreachable => {
@@ -366,16 +373,27 @@ fn translate_assert(
     // panic occurs, the GPU thread traps.
     let _ = unwind;
 
-    // Translate the condition operand
+    // Translate the condition operand.
+    //
+    // MIR assert conditions are operands, not necessarily places. In
+    // particular, rustc can retain boolean constants for guaranteed-failure
+    // blocks and deliberate traps. The shared operand translator preserves the
+    // old Copy/Move path by delegating to `translate_place`.
+    //
+    // Keep RuntimeChecks fail-closed here. `translate_operand` currently lowers
+    // those session-dependent flags to `false` without access to rustc's
+    // `Session`; accepting them as assert conditions would silently change the
+    // requested assertion policy. They need separate session-policy plumbing.
     let (cond_value, mut last_inserted) = match cond {
-        mir::Operand::Copy(place) | mir::Operand::Move(place) => {
-            rvalue::translate_place(ctx, body, place, value_map, block_ptr, prev_op, loc.clone())?
+        mir::Operand::Copy(_) | mir::Operand::Move(_) | mir::Operand::Constant(_) => {
+            rvalue::translate_operand(ctx, body, cond, value_map, block_ptr, prev_op, loc.clone())?
         }
-        _ => {
+        mir::Operand::RuntimeChecks(_) => {
             return input_err!(
                 loc.clone(),
                 TranslationErr::unsupported(
-                    "Constant conditions in assert not yet implemented".to_string(),
+                    "RuntimeChecks conditions in assert require session-policy lowering"
+                        .to_string(),
                 )
             );
         }
@@ -773,30 +791,29 @@ fn translate_switch(
 /// Translates a MIR `Drop` terminator.
 ///
 /// rustc emits `TerminatorKind::Drop` only for places whose type has drop
-/// glue. cuda-oxide does not yet emit device-side `drop_in_place` calls,
-/// so a destructor that actually does something cannot run on the device.
+/// glue. Two cases:
 ///
-/// Two cases:
-///
-/// 1. **Provably no-op glue**: when the monomorphized drop glue does
-///    nothing observable (checked by [`drop_glue::drop_glue_is_noop`]),
+/// 1. **Provably no-op glue** (fast path): when the monomorphized drop glue
+///    does nothing observable (checked by [`drop_glue::drop_glue_is_noop`]),
 ///    the terminator lowers to a plain branch to its target block.
 ///    The common source pattern is `for x in arr` over a by-value
 ///    array: the loop's `core::array::IntoIter<T, N>` has an
 ///    `impl Drop`, but for element types without drop glue that
-///    destructor folds to nothing.
+///    destructor folds to nothing. This avoids the overhead of emitting
+///    a function call for drops that are statically proven to do nothing.
 ///
-/// 2. **Genuinely effectful glue**: we surface a hard error with the
-///    dropped place's type so the user can diagnose and restructure
-///    the kernel. Lowering to a goto here would silently skip the
-///    destructor and miscompile.
+/// 2. **Effectful glue** (fallback): when the no-op proof fails, the type
+///    has a genuine destructor. We emit a device-side call to the
+///    monomorphized `drop_in_place::<T>` function, which the collector has
+///    already gathered and translated as a regular device function.
 ///
 /// Suppressing drop glue on a Copy-shaped value (e.g. wrapping in
 /// `core::mem::ManuallyDrop`) prevents the Drop terminator from being
-/// emitted in the first place and lets the kernel compile.
+/// emitted in the first place and lets the kernel compile without any
+/// drop overhead.
 ///
-/// The unwind action is ignored: device code is panic=abort, and for the
-/// no-op case there is nothing that could unwind anyway.
+/// The unwind action is ignored: device code is panic=abort, so there is
+/// nothing that could unwind.
 #[allow(clippy::too_many_arguments)]
 fn translate_drop(
     ctx: &mut Context,
@@ -806,7 +823,9 @@ fn translate_drop(
     _unwind: &mir::UnwindAction,
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
     block_map: &[Ptr<BasicBlock>],
+    legaliser: &mut Legaliser,
     loc: Location,
 ) -> TranslationResult<Ptr<Operation>> {
     let dropped_ty = place.ty(body.locals()).map_err(|e| {
@@ -817,19 +836,16 @@ fn translate_drop(
             ))
         )
     })?;
+
+    // Fast path: if the drop is provably a no-op, emit a plain branch.
     if drop_glue::drop_glue_is_noop(dropped_ty) {
         return translate_goto(ctx, target, block_ptr, prev_op, block_map, loc);
     }
-    input_err!(
+
+    // Fallback: emit a device-side call to drop_in_place::<T>(ptr).
+    drop_glue::emit_drop_glue(
+        ctx, body, place, dropped_ty, target, block_ptr, prev_op, value_map, block_map, legaliser,
         loc,
-        TranslationErr::unsupported(format!(
-            "drop of `{:?}` is not supported on the device; its destructor \
-             does observable work and cuda-oxide does not yet emit \
-             device-side `drop_in_place` calls. Restructure the kernel to \
-             use only `Copy` types, or wrap the value in \
-             `core::mem::ManuallyDrop` to suppress drop glue.",
-            dropped_ty.kind()
-        ))
     )
 }
 
@@ -887,7 +903,7 @@ fn translate_call(
     let target_usize = target.map(|t| t);
 
     // Extract function info
-    let (pattern_name, call_name, substs_str) = extract_func_info(func);
+    let (pattern_name, call_name, substs_str) = extract_func_info(func, &loc)?;
 
     // Helper to check if substitutions contain a type
     let substs_contains =
@@ -959,7 +975,7 @@ fn translate_call(
                 legaliser,
             );
         }
-        if let Some(function_item) = extract_function_item_target(&args[0], body) {
+        if let Some(function_item) = extract_function_item_target(&args[0], body, &loc)? {
             return translate_function_item_call(
                 ctx,
                 body,
@@ -977,42 +993,6 @@ fn translate_call(
         }
     }
 
-    // Handle prof_trigger specially to extract const generic N
-    if let Some(ref name) = pattern_name
-        && name == "cuda_device::debug::prof_trigger"
-    {
-        // Extract the const generic N from the function type
-        if let mir::Operand::Constant(const_op) = func
-            && let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(_, substs)) =
-                const_op.const_.ty().kind()
-        {
-            // The const generic N is the first generic argument
-            if let Some(rustc_public::ty::GenericArgKind::Const(c)) = substs.0.first() {
-                use rustc_public::ty::TyConstKind;
-
-                let event_id = match c.kind() {
-                    TyConstKind::Value(_, alloc) => {
-                        // Read the allocation bytes (little-endian u32)
-                        alloc.read_uint().unwrap_or(0) as u32
-                    }
-                    _ => {
-                        // Try eval_target_usize as fallback
-                        c.eval_target_usize().unwrap_or(0) as u32
-                    }
-                };
-                return intrinsics::debug::emit_prof_trigger(
-                    ctx,
-                    event_id,
-                    &target_usize,
-                    block_ptr,
-                    prev_op,
-                    block_map,
-                    loc,
-                );
-            }
-        }
-    }
-
     // Per-loop unroll marker from `#[unroll]` / `#[unroll(N)]`. The enclosing
     // `#[kernel]` or `#[device]` macro injects this call at the start of the loop
     // body, so we plant a `mir.unroll_hint` op right here, inside that loop
@@ -1023,9 +1003,7 @@ fn translate_call(
     // Match both the full path (`cuda_device::thread::__unroll_config`) and the
     // re-exported short path (`cuda_device::__unroll_config`), mirroring the
     // robust suffix match in `body::detect_unroll_config`.
-    if let Some(ref name) = pattern_name
-        && (name == "__unroll_config" || name.ends_with("::__unroll_config"))
-    {
+    if is_cuda_device_const_marker(func, "__unroll_config") {
         let Some(factor) = extract_unroll_factor(func) else {
             return input_err!(
                 loc,
@@ -1034,6 +1012,14 @@ fn translate_call(
                 )
             );
         };
+        if factor == 1 || factor > 1024 {
+            return input_err!(
+                loc,
+                TranslationErr::invalid_op(format!(
+                    "partial unroll factor must be in 2..=1024, or 0 for full unrolling; got {factor}"
+                ))
+            );
+        }
         let Some(target) = target_usize else {
             return input_err!(
                 loc,
@@ -1142,8 +1128,7 @@ fn translate_call(
     // ordinary type it compiles to nothing. We decide which case applies
     // from the monomorphized type's layout: uninhabited types are exactly
     // those whose layout has `VariantsShape::Empty`. Inhabited types lower
-    // to a unit no-op; uninhabited ones lower to `unreachable`, matching
-    // how device code models panics (they cannot execute on the GPU).
+    // to a unit no-op; uninhabited ones lower to a trap.
     // If the generic argument or its layout cannot be read, fall through
     // to the loud "not yet supported" rejection below.
     if let Some(ref name) = pattern_name
@@ -1160,21 +1145,7 @@ fn translate_call(
             rustc_public::abi::VariantsShape::Empty
         );
         if uninhabited {
-            let op = Operation::new(
-                ctx,
-                dialect_mir::ops::MirUnreachableOp::get_concrete_op_info(),
-                vec![],
-                vec![],
-                vec![],
-                0,
-            );
-            op.deref_mut(ctx).set_loc(loc);
-            if let Some(prev) = prev_op {
-                op.insert_after(ctx, prev);
-            } else {
-                op.insert_at_front(block_ptr, ctx);
-            }
-            return Ok(op);
+            return Ok(emit_trap_unreachable_after(ctx, block_ptr, prev_op, loc));
         }
         return helpers::emit_unit_noop_intrinsic(
             ctx,
@@ -1194,6 +1165,7 @@ fn translate_call(
         && let Some(result) = try_dispatch_intrinsic(
             ctx,
             body,
+            func,
             name,
             args,
             destination,
@@ -1211,11 +1183,19 @@ fn translate_call(
 
     // Handle diverging calls (calls that never return, like unwrap_failed, panic, etc.)
     // These have no target block because the function never returns.
-    // In GPU code, we emit an unreachable terminator since panics can't actually execute.
+    //
+    // The callee is dropped and replaced by an immediate trap. That applies
+    // to every `-> !` callee reaching this point, including a user
+    // `#[device]` fn that legitimately diverges (e.g. `loop {}`); full Rust
+    // fidelity would emit the call for resolvable callees the way
+    // `translate_function_item_call` does. Dropping the call is a
+    // pre-existing semantic: the trap only makes it safe, where the bare
+    // `unreachable` previously emitted here was UB that let `opt` delete
+    // the whole panic path.
     if target_usize.is_none() {
-        // This is a diverging call (returns !) - emit unreachable
+        // This is a diverging call (returns !) - emit trap + unreachable
         // Examples: unwrap_failed(), panic!(), abort()
-        return Ok(emit_unreachable_after(ctx, block_ptr, prev_op, loc));
+        return Ok(emit_trap_unreachable_after(ctx, block_ptr, prev_op, loc));
     }
 
     // A call to a rustc intrinsic that no dispatch arm above recognized can
@@ -1439,9 +1419,12 @@ fn translate_function_item_call(
 ///
 /// ## Important: Closure Body Resolution
 ///
-/// In unified compilation with `std`, `Instance::resolve` for `<Closure as FnOnce>::call_once`
-/// returns a trait method **shim**, not the closure body directly. We must extract the closure's
-/// DefId from `args[0]`'s type and resolve that to get the actual closure body's mangled name.
+/// When an `Fn` or `FnMut` closure is requested through `FnOnce`,
+/// `Instance::resolve` returns a `ClosureOnce` adapter shim rather than the
+/// closure body. Other closure calls may resolve directly to the body. In
+/// either case, extract the closure DefId from `args[0]` so the emitted device
+/// call targets the body; `resolved_is_shim` separately controls receiver
+/// adaptation.
 ///
 /// See `device_closures/README.md` for detailed documentation.
 #[allow(clippy::too_many_arguments)]
@@ -1473,9 +1456,9 @@ fn translate_closure_call(
     // carries the already-resolved concrete type, so use that.
     let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
 
-    // Extract the closure body's name from the closure type in args[0].
-    // This is critical for unified compilation where Instance::resolve returns
-    // a trait shim instead of the closure body directly.
+    // Extract the closure body's name from the closure type in args[0]. This
+    // avoids targeting a ClosureOnce adapter when instance resolution selected
+    // one, while remaining correct for calls that resolve directly to the body.
     let closure_body_name = extract_closure_body_name(&args[0], body);
 
     let raw_callee = closure_body_name
@@ -1506,22 +1489,12 @@ fn translate_closure_call(
     )?;
     last_op = tuple_last_op;
 
-    // Determine whether the resolved closure body expects a reference.
-    //
-    // In `std` mode, rustc generates `FnOnce::call_once(self, args)` which passes
-    // the closure BY VALUE. But the closure body expects `&self` (a reference).
-    //
-    // In `no_std` mode, rustc generates `FnMut::call_mut(&mut self, args)` which
-    // already passes a reference.
-    //
-    // When we have call_once, we need to create a reference to the closure value
-    // before calling the closure body.
-    //
-    // A compiler shim for `FnOnce` over an `Fn`/`FnMut` closure receives the
-    // closure by value but calls a body that expects a reference. A genuine
-    // by-value `FnOnce` closure resolves directly to its body (`Item`) and must
-    // stay by value. Calls whose MIR receiver is already a reference need no
-    // extra borrow in either case.
+    // Determine whether bypassing a resolved adapter shim requires us to
+    // reproduce its receiver borrow. A ClosureOnce shim for an `Fn`/`FnMut`
+    // closure receives the closure by value but calls a body that expects a
+    // reference. A genuine by-value `FnOnce` closure resolves directly to its
+    // body and must stay by value. A receiver that MIR already passes by
+    // reference needs no extra borrow.
     let receiver_needs_borrow = resolved_is_shim
         && operand_type(&args[0], body).is_some_and(|ty| {
             !matches!(
@@ -1531,8 +1504,7 @@ fn translate_closure_call(
         });
 
     let self_arg = if receiver_needs_borrow {
-        // For call_once: self is passed by value, but closure body expects reference.
-        // Create a MirRefOp to take a reference to the closure value.
+        // Reproduce the adapter shim's borrow before calling the body directly.
         let self_ty = self_value.get_type(ctx);
         let ptr_ty = dialect_mir::types::MirPtrType::get(ctx, self_ty, true, 0);
 
@@ -1570,7 +1542,7 @@ fn translate_closure_call(
         self_value
     };
 
-    // Build unpacked arguments: start with self (or ref to self for call_once)
+    // Build unpacked arguments, starting with the original or adapted receiver.
     let mut unpacked_args = vec![self_arg];
 
     // Unpack the tuple - extract each field
@@ -1672,6 +1644,14 @@ fn translate_closure_call(
     }
 }
 
+/// Terminates the block with a bare `mir.unreachable`.
+///
+/// Only for paths that can never execute: rustc-proven unreachability
+/// (`TerminatorKind::Unreachable`) or code after a call that is emitted into
+/// the module and genuinely never returns.
+///
+/// Runtime-reachable panic paths whose diverging call is dropped must use
+/// [`emit_trap_unreachable_after`] instead.
 fn emit_unreachable_after(
     ctx: &mut Context,
     block_ptr: Ptr<BasicBlock>,
@@ -1693,6 +1673,31 @@ fn emit_unreachable_after(
         op.insert_at_front(block_ptr, ctx);
     }
     op
+}
+
+/// Terminates the block with `nvvm.trap` followed by `mir.unreachable`.
+///
+/// For runtime-reachable diverging paths whose call is not emitted (dropped
+/// panic calls). A thread reaching it aborts the kernel (`trap;` in PTX).
+fn emit_trap_unreachable_after(
+    ctx: &mut Context,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> Ptr<Operation> {
+    let trap_op = dialect_nvvm::ops::TrapOp::build(ctx);
+    trap_op.deref_mut(ctx).set_loc(loc.clone());
+    // `nvvm.trap` is a generated intrinsic; the target-requirements
+    // verifier rejects it without its exact ABI marker (`i0295` is
+    // trap's append-only id in intrinsics/abi-v1.toml, the same marker
+    // the generated `debug::trap` dispatch attaches).
+    helpers::set_generated_intrinsic_marker(ctx, trap_op, "v1:i0295");
+    if let Some(prev) = prev_op {
+        trap_op.insert_after(ctx, prev);
+    } else {
+        trap_op.insert_at_front(block_ptr, ctx);
+    }
+    emit_unreachable_after(ctx, block_ptr, Some(trap_op), loc)
 }
 
 /// True only when the rust-call receiver is itself a closure.
@@ -1720,8 +1725,11 @@ struct FunctionItemTarget {
 fn extract_function_item_target(
     receiver: &mir::Operand,
     body: &mir::Body,
-) -> Option<FunctionItemTarget> {
-    let ty = operand_type(receiver, body)?;
+    loc: &Location,
+) -> TranslationResult<Option<FunctionItemTarget>> {
+    let Some(ty) = operand_type(receiver, body) else {
+        return Ok(None);
+    };
     let inner = match ty.kind() {
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(_, inner, _)) => inner,
         _ => ty,
@@ -1730,18 +1738,23 @@ fn extract_function_item_target(
     let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(fn_def, substs)) =
         inner.kind()
     else {
-        return None;
+        return Ok(None);
     };
 
-    let instance = rustc_public::mir::mono::Instance::resolve(fn_def, &substs).ok()?;
+    let Some(instance) = rustc_public::mir::mono::Instance::resolve(fn_def, &substs).ok() else {
+        return Ok(None);
+    };
     let crate_name = fn_def.krate().name;
-    Some(FunctionItemTarget {
+    let generated_direct_call_only =
+        intrinsics::generated::require_supported_raw_intrinsic(fn_def, loc)?.is_some();
+    Ok(Some(FunctionItemTarget {
         name: function_item_call_name(instance),
         requires_direct_dispatch: fn_def.is_intrinsic()
             || instance.is_foreign_item()
             || !instance.has_body()
-            || matches!(crate_name.as_str(), "cuda_device" | "cuda-device" | "libm"),
-    })
+            || matches!(crate_name.as_str(), "cuda_device" | "cuda-device" | "libm")
+            || generated_direct_call_only,
+    }))
 }
 
 fn function_item_call_name(instance: rustc_public::mir::mono::Instance) -> String {
@@ -1804,12 +1817,11 @@ fn callable_trait_call_info(func: &mir::Operand) -> Option<CallableTraitCallInfo
 
 /// Extracts the closure body's mangled name from a closure operand.
 ///
-/// In unified compilation with `std`, when we see a call like:
+/// When instance resolution selects an adapter shim for a call like:
 ///   `<{closure} as FnOnce<(u32,)>>::call_once(closure_ref, args_tuple)`
 ///
-/// The `call_name` from `Instance::resolve` gives us the trait method shim's name,
-/// not the closure body. We need to extract the closure's DefId from `args[0]`'s type
-/// and resolve that to get the actual closure body's mangled name.
+/// the resolved call name identifies the shim, not the closure body. Extract
+/// the closure's DefId from `args[0]` and resolve the body independently.
 ///
 /// The closure argument can be:
 /// - A direct closure value (type is `Closure(def, substs)`)
@@ -1832,8 +1844,8 @@ fn extract_closure_body_name(closure_arg: &mir::Operand, body: &mir::Body) -> Op
         _ => return None,
     };
 
-    // Get the closure body instance directly, NOT through resolve_closure
-    // (which returns a call_once shim in unified/std compilation).
+    // Get the closure body instance directly. Resolving the callable-trait
+    // method can legitimately select a ClosureOnce adapter instead.
     //
     // The closure_def.def_id() gives us the DefId of the closure body.
     // We construct the mangled name by creating an FnDef and resolving it.
@@ -1863,9 +1875,16 @@ fn extract_unroll_factor(func: &mir::Operand) -> Option<u32> {
     let mir::Operand::Constant(constant) = func else {
         return None;
     };
-    let TyKind::RigidTy(RigidTy::FnDef(_, args)) = constant.const_.ty().kind() else {
+    let TyKind::RigidTy(RigidTy::FnDef(definition, args)) = constant.const_.ty().kind() else {
         return None;
     };
+    let definition_name = definition.name();
+    if definition.krate().name.as_str() != "cuda_device"
+        || (definition_name != "__unroll_config" && !definition_name.ends_with("::__unroll_config"))
+        || args.0.len() != 1
+    {
+        return None;
+    }
     if let Some(arg) = args.0.first()
         && let rustc_public::ty::GenericArgKind::Const(c) = arg
     {
@@ -1880,6 +1899,28 @@ fn extract_unroll_factor(func: &mir::Operand) -> Option<u32> {
         };
     }
     None
+}
+
+/// Match a compiler marker by its resolved definition, not by a debug string.
+///
+/// A user function with the same spelling must remain an ordinary call. The
+/// `FnDef` identity also guarantees that generic arguments were type-checked by
+/// rustc before the importer reads them.
+fn is_cuda_device_const_marker(func: &mir::Operand, expected_name: &str) -> bool {
+    use rustc_public::CrateDef;
+    use rustc_public::ty::{RigidTy, TyKind};
+
+    let mir::Operand::Constant(constant) = func else {
+        return false;
+    };
+    let TyKind::RigidTy(RigidTy::FnDef(definition, _)) = constant.const_.ty().kind() else {
+        return false;
+    };
+    if definition.krate().name.as_str() != "cuda_device" {
+        return false;
+    }
+    let definition_name = definition.name();
+    definition_name == expected_name || definition_name.ends_with(&format!("::{expected_name}"))
 }
 
 /// Extracts function metadata from a MIR function operand.
@@ -1924,8 +1965,11 @@ fn extract_unroll_factor(func: &mir::Operand) -> Option<u32> {
 /// FQDN and the device linker (libdevice, external LTOIR) only knows the
 /// link symbol. `call_name` for those is `Instance::mangled_name`, which is
 /// the link symbol (it honours `#[link_name]`).
-fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Option<String>) {
-    match func {
+fn extract_func_info(
+    func: &mir::Operand,
+    loc: &Location,
+) -> TranslationResult<(Option<String>, Option<String>, Option<String>)> {
+    Ok(match func {
         mir::Operand::Constant(const_op) => match const_op.const_.kind() {
             ConstantKind::ZeroSized => {
                 let ty_kind = const_op.const_.ty().kind();
@@ -1936,7 +1980,9 @@ fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Op
                     )) => {
                         use rustc_public::mir::mono::Instance;
 
-                        let pattern_name = fn_def.name().as_str().to_string();
+                        let pattern_name =
+                            intrinsics::generated::require_supported_raw_intrinsic(*fn_def, loc)?
+                                .unwrap_or_else(|| fn_def.name().as_str().to_string());
 
                         let resolved = Instance::resolve(*fn_def, substs).ok();
                         let call_name = if let Some(instance) = resolved {
@@ -1965,7 +2011,7 @@ fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Op
             _ => (None, None, None),
         },
         _ => (None, None, None),
-    }
+    })
 }
 
 /// Lower `core::intrinsics::typed_swap_nonoverlapping::<T>(x, y)`, the
@@ -2127,7 +2173,7 @@ fn emit_typed_swap(
 /// | Index Helpers     | `index_1d`, `index_2d::<S>`, `index_2d_runtime`, `index_2d_row`, `index_2d_col` |
 /// | Synchronization   | `sync_threads`, `mbarrier_*`, `fence_*`           |
 /// | Warp Primitives   | `shuffle_*`, `vote_*`, `lane_id`                  |
-/// | WGMMA (Hopper)    | `wgmma_fence`, `wgmma_mma_*`, `make_smem_desc`    |
+/// | WGMMA (Hopper `sm_90a`) | `wgmma_fence`, `wgmma_mma_*`, `make_smem_desc` |
 /// | TMA               | `cp_async_bulk_tensor_*_g2s/s2g`, `wait_group`    |
 /// | Tcgen05 (Blackwell)| `tcgen05_alloc`, `tcgen05_mma_*`, `tcgen05_ld_*` |
 /// | Memory            | `SharedArray::index`, `stmatrix_*`, `cvt_*`       |
@@ -2136,6 +2182,7 @@ fn emit_typed_swap(
 fn try_dispatch_intrinsic(
     ctx: &mut Context,
     body: &mir::Body,
+    func: &mir::Operand,
     name: &str,
     args: &[mir::Operand],
     destination: &mir::Place,
@@ -2147,6 +2194,24 @@ fn try_dispatch_intrinsic(
     loc: Location,
     substs_contains: &impl Fn(&str) -> bool,
 ) -> TranslationResult<Option<Ptr<Operation>>> {
+    intrinsics::wgmma::reject_unsupported(name, loc.clone())?;
+
+    if let Some(operation) = intrinsics::generated::try_dispatch_generated_intrinsic(
+        ctx,
+        body,
+        name,
+        args,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc.clone(),
+    )? {
+        return Ok(Some(operation));
+    }
+
     if let Some(kind) = intrinsics::asm::InlinePtxCallKind::from_path(name) {
         return Ok(Some(intrinsics::asm::emit_inline_ptx(
             ctx,
@@ -2334,307 +2399,19 @@ fn try_dispatch_intrinsic(
         }
 
         // =================================================================
-        // Thread/Block Position Intrinsics
-        // Support both re-exported (cuda_device::) and full paths (cuda_device::thread::)
-        // =================================================================
-        "cuda_device::threadIdx_x" | "cuda_device::thread::threadIdx_x" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregTidXOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::threadIdx_y" | "cuda_device::thread::threadIdx_y" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregTidYOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::blockIdx_x" | "cuda_device::thread::blockIdx_x" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregCtaidXOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::blockIdx_y" | "cuda_device::thread::blockIdx_y" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregCtaidYOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::blockDim_x" | "cuda_device::thread::blockDim_x" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregNtidXOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::blockDim_y" | "cuda_device::thread::blockDim_y" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregNtidYOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::threadIdx_z" | "cuda_device::thread::threadIdx_z" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                dialect_nvvm::ops::ReadPtxSregTidZOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::blockIdx_z" | "cuda_device::thread::blockIdx_z" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                dialect_nvvm::ops::ReadPtxSregCtaidZOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::blockDim_z" | "cuda_device::thread::blockDim_z" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                dialect_nvvm::ops::ReadPtxSregNtidZOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::gridDim_x" | "cuda_device::thread::gridDim_x" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                dialect_nvvm::ops::ReadPtxSregNctaidXOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::gridDim_y" | "cuda_device::thread::gridDim_y" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                dialect_nvvm::ops::ReadPtxSregNctaidYOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::gridDim_z" | "cuda_device::thread::gridDim_z" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                dialect_nvvm::ops::ReadPtxSregNctaidZOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        // SM and grid identification
-        "cuda_device::smid" | "cuda_device::thread::smid" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregSmIdOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::nsmid" | "cuda_device::thread::nsmid" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregNsmIdOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::gridid" | "cuda_device::thread::gridid" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic_u64(
-                ctx,
-                ReadPtxSregGridIdOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::grid::envreg1" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            dialect_nvvm::ops::ReadPtxSregEnvReg1Op::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::grid::envreg2" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            dialect_nvvm::ops::ReadPtxSregEnvReg2Op::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        // Shared memory size queries
-        "cuda_device::shared::dynamic_smem_size" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            ReadPtxSregDynamicSmemSizeOp::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::shared::total_smem_size" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            ReadPtxSregTotalSmemSizeOp::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-
-        // =================================================================
         // Thread Index Helpers (from intrinsics::indexing)
-        // Support both re-exported (cuda_device::) and full paths (cuda_device::thread::)
         //
-        // TODO: These three handlers (index_1d, index_2d_row, index_2d_col) are not
-        // strictly necessary. Their Rust bodies are real code that calls true intrinsics
-        // (threadIdx_x, blockIdx_y, etc.), so they compile correctly through the normal
-        // function path. They exist as a reliability workaround because #[inline(always)]
-        // is not always honored by rustc — without these handlers, a non-inlined call
-        // would require compiling the function body separately. The arithmetic expansion
-        // is trivial (3 ops + cast), so we keep them for now. If rustc inlining becomes
-        // reliable, these can be removed along with emit_index_1d_expansion,
-        // emit_index_2d_row, and emit_index_2d_col in intrinsics/indexing.rs.
+        // The index helpers are normal Rust functions over generated leaf
+        // intrinsics. Their bodies use the normal function-call path.
         // =================================================================
         "cuda_device::thread::__internal::index_1d"
         | "cuda_device::index_1d"
-        | "cuda_device::thread::index_1d" => {
-            Ok(Some(intrinsics::indexing::emit_index_1d_expansion(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::index_2d_row" | "cuda_device::thread::index_2d_row" => {
-            Ok(Some(intrinsics::indexing::emit_index_2d_row(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::index_2d_col" | "cuda_device::thread::index_2d_col" => {
-            Ok(Some(intrinsics::indexing::emit_index_2d_col(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        // index_2d returns Option<ThreadIndex> with an internal col < stride check.
-        // It is compiled as a normal function (not expanded inline) so that the
-        // Option construction and branch are handled by the standard MIR translator.
-        "cuda_device::thread::__internal::index_2d"
+        | "cuda_device::thread::index_1d"
+        | "cuda_device::index_2d_row"
+        | "cuda_device::thread::index_2d_row"
+        | "cuda_device::index_2d_col"
+        | "cuda_device::thread::index_2d_col"
+        | "cuda_device::thread::__internal::index_2d"
         | "cuda_device::thread::__internal::index_2d_runtime"
         | "cuda_device::index_2d"
         | "cuda_device::thread::index_2d"
@@ -2642,254 +2419,12 @@ fn try_dispatch_intrinsic(
         | "cuda_device::thread::index_2d_runtime" => Ok(None),
 
         // =================================================================
-        // Synchronization (from intrinsics::sync)
-        // =================================================================
-        "cuda_device::sync_threads" => Ok(Some(intrinsics::sync::emit_sync_threads(
-            ctx, target, block_ptr, prev_op, block_map, loc,
-        )?)),
-        "cuda_device::threadfence_block" | "cuda_device::fence::threadfence_block" => {
-            Ok(Some(intrinsics::sync::emit_threadfence_block(
-                ctx, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
-        "cuda_device::threadfence" | "cuda_device::fence::threadfence" => Ok(Some(
-            intrinsics::sync::emit_threadfence(ctx, target, block_ptr, prev_op, block_map, loc)?,
-        )),
-        "cuda_device::threadfence_system" | "cuda_device::fence::threadfence_system" => {
-            Ok(Some(intrinsics::sync::emit_threadfence_system(
-                ctx, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
-        "cuda_device::barrier::mbarrier_init" => Ok(Some(intrinsics::sync::emit_mbarrier_init(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-        )?)),
-        "cuda_device::barrier::mbarrier_arrive" => {
-            Ok(Some(intrinsics::sync::emit_mbarrier_arrive(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::barrier::mbarrier_arrive_expect_tx" => {
-            Ok(Some(intrinsics::sync::emit_mbarrier_arrive_expect_tx(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::barrier::mbarrier_arrive_expect_tx_cluster" => Ok(Some(
-            intrinsics::sync::emit_mbarrier_arrive_expect_tx_cluster(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?,
-        )),
-        "cuda_device::barrier::mbarrier_arrive_cluster" => {
-            Ok(Some(intrinsics::sync::emit_mbarrier_arrive_cluster(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::barrier::nanosleep" => Ok(Some(intrinsics::sync::emit_nanosleep(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::barrier::mbarrier_test_wait" => {
-            Ok(Some(intrinsics::sync::emit_mbarrier_test_wait(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::barrier::mbarrier_try_wait" => {
-            Ok(Some(intrinsics::sync::emit_mbarrier_try_wait(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::barrier::mbarrier_try_wait_parity" => {
-            Ok(Some(intrinsics::sync::emit_mbarrier_try_wait_parity(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::barrier::mbarrier_try_wait_parity_cluster" => Ok(Some(
-            intrinsics::sync::emit_mbarrier_try_wait_parity_cluster(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?,
-        )),
-        "cuda_device::barrier::mbarrier_inval" => Ok(Some(intrinsics::sync::emit_mbarrier_inval(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-        )?)),
-        "cuda_device::barrier::fence_proxy_async_shared_cta" => {
-            Ok(Some(intrinsics::sync::emit_fence_proxy_async_shared_cta(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
-        "cuda_device::barrier::fence_mbarrier_init_release_cluster" => Ok(Some(
-            intrinsics::sync::emit_fence_mbarrier_init_release_cluster(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?,
-        )),
-        "cuda_device::barrier::fence_proxy_async_generic_release_shared_cta_cluster" => Ok(Some(
-            intrinsics::sync::emit_fence_proxy_async_generic_release_shared_cta_cluster(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?,
-        )),
-        "cuda_device::barrier::fence_proxy_async_generic_acquire_shared_cluster_cluster" => {
-            Ok(Some(
-                intrinsics::sync::emit_fence_proxy_async_generic_acquire_shared_cluster_cluster(
-                    ctx, args, target, block_ptr, prev_op, block_map, loc,
-                )?,
-            ))
-        }
-
-        // =================================================================
-        // Type Conversions
-        // =================================================================
-        "cuda_device::convert::cvt_f16x2_f32" => Ok(Some(intrinsics::convert::emit_cvt_f16x2_f32(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::convert::cvt_rz_f16x2_f32" => {
-            Ok(Some(intrinsics::convert::emit_cvt_rz_f16x2_f32(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::convert::cvt_rn_relu_f16x2_f32" => {
-            Ok(Some(intrinsics::convert::emit_cvt_rn_relu_f16x2_f32(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::convert::cvt_rn_relu_bf16x2_f32" => {
-            Ok(Some(intrinsics::convert::emit_cvt_rn_relu_bf16x2_f32(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::convert::cvt_rz_bf16x2_f32" => {
-            Ok(Some(intrinsics::convert::emit_cvt_rz_bf16x2_f32(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-
-        // =================================================================
         // Debug & Profiling (from intrinsics::debug)
         // =================================================================
-        "cuda_device::debug::clock" => Ok(Some(intrinsics::debug::emit_clock(
+        "cuda_device::debug::__gpu_assertfail" => Ok(Some(intrinsics::debug::emit_assertfail(
             ctx,
+            body,
+            args,
             destination,
             target,
             block_ptr,
@@ -2897,32 +2432,6 @@ fn try_dispatch_intrinsic(
             value_map,
             block_map,
             loc,
-        )?)),
-        "cuda_device::debug::clock64" => Ok(Some(intrinsics::debug::emit_clock64(
-            ctx,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::debug::globaltimer" => Ok(Some(intrinsics::debug::emit_globaltimer(
-            ctx,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::debug::trap" => Ok(Some(intrinsics::debug::emit_trap(
-            ctx, target, block_ptr, prev_op, block_map, loc,
-        )?)),
-        "cuda_device::debug::breakpoint" => Ok(Some(intrinsics::debug::emit_breakpoint(
-            ctx, target, block_ptr, prev_op, block_map, loc,
         )?)),
         "cuda_device::debug::__gpu_vprintf" => Ok(Some(intrinsics::debug::emit_vprintf(
             ctx,
@@ -2938,146 +2447,8 @@ fn try_dispatch_intrinsic(
         )?)),
 
         // =================================================================
-        // Thread Block Clusters (from intrinsics::cluster) - sm_90+
+        // Compile-time cluster configuration
         // =================================================================
-        "cuda_device::cluster::cluster_ctaidX" => {
-            Ok(Some(intrinsics::cluster::emit_cluster_ctaid_x(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::cluster_ctaidY" => {
-            Ok(Some(intrinsics::cluster::emit_cluster_ctaid_y(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::cluster_ctaidZ" => {
-            Ok(Some(intrinsics::cluster::emit_cluster_ctaid_z(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::cluster_nctaidX" => {
-            Ok(Some(intrinsics::cluster::emit_cluster_nctaid_x(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::cluster_nctaidY" => {
-            Ok(Some(intrinsics::cluster::emit_cluster_nctaid_y(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::cluster_nctaidZ" => {
-            Ok(Some(intrinsics::cluster::emit_cluster_nctaid_z(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::cluster_idx" => Ok(Some(intrinsics::cluster::emit_cluster_idx(
-            ctx,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::cluster::num_clusters" => Ok(Some(intrinsics::cluster::emit_num_clusters(
-            ctx,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::cluster::cluster_sync" => Ok(Some(intrinsics::cluster::emit_cluster_sync(
-            ctx, target, block_ptr, prev_op, block_map, loc,
-        )?)),
-        "cuda_device::cluster::map_shared_rank" => {
-            Ok(Some(intrinsics::cluster::emit_map_shared_rank(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::map_shared_rank_mut" => {
-            // Same implementation as map_shared_rank, just different pointer mutability
-            Ok(Some(intrinsics::cluster::emit_map_shared_rank(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::dsmem_read_u32" => {
-            Ok(Some(intrinsics::cluster::emit_dsmem_read_u32(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
         "cuda_device::cluster::__cluster_config" => {
             // Compile-time cluster configuration marker from #[cluster(x,y,z)] attribute.
             // The cluster dimensions are extracted in body.rs during MIR scanning.
@@ -3117,10 +2488,24 @@ fn try_dispatch_intrinsic(
                 loc,
             )))
         }
-        "cuda_device::thread::__launch_bounds_config" => {
-            // Compile-time launch bounds marker from #[launch_bounds(max, min)] attribute.
-            // The launch bounds are extracted in body.rs during MIR scanning.
-            // This call generates no runtime code - just emit a goto to the target block.
+        "cuda_device::__launch_bounds_config"
+        | "cuda_device::thread::__launch_bounds_config"
+        | "cuda_device::__launch_contract_config"
+        | "cuda_device::thread::__launch_contract_config" => {
+            let expected_marker = match name {
+                "cuda_device::__launch_bounds_config"
+                | "cuda_device::thread::__launch_bounds_config" => "__launch_bounds_config",
+                "cuda_device::__launch_contract_config"
+                | "cuda_device::thread::__launch_contract_config" => "__launch_contract_config",
+                _ => unreachable!("launch metadata arm matched an unknown marker"),
+            };
+            if !is_cuda_device_const_marker(func, expected_marker) {
+                return Ok(None);
+            }
+            // Compile-time launch metadata marker. Launch bounds are extracted
+            // in body.rs; the contract marker selects the kernel's typed launch
+            // context during macro expansion. Neither marker emits runtime code.
+            // Emit only the control-flow edge to the call's target.
             //
             // We need a prev_op to insert after. If none exists, create a dummy constant.
             let actual_prev_op = match prev_op {
@@ -3150,7 +2535,7 @@ fn try_dispatch_intrinsic(
             };
             Ok(Some(helpers::emit_goto(
                 ctx,
-                target.expect("__launch_bounds_config must have target"),
+                target.expect("launch metadata marker must have target"),
                 actual_prev_op,
                 block_map,
                 loc,
@@ -3192,587 +2577,8 @@ fn try_dispatch_intrinsic(
             )))
         }
         // =================================================================
-        // Warp Primitives (from intrinsics::warp)
-        // =================================================================
-        "cuda_device::warp::lane_id" => Ok(Some(intrinsics::warp::emit_lane_id(
-            ctx,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        // Lane-position masks: zero-operand u32 special-register reads, same
-        // shape as the thread/block indexing sregs (see `emit_nvvm_intrinsic`).
-        "cuda_device::warp::lanemask_lt" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            ReadPtxSregLanemaskLtOp::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::lanemask_le" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            ReadPtxSregLanemaskLeOp::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::lanemask_eq" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            ReadPtxSregLanemaskEqOp::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::lanemask_ge" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            ReadPtxSregLanemaskGeOp::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::lanemask_gt" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            ReadPtxSregLanemaskGtOp::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        // Hardware warp identification
-        "cuda_device::warp::warpid" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            ReadPtxSregWarpIdOp::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::nwarpid" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            ReadPtxSregNwarpIdOp::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::active_mask" => Ok(Some(intrinsics::warp::emit_active_mask(
-            ctx,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::sync_mask" => Ok(Some(intrinsics::warp::emit_warp_sync_mask(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-        )?)),
-        "cuda_device::warp::shuffle_sync" => Ok(Some(intrinsics::warp::emit_warp_shuffle_i32(
-            ctx,
-            body,
-            dialect_nvvm::ops::ShflSyncIdxI32Op::get_concrete_op_info(),
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::shuffle_up_sync" => Ok(Some(intrinsics::warp::emit_warp_shuffle_i32(
-            ctx,
-            body,
-            dialect_nvvm::ops::ShflSyncUpI32Op::get_concrete_op_info(),
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::shuffle_down_sync" => {
-            Ok(Some(intrinsics::warp::emit_warp_shuffle_i32(
-                ctx,
-                body,
-                dialect_nvvm::ops::ShflSyncDownI32Op::get_concrete_op_info(),
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::warp::shuffle_xor_sync" => Ok(Some(intrinsics::warp::emit_warp_shuffle_i32(
-            ctx,
-            body,
-            dialect_nvvm::ops::ShflSyncBflyI32Op::get_concrete_op_info(),
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::shuffle_f32_sync" => Ok(Some(intrinsics::warp::emit_warp_shuffle_f32(
-            ctx,
-            body,
-            dialect_nvvm::ops::ShflSyncIdxF32Op::get_concrete_op_info(),
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::shuffle_up_f32_sync" => {
-            Ok(Some(intrinsics::warp::emit_warp_shuffle_f32(
-                ctx,
-                body,
-                dialect_nvvm::ops::ShflSyncUpF32Op::get_concrete_op_info(),
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::warp::shuffle_down_f32_sync" => {
-            Ok(Some(intrinsics::warp::emit_warp_shuffle_f32(
-                ctx,
-                body,
-                dialect_nvvm::ops::ShflSyncDownF32Op::get_concrete_op_info(),
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::warp::shuffle_xor_f32_sync" => {
-            Ok(Some(intrinsics::warp::emit_warp_shuffle_f32(
-                ctx,
-                body,
-                dialect_nvvm::ops::ShflSyncBflyF32Op::get_concrete_op_info(),
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::warp::shuffle_u64_sync" => Ok(Some(intrinsics::warp::emit_warp_shuffle_i64(
-            ctx,
-            body,
-            dialect_nvvm::ops::ShflSyncIdxI64Op::get_concrete_op_info(),
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::shuffle_up_u64_sync" => {
-            Ok(Some(intrinsics::warp::emit_warp_shuffle_i64(
-                ctx,
-                body,
-                dialect_nvvm::ops::ShflSyncUpI64Op::get_concrete_op_info(),
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::warp::shuffle_down_u64_sync" => {
-            Ok(Some(intrinsics::warp::emit_warp_shuffle_i64(
-                ctx,
-                body,
-                dialect_nvvm::ops::ShflSyncDownI64Op::get_concrete_op_info(),
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::warp::shuffle_xor_u64_sync" => {
-            Ok(Some(intrinsics::warp::emit_warp_shuffle_i64(
-                ctx,
-                body,
-                dialect_nvvm::ops::ShflSyncBflyI64Op::get_concrete_op_info(),
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::warp::all_sync" => Ok(Some(intrinsics::warp::emit_warp_vote(
-            ctx,
-            body,
-            dialect_nvvm::ops::VoteSyncAllOp::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::any_sync" => Ok(Some(intrinsics::warp::emit_warp_vote(
-            ctx,
-            body,
-            dialect_nvvm::ops::VoteSyncAnyOp::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::ballot_sync" => Ok(Some(intrinsics::warp::emit_warp_vote(
-            ctx,
-            body,
-            dialect_nvvm::ops::VoteSyncBallotOp::get_concrete_op_info(),
-            true,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::match_any_sync" => Ok(Some(intrinsics::warp::emit_warp_match(
-            ctx,
-            body,
-            dialect_nvvm::ops::MatchAnySyncI32Op::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::match_any_i64_sync" => Ok(Some(intrinsics::warp::emit_warp_match(
-            ctx,
-            body,
-            dialect_nvvm::ops::MatchAnySyncI64Op::get_concrete_op_info(),
-            true,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::match_all_sync" => Ok(Some(intrinsics::warp::emit_warp_match(
-            ctx,
-            body,
-            dialect_nvvm::ops::MatchAllSyncI32Op::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::match_all_i64_sync" => Ok(Some(intrinsics::warp::emit_warp_match(
-            ctx,
-            body,
-            dialect_nvvm::ops::MatchAllSyncI64Op::get_concrete_op_info(),
-            true,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::redux_sync_add" => Ok(Some(intrinsics::warp::emit_warp_redux(
-            ctx,
-            body,
-            dialect_nvvm::ops::ReduxSyncAddOp::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::redux_sync_min_u32" => Ok(Some(intrinsics::warp::emit_warp_redux(
-            ctx,
-            body,
-            dialect_nvvm::ops::ReduxSyncUminOp::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::redux_sync_min_i32" => Ok(Some(intrinsics::warp::emit_warp_redux(
-            ctx,
-            body,
-            dialect_nvvm::ops::ReduxSyncMinOp::get_concrete_op_info(),
-            true,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::redux_sync_max_u32" => Ok(Some(intrinsics::warp::emit_warp_redux(
-            ctx,
-            body,
-            dialect_nvvm::ops::ReduxSyncUmaxOp::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::redux_sync_max_i32" => Ok(Some(intrinsics::warp::emit_warp_redux(
-            ctx,
-            body,
-            dialect_nvvm::ops::ReduxSyncMaxOp::get_concrete_op_info(),
-            true,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::redux_sync_and" => Ok(Some(intrinsics::warp::emit_warp_redux(
-            ctx,
-            body,
-            dialect_nvvm::ops::ReduxSyncAndOp::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::redux_sync_or" => Ok(Some(intrinsics::warp::emit_warp_redux(
-            ctx,
-            body,
-            dialect_nvvm::ops::ReduxSyncOrOp::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::redux_sync_xor" => Ok(Some(intrinsics::warp::emit_warp_redux(
-            ctx,
-            body,
-            dialect_nvvm::ops::ReduxSyncXorOp::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::elect_sync" => Ok(Some(intrinsics::warp::emit_elect_sync(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-
-        // =================================================================
-        // WMMA (from intrinsics::wmma), Ampere+ mma.sync
-        // =================================================================
-        "cuda_device::wmma::mma_m16n8k16_f32_bf16" => {
-            Ok(Some(intrinsics::wmma::emit_mma_m16n8k16_f32_bf16(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::wmma::mma_m16n8k16_f32_f16" => {
-            Ok(Some(intrinsics::wmma::emit_mma_m16n8k16_f32_f16(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::wmma::mma_m16n8k8_f32_tf32" => {
-            Ok(Some(intrinsics::wmma::emit_mma_m16n8k8_f32_tf32(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::wmma::mma_m16n8k32_s32_s8" => {
-            Ok(Some(intrinsics::wmma::emit_mma_m16n8k32_s32_s8(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::wmma::mma_m8n8k4_f64" => Ok(Some(intrinsics::wmma::emit_mma_m8n8k4_f64(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-
-        // =================================================================
         // WGMMA (from intrinsics::wgmma)
         // =================================================================
-        "cuda_device::wgmma::wgmma_fence" => Ok(Some(intrinsics::wgmma::emit_wgmma_fence(
-            ctx, args, target, block_ptr, prev_op, block_map, loc,
-        )?)),
-        "cuda_device::wgmma::wgmma_commit_group" => {
-            Ok(Some(intrinsics::wgmma::emit_wgmma_commit_group(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
         "cuda_device::wgmma::make_smem_desc" => {
             Ok(Some(intrinsics::wgmma::emit_wgmma_make_smem_desc(
                 ctx,
@@ -3790,651 +2596,6 @@ fn try_dispatch_intrinsic(
         "cuda_device::wgmma::wgmma_mma_m64n64k16_f32_bf16" => {
             Ok(Some(intrinsics::wgmma::emit_wgmma_mma_m64n64k16_f32_bf16(
                 ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-
-        // =================================================================
-        // TMA (from intrinsics::tma)
-        // =================================================================
-        "cuda_device::tma::cp_async_bulk_tensor_1d_g2s" => Ok(Some(intrinsics::tma::emit_tma_g2s(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 1,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_2d_g2s" => Ok(Some(intrinsics::tma::emit_tma_g2s(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 2,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_2d_g2s_multicast" => {
-            Ok(Some(intrinsics::tma::emit_tma_g2s_multicast(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2" => {
-            Ok(Some(intrinsics::tma::emit_tma_g2s_multicast_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tma::cp_async_bulk_tensor_3d_g2s" => Ok(Some(intrinsics::tma::emit_tma_g2s(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 3,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_4d_g2s" => Ok(Some(intrinsics::tma::emit_tma_g2s(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 4,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_5d_g2s" => Ok(Some(intrinsics::tma::emit_tma_g2s(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 5,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_1d_s2g" => Ok(Some(intrinsics::tma::emit_tma_s2g(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 1,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_2d_s2g" => Ok(Some(intrinsics::tma::emit_tma_s2g(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 2,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_3d_s2g" => Ok(Some(intrinsics::tma::emit_tma_s2g(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 3,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_4d_s2g" => Ok(Some(intrinsics::tma::emit_tma_s2g(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 4,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_5d_s2g" => Ok(Some(intrinsics::tma::emit_tma_s2g(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 5,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_commit_group" => {
-            Ok(Some(intrinsics::tma::emit_tma_commit_group(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
-        "cuda_device::tma::cp_async_bulk_wait_group" => {
-            Ok(Some(intrinsics::tma::emit_tma_wait_group(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, false,
-            )?))
-        }
-        "cuda_device::tma::cp_async_bulk_wait_group_read" => {
-            Ok(Some(intrinsics::tma::emit_tma_wait_group(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, true,
-            )?))
-        }
-
-        // =================================================================
-        // Tcgen05 (from intrinsics::tcgen05)
-        // =================================================================
-        "cuda_device::tcgen05::tcgen05_alloc" => Ok(Some(intrinsics::tcgen05::emit_tcgen05_alloc(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-        )?)),
-        "cuda_device::tcgen05::tcgen05_dealloc" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_dealloc(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_relinquish_alloc_permit" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_relinquish_alloc_permit(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?,
-        )),
-        "cuda_device::tcgen05::tcgen05_fence_before_thread_sync" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_fence_before_thread_sync(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?,
-        )),
-        "cuda_device::tcgen05::tcgen05_fence_after_thread_sync" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_fence_after_thread_sync(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?,
-        )),
-        "cuda_device::tcgen05::tcgen05_commit" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_commit(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_commit_shared_cluster" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_commit_shared_cluster(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?,
-        )),
-        // NOTE: tcgen05_make_smem_desc and tcgen05_make_smem_desc_strided removed
-        // Use Tcgen05SmemDescriptor::builder() in cuda-core instead
-        "cuda_device::tcgen05::tcgen05_mma_ws_f16" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_mma_ws_f16(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_mma_f16" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_mma_f16(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_mma_ws_bf16" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_mma_ws_bf16(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_mma_ws_tf32" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_mma_ws_tf32(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_cp_smem_to_tmem" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_cp_smem_to_tmem(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        // NOTE: tcgen05_st_tmem_to_smem* and tcgen05_ld_* (non-pure) removed
-        // Use tcgen05_ld_16x256b_pure or tcgen05_ld_16x256b_x8_pure instead
-        "cuda_device::tcgen05::tcgen05_ld_16x256b_x8_pure" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_ld_16x256b_x8_pure(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_ld_16x256b_pure" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_ld_16x256b_pure(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_load_wait" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_load_wait(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_store_wait" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_store_wait(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
-
-        // CTA pair (cta_group::2) variants
-        "cuda_device::tcgen05::tcgen05_alloc_cg2" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_alloc_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_dealloc_cg2" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_dealloc_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_relinquish_alloc_permit_cg2" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_relinquish_alloc_permit_cg2(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?,
-        )),
-        "cuda_device::tcgen05::tcgen05_mma_f16_cg2" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_mma_f16_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_commit_cg2" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_commit_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_commit_shared_cluster_cg2" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_commit_shared_cluster_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?,
-        )),
-        "cuda_device::tcgen05::tcgen05_commit_multicast_cg2" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_commit_multicast_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?,
-        )),
-        "cuda_device::tcgen05::tcgen05_cp_smem_to_tmem_cg2" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_cp_smem_to_tmem_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-
-        // =================================================================
-        // Async Copy (cp.async) Operations (from intrinsics::cp_async)
-        // =================================================================
-        "cuda_device::async_copy::cp_async_ca_4" => {
-            Ok(Some(intrinsics::cp_async::emit_cp_async_ca_4(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::async_copy::cp_async_ca_8" => {
-            Ok(Some(intrinsics::cp_async::emit_cp_async_ca_8(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::async_copy::cp_async_ca_zfill_4" => {
-            Ok(Some(intrinsics::cp_async::emit_cp_async_ca_zfill_4(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::async_copy::cp_async_ca_zfill_8" => {
-            Ok(Some(intrinsics::cp_async::emit_cp_async_ca_zfill_8(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::async_copy::cp_async_ca_zfill_16" => {
-            Ok(Some(intrinsics::cp_async::emit_cp_async_ca_zfill_16(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-
-        // =================================================================
-        // Memory Operations (from intrinsics::memory)
-        // Note: stmatrix and cvt are under cuda_device::tcgen05::
-        // =================================================================
-        "cuda_device::tcgen05::stmatrix_m8n8_x4" => {
-            Ok(Some(intrinsics::memory::emit_stmatrix_m8n8_x4(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::stmatrix_m8n8_x4_trans" => {
-            Ok(Some(intrinsics::memory::emit_stmatrix_m8n8_x4_trans(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::stmatrix_m8n8_x2" => {
-            Ok(Some(intrinsics::memory::emit_stmatrix_m8n8_x2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::stmatrix_m8n8_x2_trans" => {
-            Ok(Some(intrinsics::memory::emit_stmatrix_m8n8_x2_trans(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        // =================================================================
-        // Ldmatrix: warp-cooperative shared memory matrix loads
-        // =================================================================
-        "cuda_device::wmma::ldmatrix_x1" => Ok(Some(intrinsics::ldmatrix::emit_ldmatrix_x1(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::wmma::ldmatrix_x1_trans" => {
-            Ok(Some(intrinsics::ldmatrix::emit_ldmatrix_x1_trans(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::wmma::ldmatrix_x2" => Ok(Some(intrinsics::ldmatrix::emit_ldmatrix_x2(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::wmma::ldmatrix_x2_trans" => {
-            Ok(Some(intrinsics::ldmatrix::emit_ldmatrix_x2_trans(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::wmma::ldmatrix_x4" => Ok(Some(intrinsics::ldmatrix::emit_ldmatrix_x4(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::wmma::ldmatrix_x4_trans" => {
-            Ok(Some(intrinsics::ldmatrix::emit_ldmatrix_x4_trans(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-
-        "cuda_device::tcgen05::cvt_f32x2_bf16x2" => {
-            Ok(Some(intrinsics::memory::emit_cvt_f32x2_bf16x2(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-
-        // =================================================================
-        // Warp-level matrix operations (from intrinsics::wmma)
-        // =================================================================
-        "cuda_device::wmma::movmatrix_trans_b16" => {
-            Ok(Some(intrinsics::wmma::emit_movmatrix_trans_b16(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-
-        // =================================================================
-        // bf16x2 packed arithmetic (from intrinsics::bf16x2)
-        // =================================================================
-        "cuda_device::bf16x2::fma_bf16x2" => Ok(Some(intrinsics::bf16x2::emit_fma_bf16x2(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        // =================================================================
-        // Integer dot products (from intrinsics::dotprod)
-        // =================================================================
-        "cuda_device::dotprod::dp4a_s32" => Ok(Some(intrinsics::dotprod::emit_dp4a_s32(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::dotprod::dp4a_u32" => Ok(Some(intrinsics::dotprod::emit_dp4a_u32(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::dotprod::dp2a_s32" => Ok(Some(intrinsics::dotprod::emit_dp2a_s32(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::dotprod::dp2a_u32" => Ok(Some(intrinsics::dotprod::emit_dp2a_u32(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        // =================================================================
-        // bf16x2 packed arithmetic (from intrinsics::bf16x2)
-        // =================================================================
-        "cuda_device::bf16x2::fma_relu_bf16x2" => {
-            Ok(Some(intrinsics::bf16x2::emit_fma_relu_bf16x2(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::bf16x2::add_bf16x2" => Ok(Some(intrinsics::bf16x2::emit_add_bf16x2(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::bf16x2::sub_bf16x2" => Ok(Some(intrinsics::bf16x2::emit_sub_bf16x2(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::bf16x2::mul_bf16x2" => Ok(Some(intrinsics::bf16x2::emit_mul_bf16x2(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::bf16x2::min_bf16x2" => Ok(Some(intrinsics::bf16x2::emit_min_bf16x2(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::bf16x2::max_bf16x2" => Ok(Some(intrinsics::bf16x2::emit_max_bf16x2(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::bf16x2::neg_bf16x2" => Ok(Some(intrinsics::bf16x2::emit_neg_bf16x2(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::bf16x2::abs_bf16x2" => Ok(Some(intrinsics::bf16x2::emit_abs_bf16x2(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-
-        // =================================================================
-        // Packed atomic add (from intrinsics::atomic)
-        // =================================================================
-        path if intrinsics::atomic::packed_atomic_add_kind(path)
-            == Some(intrinsics::atomic::PackedAtomicAddKind::F16x2) =>
-        {
-            Ok(Some(intrinsics::atomic::emit_atom_add_f16x2(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        path if intrinsics::atomic::packed_atomic_add_kind(path)
-            == Some(intrinsics::atomic::PackedAtomicAddKind::Bf16x2) =>
-        {
-            Ok(Some(intrinsics::atomic::emit_atom_add_bf16x2(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-
-        // =================================================================
-        // CLC - Cluster Launch Control (from intrinsics::clc)
-        // =================================================================
-        "cuda_device::clc::clc_try_cancel" => Ok(Some(intrinsics::clc::emit_clc_try_cancel(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-        )?)),
-        "cuda_device::clc::clc_try_cancel_multicast" => {
-            Ok(Some(intrinsics::clc::emit_clc_try_cancel_multicast(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::clc::clc_query_is_canceled" => {
-            Ok(Some(intrinsics::clc::emit_clc_query_is_canceled(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::clc::clc_query_get_first_ctaid_x" => {
-            Ok(Some(intrinsics::clc::emit_clc_query_get_first_ctaid_x(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::clc::clc_query_get_first_ctaid_y" => {
-            Ok(Some(intrinsics::clc::emit_clc_query_get_first_ctaid_y(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::clc::clc_query_get_first_ctaid_z" => {
-            Ok(Some(intrinsics::clc::emit_clc_query_get_first_ctaid_z(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
             )?))
         }
 
@@ -4500,22 +2661,6 @@ fn try_dispatch_intrinsic(
                 block_map,
                 loc,
                 false,
-            )?))
-        }
-
-        // =================================================================
-        // Prefix-based matches (for const generics like wgmma_wait_group::<N>)
-        // =================================================================
-        path if path.starts_with("cuda_device::wgmma::wgmma_wait_group") => {
-            // Extract N from path like "cuda_device::wgmma::wgmma_wait_group::<0>"
-            let n = path
-                .split("::<")
-                .nth(1)
-                .and_then(|s| s.strip_suffix('>'))
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            Ok(Some(intrinsics::wgmma::emit_wgmma_wait_group(
-                ctx, args, target, block_ptr, prev_op, block_map, loc, n,
             )?))
         }
 

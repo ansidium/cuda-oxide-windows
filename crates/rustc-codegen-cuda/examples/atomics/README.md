@@ -14,8 +14,8 @@ Atomic operations require **LLVM 22 or newer** for correct syncscope
 generation. Without it, scopes (`.gpu`, `.cta`, `.sys`) will be missing
 from generated PTX.
 
-The pinned Rust toolchain (`nightly-2026-05-22`) ships LLVM 22 with NVPTX
-enabled via the `llvm-tools` component, so the default onboarding path
+The stable Rust toolchain ships LLVM 22 with NVPTX enabled via the
+`llvm-tools` component, so the default onboarding path
 already satisfies this requirement:
 
 ```bash

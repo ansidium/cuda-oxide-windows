@@ -19,7 +19,7 @@ Generated programs are terminating, UB-free, and deterministic. A discrepancy be
 always indicate a bug in them (or a bug in Rustlantis).
 
 ## Requirements
-- Rust nightly
+- Latest stable Rust with the repository configuration
 - rustup
 
 ## Config

@@ -44,9 +44,6 @@ jobs:
         with:
           arch: x64
 
-      - name: Install rustfmt for the pinned nightly
-        run: rustup component add rustfmt
-
       - name: Install CUDA toolkit
         id: cuda-toolkit
         uses: Jimver/cuda-toolkit@v0.2.35
@@ -74,9 +71,6 @@ jobs:
       - name: Install libffi
         shell: pwsh
         run: .\.github\scripts\install-libffi.ps1
-
-      - name: Check formatting
-        run: cargo fmt --all --check
 
       - name: Build cargo-oxide
         run: cargo build --locked -p cargo-oxide

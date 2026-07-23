@@ -91,7 +91,7 @@
         # LLVM
         llvmPkgs = pkgs.llvmPackages_22;
 
-        # Nightly Rust
+        # Rust toolchain selected by the repository
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
         # cuda

@@ -7,9 +7,14 @@ target/
 .ltoir_arch
 *.ll
 *.bc
+
+# Generated intrinsic probes are checked-in fixtures.
+!intrinsics/probes/*.ll
 .DS_Store
 *.tar.gz
 .cursor/
+.idea/
+*.iml
 .vscode/
 .claude/
 .codex/

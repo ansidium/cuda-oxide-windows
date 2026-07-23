@@ -28,9 +28,14 @@ jobs:
       - name: Check example crate formatting
         run: |
           set -euo pipefail
-          for manifest in crates/rustc-codegen-cuda/examples/*/Cargo.toml; do
+          # `cargo fmt --all` also formats local path dependencies. Running it
+          # per example repeatedly reformats the large shared workspaces.
+          shopt -s globstar nullglob
+          manifests=(crates/rustc-codegen-cuda/examples/**/Cargo.toml)
+          ((${#manifests[@]} > 0))
+          for manifest in "${manifests[@]}"; do
             example_dir="$(dirname "$manifest")"
             echo "::group::cargo fmt --check ($example_dir)"
-            (cd "$example_dir" && cargo fmt --all -- --check)
+            cargo fmt --manifest-path "$manifest" -- --check
             echo "::endgroup::"
           done

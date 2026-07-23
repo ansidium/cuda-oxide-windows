@@ -50,7 +50,7 @@
 //!
 //! The mtime checks above miss a toolchain swap: the cached `.so` is
 //! dynamically linked against one specific `librustc_driver-<hash>.so`, but a
-//! repo `rust-toolchain.toml` or a changed default nightly leaves the
+//! repo `rust-toolchain.toml` or a changed stable compiler leaves the
 //! `cargo-oxide` binary and the cached source untouched. The stale `.so` then
 //! loads against the wrong driver and fails with a cryptic
 //! `librustc_driver-<hash>.so: cannot open shared object file`. To catch this
@@ -87,7 +87,7 @@ pub(crate) const PINNED_SOURCE_REPOSITORY: &str =
     "https://github.com/ansidium/cuda-oxide-windows.git";
 // This source commit may intentionally precede the cargo-oxide CLI commit:
 // embedding a commit's own SHA is impossible. It must nevertheless contain
-// the complete backend and library migration for the pinned nightly.
+// the complete backend and library migration for the selected compiler.
 pub(crate) const PINNED_SOURCE_REVISION: &str = "285f587c1df658df453dd9137ed91746914b3447";
 
 struct BackendCacheLock {
@@ -958,7 +958,7 @@ fn fetch_source_at_revision(
     result
 }
 
-/// Returns the active rustc sysroot path (e.g., `~/.rustup/toolchains/nightly-...`).
+/// Returns the active rustc sysroot path.
 ///
 /// Used to locate `libstd`, `librustc_driver`, and other compiler libraries that
 /// must be on the platform loader path when loading the codegen backend.

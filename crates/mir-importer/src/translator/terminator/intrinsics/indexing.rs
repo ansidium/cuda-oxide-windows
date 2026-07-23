@@ -15,8 +15,8 @@
 //! | `threadIdx_x/y/z`          | `ReadPtxSregTidX/Y/Z`   | Thread ID within block                               |
 //! | `blockIdx_x/y/z`           | `ReadPtxSregCtaidX/Y/Z` | Block ID within grid                                 |
 //! | `blockDim_x/y/z`           | `ReadPtxSregNtidX/Y/Z`  | Block dimensions                                     |
-//! | `index_1d()`               | Arithmetic expansion    | Global 1D thread index                               |
-//! | `index_2d_row/col()`       | Arithmetic expansion    | 2D row/column indices                                |
+//! | `index_1d()`               | Normal function call    | Global 1D thread index                               |
+//! | `index_2d_row/col()`       | Normal function call    | 2D row/column indices                                |
 //! | `index_2d::<S>()`          | Normal function call    | Const-stride 2D index (returns `Option<ThreadIndex>`)|
 //! | `index_2d_runtime(s)`      | Normal function call    | Runtime-stride 2D index (caller-asserted)            |
 //! | `get_thread_local()`       | `MirPtrOffsetOp`        | DisjointSlice element ptr                            |
@@ -30,7 +30,7 @@
 //! - `index_2d::<S>() = if col < S { Some(row * S + col) } else { None }`
 //! - `index_2d_runtime(s) = if col < s { Some(row * s + col) } else { None }`
 
-use super::super::helpers::emit_store_result_and_goto;
+use super::super::helpers::{emit_store_result_and_goto, set_generated_intrinsic_marker};
 use crate::error::{TranslationErr, TranslationResult};
 use crate::translator::rvalue;
 use crate::translator::types;
@@ -49,268 +49,22 @@ use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::Typed;
+use pliron::value::Value;
 use rustc_public::mir;
-/// Emits the expansion of `index_1d()`: `(blockIdx.x * blockDim.x + threadIdx.x) as usize`
-///
-/// `index_1d()` is marked `#[inline(always)]` but rustc doesn't always inline it,
-/// so we manually expand it here into the three NVVM intrinsics and arithmetic operations.
-#[allow(clippy::too_many_arguments)]
-pub fn emit_index_1d_expansion(
+
+fn generated_sreg_op(
     ctx: &mut Context,
-    destination: &mir::Place,
-    target: &Option<usize>,
-    block_ptr: Ptr<BasicBlock>,
-    prev_op: Option<Ptr<Operation>>,
-    value_map: &mut ValueMap,
-    block_map: &[Ptr<BasicBlock>],
+    opid: (fn(Ptr<Operation>) -> pliron::op::OpObj, std::any::TypeId),
+    result_type: pliron::r#type::TypeHandle,
     loc: Location,
-) -> TranslationResult<Ptr<Operation>> {
-    let u32_type = IntegerType::get(ctx, 32, Signedness::Unsigned);
-    let usize_type = types::get_usize_type(ctx);
-
-    // Emit threadIdx.x
-    let tid_op = Operation::new(
-        ctx,
-        ReadPtxSregTidXOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![],
-        vec![],
-        0,
-    );
-    tid_op.deref_mut(ctx).set_loc(loc.clone());
-    let tid_op = match prev_op {
-        Some(prev) => {
-            tid_op.insert_after(ctx, prev);
-            tid_op
-        }
-        None => {
-            tid_op.insert_at_front(block_ptr, ctx);
-            tid_op
-        }
-    };
-    let tid_val = tid_op.deref(ctx).get_result(0);
-
-    // Emit blockIdx.x
-    let bid_op = Operation::new(
-        ctx,
-        ReadPtxSregCtaidXOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![],
-        vec![],
-        0,
-    );
-    bid_op.deref_mut(ctx).set_loc(loc.clone());
-    bid_op.insert_after(ctx, tid_op);
-    let bid_val = bid_op.deref(ctx).get_result(0);
-
-    // Emit blockDim.x
-    let bdim_op = Operation::new(
-        ctx,
-        ReadPtxSregNtidXOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![],
-        vec![],
-        0,
-    );
-    bdim_op.deref_mut(ctx).set_loc(loc.clone());
-    bdim_op.insert_after(ctx, bid_op);
-    let bdim_val = bdim_op.deref(ctx).get_result(0);
-
-    // Emit bid * bdim
-    let mul_op = Operation::new(
-        ctx,
-        MirMulOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![bid_val, bdim_val],
-        vec![],
-        0,
-    );
-    mul_op.deref_mut(ctx).set_loc(loc.clone());
-    mul_op.insert_after(ctx, bdim_op);
-    let mul_val = mul_op.deref(ctx).get_result(0);
-
-    // Emit (bid * bdim) + tid
-    let add_op = Operation::new(
-        ctx,
-        MirAddOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![mul_val, tid_val],
-        vec![],
-        0,
-    );
-    add_op.deref_mut(ctx).set_loc(loc.clone());
-    add_op.insert_after(ctx, mul_op);
-    let add_val = add_op.deref(ctx).get_result(0);
-
-    // Cast u32 to usize
-    let cast_op = Operation::new(
-        ctx,
-        MirCastOp::get_concrete_op_info(),
-        vec![usize_type.to_handle()],
-        vec![add_val],
-        vec![],
-        0,
-    );
-    cast_op.deref_mut(ctx).set_loc(loc.clone());
-    MirCastOp::new(cast_op).set_attr_cast_kind(ctx, MirCastKindAttr::IntToInt);
-    cast_op.insert_after(ctx, add_op);
-    let result_val = cast_op.deref(ctx).get_result(0);
-
-    emit_store_result_and_goto(
-        ctx,
-        destination,
-        result_val,
-        target,
-        block_ptr,
-        cast_op,
-        value_map,
-        block_map,
-        loc,
-        "Call terminator without target not supported",
-    )
-}
-
-/// Emits `index_2d_row() = blockIdx.y * blockDim.y + threadIdx.y`
-#[allow(clippy::too_many_arguments)]
-pub fn emit_index_2d_row(
-    ctx: &mut Context,
-    destination: &mir::Place,
-    target: &Option<usize>,
-    block_ptr: Ptr<BasicBlock>,
-    prev_op: Option<Ptr<Operation>>,
-    value_map: &mut ValueMap,
-    block_map: &[Ptr<BasicBlock>],
-    loc: Location,
-) -> TranslationResult<Ptr<Operation>> {
-    let u32_type = IntegerType::get(ctx, 32, Signedness::Unsigned);
-    let usize_type = types::get_usize_type(ctx);
-
-    // Emit threadIdx.y
-    let tid_op = Operation::new(
-        ctx,
-        ReadPtxSregTidYOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![],
-        vec![],
-        0,
-    );
-    tid_op.deref_mut(ctx).set_loc(loc.clone());
-    let tid_op = match prev_op {
-        Some(prev) => {
-            tid_op.insert_after(ctx, prev);
-            tid_op
-        }
-        None => {
-            tid_op.insert_at_front(block_ptr, ctx);
-            tid_op
-        }
-    };
-    let tid_val = tid_op.deref(ctx).get_result(0);
-
-    // Emit blockIdx.y
-    let bid_op = Operation::new(
-        ctx,
-        ReadPtxSregCtaidYOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![],
-        vec![],
-        0,
-    );
-    bid_op.deref_mut(ctx).set_loc(loc.clone());
-    bid_op.insert_after(ctx, tid_op);
-    let bid_val = bid_op.deref(ctx).get_result(0);
-
-    // Emit blockDim.y
-    let bdim_op = Operation::new(
-        ctx,
-        ReadPtxSregNtidYOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![],
-        vec![],
-        0,
-    );
-    bdim_op.deref_mut(ctx).set_loc(loc.clone());
-    bdim_op.insert_after(ctx, bid_op);
-    let bdim_val = bdim_op.deref(ctx).get_result(0);
-
-    // Emit bid * bdim
-    let mul_op = Operation::new(
-        ctx,
-        MirMulOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![bid_val, bdim_val],
-        vec![],
-        0,
-    );
-    mul_op.deref_mut(ctx).set_loc(loc.clone());
-    mul_op.insert_after(ctx, bdim_op);
-    let mul_val = mul_op.deref(ctx).get_result(0);
-
-    // Emit (bid * bdim) + tid
-    let add_op = Operation::new(
-        ctx,
-        MirAddOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![mul_val, tid_val],
-        vec![],
-        0,
-    );
-    add_op.deref_mut(ctx).set_loc(loc.clone());
-    add_op.insert_after(ctx, mul_op);
-    let add_val = add_op.deref(ctx).get_result(0);
-
-    // Cast u32 to usize
-    let cast_op = Operation::new(
-        ctx,
-        MirCastOp::get_concrete_op_info(),
-        vec![usize_type.to_handle()],
-        vec![add_val],
-        vec![],
-        0,
-    );
-    cast_op.deref_mut(ctx).set_loc(loc.clone());
-    MirCastOp::new(cast_op).set_attr_cast_kind(ctx, MirCastKindAttr::IntToInt);
-    cast_op.insert_after(ctx, add_op);
-    let result_val = cast_op.deref(ctx).get_result(0);
-
-    emit_store_result_and_goto(
-        ctx,
-        destination,
-        result_val,
-        target,
-        block_ptr,
-        cast_op,
-        value_map,
-        block_map,
-        loc,
-        "Call terminator without target not supported",
-    )
-}
-
-/// Emits `index_2d_col() = blockIdx.x * blockDim.x + threadIdx.x`
-///
-/// This is the same computation as `index_1d`.
-#[allow(clippy::too_many_arguments)]
-pub fn emit_index_2d_col(
-    ctx: &mut Context,
-    destination: &mir::Place,
-    target: &Option<usize>,
-    block_ptr: Ptr<BasicBlock>,
-    prev_op: Option<Ptr<Operation>>,
-    value_map: &mut ValueMap,
-    block_map: &[Ptr<BasicBlock>],
-    loc: Location,
-) -> TranslationResult<Ptr<Operation>> {
-    emit_index_1d_expansion(
-        ctx,
-        destination,
-        target,
-        block_ptr,
-        prev_op,
-        value_map,
-        block_map,
-        loc,
-    )
+) -> Ptr<Operation> {
+    let op = Operation::new(ctx, opid, vec![result_type], vec![], vec![], 0);
+    op.deref_mut(ctx).set_loc(loc);
+    let op_name = Operation::get_opid(op, ctx).to_string();
+    let marker = cuda_oxide_codegen::__private::generated_intrinsic_marker_by_op_name(&op_name)
+        .unwrap_or_else(|| panic!("generated sreg op `{op_name}` has no generated target record"));
+    set_generated_intrinsic_marker(ctx, op, marker);
+    op
 }
 
 /// Emits `row * stride + col` for `index_2d::<S>()` and `index_2d_runtime(s)`.
@@ -350,15 +104,12 @@ pub fn emit_index_2d(
     };
 
     // Emit row = blockIdx.y * blockDim.y + threadIdx.y
-    let tid_y_op = Operation::new(
+    let tid_y_op = generated_sreg_op(
         ctx,
         ReadPtxSregTidYOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![],
-        vec![],
-        0,
+        u32_type.to_handle(),
+        loc.clone(),
     );
-    tid_y_op.deref_mut(ctx).set_loc(loc.clone());
     match last_op {
         Some(prev) => tid_y_op.insert_after(ctx, prev),
         None => tid_y_op.insert_at_front(block_ptr, ctx),
@@ -366,28 +117,22 @@ pub fn emit_index_2d(
     let tid_y_val = tid_y_op.deref(ctx).get_result(0);
     last_op = Some(tid_y_op);
 
-    let bid_y_op = Operation::new(
+    let bid_y_op = generated_sreg_op(
         ctx,
         ReadPtxSregCtaidYOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![],
-        vec![],
-        0,
+        u32_type.to_handle(),
+        loc.clone(),
     );
-    bid_y_op.deref_mut(ctx).set_loc(loc.clone());
     bid_y_op.insert_after(ctx, last_op.unwrap());
     let bid_y_val = bid_y_op.deref(ctx).get_result(0);
     last_op = Some(bid_y_op);
 
-    let bdim_y_op = Operation::new(
+    let bdim_y_op = generated_sreg_op(
         ctx,
         ReadPtxSregNtidYOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![],
-        vec![],
-        0,
+        u32_type.to_handle(),
+        loc.clone(),
     );
-    bdim_y_op.deref_mut(ctx).set_loc(loc.clone());
     bdim_y_op.insert_after(ctx, last_op.unwrap());
     let bdim_y_val = bdim_y_op.deref(ctx).get_result(0);
     last_op = Some(bdim_y_op);
@@ -434,41 +179,32 @@ pub fn emit_index_2d(
     last_op = Some(row_op);
 
     // Emit col = blockIdx.x * blockDim.x + threadIdx.x
-    let tid_x_op = Operation::new(
+    let tid_x_op = generated_sreg_op(
         ctx,
         ReadPtxSregTidXOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![],
-        vec![],
-        0,
+        u32_type.to_handle(),
+        loc.clone(),
     );
-    tid_x_op.deref_mut(ctx).set_loc(loc.clone());
     tid_x_op.insert_after(ctx, last_op.unwrap());
     let tid_x_val = tid_x_op.deref(ctx).get_result(0);
     last_op = Some(tid_x_op);
 
-    let bid_x_op = Operation::new(
+    let bid_x_op = generated_sreg_op(
         ctx,
         ReadPtxSregCtaidXOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![],
-        vec![],
-        0,
+        u32_type.to_handle(),
+        loc.clone(),
     );
-    bid_x_op.deref_mut(ctx).set_loc(loc.clone());
     bid_x_op.insert_after(ctx, last_op.unwrap());
     let bid_x_val = bid_x_op.deref(ctx).get_result(0);
     last_op = Some(bid_x_op);
 
-    let bdim_x_op = Operation::new(
+    let bdim_x_op = generated_sreg_op(
         ctx,
         ReadPtxSregNtidXOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
-        vec![],
-        vec![],
-        0,
+        u32_type.to_handle(),
+        loc.clone(),
     );
-    bdim_x_op.deref_mut(ctx).set_loc(loc.clone());
     bdim_x_op.insert_after(ctx, last_op.unwrap());
     let bdim_x_val = bdim_x_op.deref(ctx).get_result(0);
     last_op = Some(bdim_x_op);
@@ -553,6 +289,64 @@ pub fn emit_index_2d(
         loc,
         "Call terminator without target not supported",
     )
+}
+
+/// Load the `DisjointSlice` value behind a method receiver.
+///
+/// `DisjointSlice::len` has an `&self` receiver, so fully monomorphized MIR
+/// passes a `mir.ptr<mir.disjoint_slice<T>>`. Keep that source-level contract
+/// explicit: accept exactly one pointer layer whose pointee is the compiler's
+/// `MirDisjointSliceType`, and reject every other shape instead of guessing.
+fn load_disjoint_slice_receiver(
+    ctx: &mut Context,
+    receiver: Value,
+    block_ptr: Ptr<BasicBlock>,
+    last_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Ptr<Operation>)> {
+    let receiver_ty = receiver.get_type(ctx);
+    let pointee = {
+        let receiver_ty_obj = receiver_ty.deref(ctx);
+        let pointee = receiver_ty_obj
+            .downcast_ref::<dialect_mir::types::MirPtrType>()
+            .map(|ptr_ty| ptr_ty.pointee);
+        match pointee {
+            Some(pointee)
+                if pointee
+                    .deref(ctx)
+                    .downcast_ref::<dialect_mir::types::MirDisjointSliceType>()
+                    .is_some() =>
+            {
+                pointee
+            }
+            _ => {
+                return input_err!(
+                    loc,
+                    TranslationErr::type_error(
+                        "DisjointSlice::len receiver must be a pointer to mir.disjoint_slice"
+                            .to_string(),
+                    )
+                );
+            }
+        }
+    };
+
+    let load_op = Operation::new(
+        ctx,
+        dialect_mir::ops::MirLoadOp::get_concrete_op_info(),
+        vec![pointee],
+        vec![receiver],
+        vec![],
+        0,
+    );
+    load_op.deref_mut(ctx).set_loc(loc);
+    match last_op {
+        Some(prev) => load_op.insert_after(ctx, prev),
+        None => load_op.insert_at_front(block_ptr, ctx),
+    }
+
+    let loaded_val = load_op.deref(ctx).get_result(0);
+    Ok((loaded_val, load_op))
 }
 
 /// Emits `DisjointSlice::get_thread_local(&self, idx) -> &mut T`.
@@ -804,7 +598,7 @@ pub fn emit_len(
     }
 
     // Get the DisjointSlice value (arg 0)
-    let (disjoint_slice_val, mut last_op) = match &args[0] {
+    let (disjoint_slice_val, last_op) = match &args[0] {
         mir::Operand::Copy(place) | mir::Operand::Move(place) => {
             rvalue::translate_place(ctx, body, place, value_map, block_ptr, prev_op, loc.clone())?
         }
@@ -815,6 +609,10 @@ pub fn emit_len(
             );
         }
     };
+
+    let (disjoint_slice_val, load_op) =
+        load_disjoint_slice_receiver(ctx, disjoint_slice_val, block_ptr, last_op, loc.clone())?;
+    let mut last_op = Some(load_op);
 
     // Extract len field (field 1) from DisjointSlice
     // DisjointSlice layout: { ptr: *mut T, len: usize, _marker: PhantomData }
@@ -856,4 +654,123 @@ pub fn emit_len(
         loc,
         "len call without target block",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dialect_mir::ops::MirLoadOp;
+    use dialect_mir::types::{MirDisjointSliceType, MirPtrType, MirSliceType};
+    use pliron::builtin::attributes::StringAttr;
+    use pliron::common_traits::Verify;
+    use pliron::identifier::Identifier;
+    use pliron::linked_list::ContainsLinkedList;
+
+    #[test]
+    fn disjoint_slice_len_receiver_loads_exactly_one_typed_pointer_layer() {
+        let mut ctx = Context::new();
+        crate::translator::register_dialects(&mut ctx);
+
+        let element_ty = IntegerType::get(&ctx, 32, Signedness::Unsigned).to_handle();
+        let disjoint_ty: pliron::r#type::TypeHandle =
+            MirDisjointSliceType::get(&mut ctx, element_ty).into();
+        let receiver_ty = MirPtrType::get_generic(&mut ctx, disjoint_ty, false);
+        let block = BasicBlock::new(&mut ctx, None, vec![receiver_ty.into()]);
+        let receiver = block.deref(&ctx).get_argument(0);
+
+        let (loaded, load_op) =
+            load_disjoint_slice_receiver(&mut ctx, receiver, block, None, Location::Unknown)
+                .expect("a pointer to MirDisjointSliceType is the len receiver shape");
+
+        assert_eq!(loaded.get_type(&ctx), disjoint_ty);
+        assert_eq!(block.deref(&ctx).iter(&ctx).count(), 1);
+        let load = MirLoadOp::new(load_op);
+        assert_eq!(load.address_opd(&ctx), receiver);
+        assert!(load.verify(&ctx).is_ok());
+    }
+
+    #[test]
+    fn disjoint_slice_len_receiver_rejects_near_miss_shapes() {
+        let mut ctx = Context::new();
+        crate::translator::register_dialects(&mut ctx);
+
+        let element_ty = IntegerType::get(&ctx, 32, Signedness::Unsigned).to_handle();
+        let disjoint_ty: pliron::r#type::TypeHandle =
+            MirDisjointSliceType::get(&mut ctx, element_ty).into();
+        let receiver_ty: pliron::r#type::TypeHandle =
+            MirPtrType::get_generic(&mut ctx, disjoint_ty, false).into();
+
+        // `len(&self)` always supplies one pointer layer. A direct fat value
+        // or another pointer layer indicates a broken caller/translation and
+        // must not be accepted by recursively guessing at the representation.
+        for near_miss_ty in [disjoint_ty, {
+            MirPtrType::get_generic(&mut ctx, receiver_ty, false).into()
+        }] {
+            let block = BasicBlock::new(&mut ctx, None, vec![near_miss_ty]);
+            let receiver = block.deref(&ctx).get_argument(0);
+            assert!(
+                load_disjoint_slice_receiver(&mut ctx, receiver, block, None, Location::Unknown,)
+                    .is_err()
+            );
+            assert_eq!(block.deref(&ctx).iter(&ctx).count(), 0);
+        }
+
+        // An ordinary Rust slice is also a `(ptr, len)` carrier, but it is not
+        // a DisjointSlice receiver and must not pass a shape-only check.
+        let ordinary_slice_ty: pliron::r#type::TypeHandle =
+            MirSliceType::get(&mut ctx, element_ty).into();
+        let ordinary_receiver_ty = MirPtrType::get_generic(&mut ctx, ordinary_slice_ty, false);
+        let block = BasicBlock::new(&mut ctx, None, vec![ordinary_receiver_ty.into()]);
+        let receiver = block.deref(&ctx).get_argument(0);
+        assert!(
+            load_disjoint_slice_receiver(&mut ctx, receiver, block, None, Location::Unknown,)
+                .is_err()
+        );
+        assert_eq!(block.deref(&ctx).iter(&ctx).count(), 0);
+    }
+
+    #[test]
+    fn index_1d_sreg_ops_carry_their_exact_generated_markers() {
+        let mut ctx = Context::new();
+        dialect_nvvm::register(&mut ctx);
+        let result_type = IntegerType::get(&ctx, 32, Signedness::Unsigned).to_handle();
+        let ops = [
+            (
+                generated_sreg_op(
+                    &mut ctx,
+                    ReadPtxSregTidXOp::get_concrete_op_info(),
+                    result_type,
+                    Location::Unknown,
+                ),
+                "v1:i0001",
+            ),
+            (
+                generated_sreg_op(
+                    &mut ctx,
+                    ReadPtxSregCtaidXOp::get_concrete_op_info(),
+                    result_type,
+                    Location::Unknown,
+                ),
+                "v1:i0002",
+            ),
+            (
+                generated_sreg_op(
+                    &mut ctx,
+                    ReadPtxSregNtidXOp::get_concrete_op_info(),
+                    result_type,
+                    Location::Unknown,
+                ),
+                "v1:i0003",
+            ),
+        ];
+        let key =
+            Identifier::try_from(cuda_oxide_codegen::__private::GENERATED_INTRINSIC_MARKER_ATTR)
+                .unwrap();
+
+        for (op, expected) in ops {
+            let op_ref = op.deref(&ctx);
+            let marker: &StringAttr = op_ref.attributes.get(&key).unwrap();
+            assert_eq!(String::from(marker.clone()), expected);
+        }
+    }
 }

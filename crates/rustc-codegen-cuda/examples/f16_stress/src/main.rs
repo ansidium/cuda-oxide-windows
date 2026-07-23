@@ -7,7 +7,7 @@
 
 //! Rust primitive `f16` stress test.
 //!
-//! Exercises first-class Rust nightly `f16` through MIR import, lowering to LLVM
+//! Exercises Rust's unstable `f16` through MIR import, lowering to LLVM
 //! `half`, constants, memory traffic, arithmetic, comparisons, and casts.
 //!
 //! Run: cargo oxide run f16_stress

@@ -15,7 +15,7 @@
       "upgradePackages": false
     },
     "ghcr.io/devcontainers/features/rust:1": {
-      "version": "nightly-2026-05-22",
+      "version": "stable",
       "profile": "minimal",
       "components": "rust-src,rustc-dev,rust-analyzer,rustfmt,clippy,llvm-tools"
     }

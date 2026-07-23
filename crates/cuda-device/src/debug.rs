@@ -37,193 +37,8 @@
 //! }
 //! ```
 
-// =============================================================================
-// Clock/Timing Intrinsics
-// =============================================================================
-
-/// Read the GPU clock counter (32-bit).
-///
-/// Returns the current value of a per-SM clock counter. Useful for micro-benchmarking
-/// kernel code by measuring elapsed cycles between operations.
-///
-/// # Returns
-///
-/// A 32-bit clock cycle count. Note that this wraps around relatively quickly
-/// (~4 billion cycles). For longer measurements, use [`clock64()`].
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use cuda_device::debug;
-///
-/// let start = debug::clock();
-/// // ... some computation ...
-/// let end = debug::clock();
-/// let cycles = end.wrapping_sub(start);
-/// ```
-///
-/// # Notes
-///
-/// - Clock frequency varies by GPU and power state
-/// - Different SMs may have slightly different clock values
-/// - Use for relative timing within a kernel, not absolute time
-#[inline(never)]
-pub fn clock() -> u32 {
-    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.clock()
-    unreachable!("clock called outside CUDA kernel context")
-}
-
-/// Read the GPU clock counter (64-bit).
-///
-/// Returns the current value of a per-SM clock counter as a 64-bit value.
-/// Preferred over [`clock()`] for measurements that might exceed 32-bit range.
-///
-/// # Returns
-///
-/// A 64-bit clock cycle count that won't wrap around for practical measurements.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use cuda_device::debug;
-///
-/// let start = debug::clock64();
-/// // ... some computation ...
-/// let end = debug::clock64();
-/// let cycles = end - start;  // No wrapping concerns
-/// ```
-///
-/// # Notes
-///
-/// - Clock frequency varies by GPU and power state
-/// - Different SMs may have slightly different clock values
-/// - Use for relative timing within a kernel, not absolute time
-#[inline(never)]
-pub fn clock64() -> u64 {
-    // Lowered to: call i64 @llvm.nvvm.read.ptx.sreg.clock64()
-    unreachable!("clock64 called outside CUDA kernel context")
-}
-
-/// Read the GPU global timer.
-///
-/// Returns a 64-bit timer value from PTX `%globaltimer`. Unlike [`clock64()`],
-/// this is a global timer source, so it is preferable when measuring interactions
-/// that may span multiple SMs.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use cuda_device::debug;
-///
-/// let start = debug::globaltimer();
-/// // ... operation to measure ...
-/// let end = debug::globaltimer();
-/// let ticks = end.wrapping_sub(start);
-/// ```
-#[inline(never)]
-pub fn globaltimer() -> u64 {
-    // Lowered to: call i64 @llvm.nvvm.read.ptx.sreg.globaltimer()
-    unreachable!("globaltimer called outside CUDA kernel context")
-}
-
-// =============================================================================
-// Trap/Abort Intrinsics
-// =============================================================================
-
-/// Abort kernel execution immediately.
-///
-/// This is equivalent to `__trap()` in CUDA C/C++. When any thread executes
-/// `trap()`, the kernel is terminated and an error is reported to the host.
-///
-/// # Use Cases
-///
-/// - Runtime error checking (like `assert` but unconditional)
-/// - Detecting invalid states that should never occur
-/// - Debugging to stop execution at a specific point
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use cuda_device::debug;
-///
-/// if invalid_condition {
-///     debug::trap();  // Kernel dies here
-/// }
-/// ```
-///
-/// # Notes
-///
-/// - The kernel terminates with an error status
-/// - No error message is provided (use `gpu_assert!` for messages)
-/// - Host will see a CUDA error when synchronizing
-#[inline(never)]
-pub fn trap() -> ! {
-    // Lowered to: call void @llvm.nvvm.trap()
-    unreachable!("trap called outside CUDA kernel context")
-}
-
-// =============================================================================
-// Debugging Intrinsics
-// =============================================================================
-
-/// Insert a breakpoint for cuda-gdb.
-///
-/// When debugging with cuda-gdb, execution will stop at this point.
-/// This is equivalent to `__brkpt()` in CUDA C/C++.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use cuda_device::debug;
-///
-/// // Only break on thread 0 to avoid overwhelming the debugger
-/// if thread::index_1d().get() == 0 {
-///     debug::breakpoint();
-/// }
-/// ```
-///
-/// # Notes
-///
-/// - Only effective when running under cuda-gdb
-/// - Without cuda-gdb, this is typically a no-op or trap
-/// - Be careful about placing breakpoints in divergent code
-#[inline(never)]
-pub fn breakpoint() {
-    // Lowered to: call void @llvm.nvvm.brkpt() or inline PTX "brkpt;"
-    unreachable!("breakpoint called outside CUDA kernel context")
-}
-
-/// Signal the NVIDIA profiler at a specific point.
-///
-/// Triggers a profiler event that can be viewed in Nsight Systems or
-/// Nsight Compute. The counter `N` identifies the trigger point.
-///
-/// This is equivalent to `__prof_trigger(N)` in CUDA C/C++.
-///
-/// # Type Parameters
-///
-/// * `N` - The profiler counter ID (0-15 typically)
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use cuda_device::debug;
-///
-/// debug::prof_trigger::<0>();  // Mark start of region
-/// // ... computation ...
-/// debug::prof_trigger::<1>();  // Mark end of region
-/// ```
-///
-/// # Notes
-///
-/// - Useful for marking regions of interest in profiler traces
-/// - Counter IDs should be consistent across kernel invocations
-/// - Has minimal overhead when not profiling
-#[inline(never)]
-pub fn prof_trigger<const N: u32>() {
-    // Lowered to: inline PTX "pmevent N;"
-    unreachable!("prof_trigger called outside CUDA kernel context")
-}
+include!("generated/debug_sreg.rs");
+include!("generated/debug_control.rs");
 
 // =============================================================================
 // Assertion Macro
@@ -242,21 +57,23 @@ pub fn prof_trigger<const N: u32>() {
 /// // Simple assertion
 /// gpu_assert!(x >= 0);
 ///
-/// // With custom message (message is ignored in current impl)
+/// // With a custom string-literal message
 /// gpu_assert!(idx < len, "Index out of bounds");
 /// ```
 ///
 /// # Behavior
 ///
 /// When the condition is false:
-/// - The kernel execution is aborted via `trap()`
+/// - The no-message form aborts kernel execution via [`trap()`]
+/// - The message form reports the message and call-site metadata via CUDA's
+///   device-side `__assertfail` system call
 /// - The CUDA driver reports an error to the host
 /// - Other threads may continue briefly before the error propagates
 ///
 /// # Notes
 ///
 /// - Use sparingly in performance-critical code
-/// - The message argument is currently ignored (will be supported with assertfail)
+/// - Custom messages must be string literals
 /// - For debugging, consider using [`breakpoint()`] instead
 #[macro_export]
 macro_rules! gpu_assert {
@@ -265,12 +82,85 @@ macro_rules! gpu_assert {
             $crate::debug::trap();
         }
     };
-    ($cond:expr, $msg:expr) => {
+    ($cond:expr, $msg:literal) => {{
         if !$cond {
-            // TODO (npasham): Use llvm.nvvm.assertfail for better error messages with file/line
-            $crate::debug::trap();
+            const __GPU_ASSERT_MESSAGE_TEXT: &str = $msg;
+            const __GPU_ASSERT_MESSAGE: [u8; __GPU_ASSERT_MESSAGE_TEXT.len() + 1] =
+                $crate::debug::__gpu_assert_c_string::<{ __GPU_ASSERT_MESSAGE_TEXT.len() + 1 }>(
+                    __GPU_ASSERT_MESSAGE_TEXT,
+                );
+
+            const __GPU_ASSERT_FILE_TEXT: &str = file!();
+            const __GPU_ASSERT_FILE: [u8; __GPU_ASSERT_FILE_TEXT.len() + 1] =
+                $crate::debug::__gpu_assert_c_string::<{ __GPU_ASSERT_FILE_TEXT.len() + 1 }>(
+                    __GPU_ASSERT_FILE_TEXT,
+                );
+
+            const __GPU_ASSERT_FUNCTION_TEXT: &str = module_path!();
+            const __GPU_ASSERT_FUNCTION: [u8; __GPU_ASSERT_FUNCTION_TEXT.len() + 1] =
+                $crate::debug::__gpu_assert_c_string::<{ __GPU_ASSERT_FUNCTION_TEXT.len() + 1 }>(
+                    __GPU_ASSERT_FUNCTION_TEXT,
+                );
+
+            $crate::debug::__gpu_assertfail(
+                __GPU_ASSERT_MESSAGE.as_ptr(),
+                __GPU_ASSERT_FILE.as_ptr(),
+                line!(),
+                __GPU_ASSERT_FUNCTION.as_ptr(),
+                1,
+            );
         }
+    }};
+    ($cond:expr, $msg:expr) => {
+        compile_error!("gpu_assert! messages must be string literals")
     };
+}
+
+/// Builds a null-terminated byte array for CUDA assertion metadata.
+///
+/// This helper is public only because [`gpu_assert!`] expands in downstream
+/// crates. It is evaluated at compile time by the message form of the macro.
+#[doc(hidden)]
+pub const fn __gpu_assert_c_string<const N: usize>(value: &str) -> [u8; N] {
+    let bytes = value.as_bytes();
+    assert!(
+        N == bytes.len() + 1,
+        "GPU assertion C string has an invalid length"
+    );
+
+    let mut output = [0; N];
+    let mut index = 0;
+    while index < bytes.len() {
+        assert!(
+            bytes[index] != 0,
+            "gpu_assert! strings must not contain NUL bytes"
+        );
+        output[index] = bytes[index];
+        index += 1;
+    }
+    output
+}
+
+/// Internal CUDA assertion-failure wrapper.
+///
+/// This function is recognized by the cuda-oxide compiler and lowered to
+/// CUDA's device-side `__assertfail(message, file, line, function, char_size)`
+/// system call. Do not call directly.
+///
+/// # Safety
+///
+/// This function only works within CUDA kernel context. Calling it from host
+/// code will panic.
+#[doc(hidden)]
+#[inline(never)]
+pub fn __gpu_assertfail(
+    _message: *const u8,
+    _file: *const u8,
+    _line: u32,
+    _function: *const u8,
+    _char_size: usize,
+) {
+    unreachable!("__gpu_assertfail called outside CUDA kernel context")
 }
 
 // =============================================================================
