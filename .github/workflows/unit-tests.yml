@@ -181,11 +181,15 @@ jobs:
       - name: Check generated intrinsic outputs
         run: cargo run -p cuda-intrinsics-gen -- check
 
-      - name: Probe every generated LLVM-NVPTX route
+      - name: Probe every generated LLVM-NVPTX route with the current toolchain
         run: |
-          # Stock runners do not carry the recorded CUDA 13.3 ptxas binary.
-          # This still checks the pinned llc identity and exact emitted PTX.
-          cargo run -p cuda-intrinsics-gen -- probe --all --skip-terminal
+          # Stock runners do not carry the recorded ptxas binary.
+          # Stable tracks the current Rust release, while checked-in evidence
+          # remains tied to the backend that produced it. Probe stable as an
+          # explicit comparison backend and still require exact emitted PTX.
+          toolchain_libdir="$(rustc --print target-libdir)"
+          llc="$(dirname "${toolchain_libdir}")/bin/llc"
+          cargo run -p cuda-intrinsics-gen -- probe --all --llc "${llc}" --skip-terminal
 
       - name: Check append-only intrinsic ABI ledger
         run: |

@@ -547,10 +547,9 @@ pub fn is_fully_monomorphized<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>)
 /// may not call into `std`, so our "no std on the GPU" guard would normally
 /// reject the call.
 ///
-/// We never actually run `std` here: mir-importer rewrites each of these
-/// names to the matching NVIDIA libdevice function (`__nv_tan`, `__nv_sinh`,
-/// ...). This list just tells the guard "these are fine, we handle them."
-/// Keep it in sync with the `std::sys::cmath` matches in float_math.rs.
+/// We never actually run `std` here: mir-importer rewrites each recognized
+/// name to the matching NVIDIA libdevice function (`__nv_tan`, `__nv_sinh`,
+/// ...). Reuse its dispatch table so collection and lowering cannot drift.
 ///
 /// A few functions (`sin`, `cos`, `exp`, ...) take a different, allowed route
 /// on this toolchain: the compiler lowers them to a builtin in `core`, so
@@ -559,37 +558,11 @@ pub fn is_fully_monomorphized<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>)
 /// case a build ever takes the `std` route too. Only `std::`-prefixed names
 /// belong here; `core`-based shims are already allowed.
 fn is_intrinsic_lowered_cmath_shim(fn_path: &str) -> bool {
-    matches!(
-        fn_path,
-        "std::sys::cmath::sinf"
-            | "std::sys::cmath::sin"
-            | "std::sys::cmath::cosf"
-            | "std::sys::cmath::cos"
-            | "std::sys::cmath::tanf"
-            | "std::sys::cmath::tan"
-            | "std::sys::cmath::asinf"
-            | "std::sys::cmath::asin"
-            | "std::sys::cmath::acosf"
-            | "std::sys::cmath::acos"
-            | "std::sys::cmath::atan2f"
-            | "std::sys::cmath::atan2"
-            | "std::sys::cmath::atanf"
-            | "std::sys::cmath::atan"
-            | "std::sys::cmath::cbrtf"
-            | "std::sys::cmath::cbrt"
-            | "std::sys::cmath::sinhf"
-            | "std::sys::cmath::sinh"
-            | "std::sys::cmath::coshf"
-            | "std::sys::cmath::cosh"
-            | "std::sys::cmath::tanhf"
-            | "std::sys::cmath::tanh"
-            | "std::sys::cmath::expm1f"
-            | "std::sys::cmath::expm1"
-            | "std::sys::cmath::log1pf"
-            | "std::sys::cmath::log1p"
-            | "std::sys::cmath::hypotf"
-            | "std::sys::cmath::hypot"
-    )
+    fn_path.starts_with("std::sys::cmath::")
+        && mir_importer::translator::terminator::intrinsics::float_math::RustFloatMathIntrinsic::from_core_path(
+            fn_path,
+        )
+        .is_some()
 }
 
 /// Returns true for hidden `cuda_device::ptx_asm!` marker functions.

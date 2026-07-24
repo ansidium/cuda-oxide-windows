@@ -7,15 +7,9 @@
 //! in a kernel: `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`,
 //! `exp_m1`, `ln_1p`, and `hypot`.
 //!
-//! Six of these (`sinh`, `cosh`, `tanh`, `exp_m1`, `ln_1p`, `hypot`) lower
-//! to a `std::sys::cmath::*` shim and previously failed the "FORBIDDEN CRATE
-//! IN DEVICE CODE" guard; the float-math dispatch now intercepts each and
-//! emits the matching `__nv_*` libdevice call (`__nv_sinh`, `__nv_hypot`,
-//! ...). The inverse hyperbolics (`asinh`, `acosh`, `atanh`) are pure-Rust
-//! formulas in `std` (compositions of `ln`/`sqrt`/`ln_1p`), so they need no
-//! new interception; `atanh` in particular only works once `ln_1p` is
-//! intercepted, which this change does. They are exercised here as a
-//! regression guard for that composition path.
+//! These methods may lower to `std::sys::cmath::*` shims depending on the Rust
+//! toolchain. The float-math dispatch intercepts those shims and emits the
+//! matching `__nv_*` libdevice calls.
 //!
 //! The host recomputes each expression with stdlib float methods and checks
 //! the GPU result against a small relative tolerance (transcendental
