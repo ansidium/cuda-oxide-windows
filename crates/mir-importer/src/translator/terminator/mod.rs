@@ -853,22 +853,21 @@ fn translate_drop(
 // Call Translation (includes intrinsic dispatch)
 // ============================================================================
 
-/// True when `fn_def` is `core::ptr::drop_in_place` itself, the only
-/// function whose monomorphizations resolve to rustc's drop-glue shims.
-/// Same crate + path-segment matching idiom as the callable-trait
-/// detection below.
-fn is_drop_in_place_callee(fn_def: &rustc_public::ty::FnDef) -> bool {
-    if fn_def.krate().name.as_str() != "core" {
-        return false;
-    }
-    let method_name = fn_def.def_id().name();
-    let method = method_name.as_str().rsplit("::").next().unwrap_or("");
-    let Some(parent_def) = fn_def.def_id().parent() else {
+/// True when `instance` is the compiler-selected drop glue for the type in
+/// `substs`.
+///
+/// Rust may expose that callee through different internal item names across
+/// toolchains. Resolve the canonical drop instance and compare identities
+/// instead of matching those names.
+fn is_drop_glue_instance(
+    instance: &rustc_public::mir::mono::Instance,
+    substs: &rustc_public::ty::GenericArgs,
+) -> bool {
+    let Some(rustc_public::ty::GenericArgKind::Type(dropped_ty)) = substs.0.first() else {
         return false;
     };
-    let parent_name = parent_def.name();
-    let parent = parent_name.as_str().rsplit("::").next().unwrap_or("");
-    method == "drop_in_place" && parent == "ptr"
+    let expected = rustc_public::mir::mono::Instance::resolve_drop_in_place(*dropped_ty);
+    instance.mangled_name() == expected.mangled_name()
 }
 
 /// Emit a branch to `target` as the only effect of a call we are eliding:
@@ -1010,16 +1009,14 @@ fn translate_call(
         }
     }
 
-    // Elide a call to provably no-op drop glue. An explicit
-    // `ptr::drop_in_place::<T>` call (e.g. reached from inside another type's
-    // `Drop::drop`, or from a libcore wrapper) resolves either to rustc's
-    // empty shim for a `T` with no drop glue (`InstanceKind::DropGlue(_,
-    // None)`) or to a shim body the shared no-op proof can discharge. The
-    // collector refuses to collect exactly that set (`process_call_operand`
-    // skips DropGlue callees via the same predicate), so emitting the call
-    // would dangle as `Symbol ...drop_in_place... not found` at verification
-    // time. The glue does nothing, so drop the call and branch straight to
-    // the target -- the same elision the `Drop` terminator path performs via
+    // Elide a call to provably no-op drop glue. A compiler-selected drop
+    // callee resolves either to an empty shim for a `T` with no drop glue
+    // (`InstanceKind::DropGlue(_, None)`) or to a shim body the shared no-op
+    // proof can discharge. The collector refuses to collect exactly that set
+    // (`process_call_operand` skips DropGlue callees via the same predicate),
+    // so emitting the call would leave a missing symbol at verification time.
+    // The glue does nothing, so drop the call and branch straight to the
+    // target -- the same elision the `Drop` terminator path performs via
     // `drop_glue_is_noop`, consulting the same shared predicate
     // (`drop_instance_is_noop`, whose fast path covers the empty shim) so
     // collection and emission stay in lockstep.
@@ -1029,8 +1026,8 @@ fn translate_call(
             fn_def,
             ref substs,
         )) = const_op.const_.ty().kind()
-        && is_drop_in_place_callee(&fn_def)
         && let Ok(instance) = rustc_public::mir::mono::Instance::resolve(fn_def, substs)
+        && is_drop_glue_instance(&instance, substs)
         && drop_glue::drop_instance_is_noop(&instance)
     {
         return Ok(emit_elided_call_goto(
