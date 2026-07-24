@@ -707,7 +707,7 @@ impl LibraryCandidate {
 fn open_library(tried: &mut Vec<String>, retain_exact_file: bool) -> Option<OpenedLibrary> {
     let override_path = std::env::var_os("LIBNVVM_PATH").map(PathBuf::from);
     let discovered = cuda_toolkit_discovery::libnvvm_dll_candidates(target_triple_hint());
-    let candidates = library_candidates(override_path, &discovered);
+    let candidates = library_candidates(override_path, &discovered, retain_exact_file);
     open_library_from_candidates(&candidates, tried, retain_exact_file)
 }
 
@@ -752,10 +752,17 @@ fn open_library_from_candidates(
 fn library_candidates(
     override_path: Option<PathBuf>,
     discovered_paths: &[PathBuf],
+    prefer_discovered_paths: bool,
 ) -> Vec<LibraryCandidate> {
     let mut candidates = Vec::new();
     if let Some(path) = override_path {
         candidates.push(LibraryCandidate::Path(path));
+    }
+
+    if prefer_discovered_paths {
+        for path in discovered_paths {
+            push_candidate_once(&mut candidates, LibraryCandidate::Path(path.clone()));
+        }
     }
 
     platform_library_candidates(&mut candidates, discovered_paths);
@@ -979,8 +986,9 @@ mod tests {
     fn candidate_descriptions(
         override_path: Option<PathBuf>,
         discovered_paths: &[PathBuf],
+        prefer_discovered_paths: bool,
     ) -> Vec<String> {
-        library_candidates(override_path, discovered_paths)
+        library_candidates(override_path, discovered_paths, prefer_discovered_paths)
             .iter()
             .map(LibraryCandidate::description)
             .collect()
@@ -997,8 +1005,11 @@ mod tests {
     #[test]
     fn direct_override_is_first_candidate() {
         let override_path = PathBuf::from(r"C:\custom\nvvm64_40_0.dll");
-        let descriptions =
-            candidate_descriptions(Some(override_path.clone()), &[PathBuf::from(r"C:\CUDA")]);
+        let descriptions = candidate_descriptions(
+            Some(override_path.clone()),
+            &[PathBuf::from(r"C:\CUDA")],
+            false,
+        );
 
         assert_eq!(descriptions[0], override_path.display().to_string());
     }
@@ -1013,7 +1024,7 @@ mod tests {
                 .join("x64")
                 .join("nvvm64_40_0.dll"),
         ];
-        let descriptions = candidate_descriptions(None, &discovered);
+        let descriptions = candidate_descriptions(None, &discovered, false);
 
         assert!(descriptions.contains(&"nvvm64_*.dll".to_string()));
         assert!(
@@ -1034,12 +1045,20 @@ mod tests {
     fn linux_candidates_preserve_loader_names_and_toolkit_path() {
         let root = PathBuf::from("/usr/local/cuda");
         let discovered = vec![root.join("nvvm/lib64/libnvvm.so")];
-        let descriptions = candidate_descriptions(None, &discovered);
+        let descriptions = candidate_descriptions(None, &discovered, false);
 
         assert_eq!(descriptions[0], "libnvvm.so.4");
         assert_eq!(descriptions[1], "libnvvm.so.3");
         assert_eq!(descriptions[2], "libnvvm.so");
         assert!(descriptions.contains(&root.join("nvvm/lib64/libnvvm.so").display().to_string()));
+    }
+
+    #[test]
+    fn cache_candidates_prefer_exact_toolkit_path() {
+        let path = PathBuf::from("toolkit/libnvvm");
+        let descriptions = candidate_descriptions(None, std::slice::from_ref(&path), true);
+
+        assert_eq!(descriptions[0], path.display().to_string());
     }
 
     #[test]
