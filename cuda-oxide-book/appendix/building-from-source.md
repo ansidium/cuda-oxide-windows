@@ -51,8 +51,10 @@ rustup update stable
 rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain stable
 ```
 
-`rust-src` provides the standard library source for cross-compilation and
-`rustc-dev` exposes compiler internals that the codegen backend links against.
+`rust-src` provides the standard library source for cross-compilation,
+`rustc-dev` exposes compiler internals that the codegen backend links against,
+and `llvm-tools` installs the toolchain-bundled `llc` used for PTX generation
+(also required by `cargo oxide doctor`).
 
 ## Install CUDA
 
@@ -203,8 +205,14 @@ Use `.\scripts\smoketest.ps1 -BuildOnly` on machines without an NVIDIA GPU.
 # Build and run an example
 cargo oxide run <example>
 
+# Print generated PTX only
+cargo oxide inspect <example>
+
 # Show the full compilation pipeline (MIR → LLVM IR → PTX)
 cargo oxide pipeline <example>
+
+# Remove local build outputs and generated artifacts
+cargo oxide clean
 
 # Run under NVIDIA Compute Sanitizer
 cargo oxide sanitize <example> --tool memcheck

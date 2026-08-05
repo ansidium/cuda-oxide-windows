@@ -131,9 +131,43 @@ function Assert-CurrentBranch {
     }
 }
 
+function Invoke-RustfmtCheck {
+    if (-not $IsWindows) {
+        Invoke-ExternalCommand -Name 'cargo fmt --all --check' -FilePath 'cargo' -ArgumentList @('fmt', '--all', '--check')
+        return
+    }
+
+    Assert-ToolAvailable 'rustfmt'
+
+    $generatedFile = 'crates/cuda-oxide-codegen/src/generated_intrinsic_targets.rs'
+    $upstreamRef = "$UpstreamRemote/$UpstreamBranch"
+    & git diff --quiet $upstreamRef -- $generatedFile
+    $generatedDiffStatus = $LASTEXITCODE
+    if ($generatedDiffStatus -eq 1) {
+        throw "$generatedFile differs from $upstreamRef; verify its formatting on a non-Windows host."
+    }
+    if ($generatedDiffStatus -ne 0) {
+        throw "git diff --quiet failed with exit code $generatedDiffStatus."
+    }
+
+    $trackedRust = Invoke-GitOutput 'git ls-files *.rs' @('ls-files', '--', '*.rs')
+    $rustFiles = @($trackedRust -split "`n" | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and $_ -ne $generatedFile
+    })
+
+    $batchSize = 64
+    for ($offset = 0; $offset -lt $rustFiles.Count; $offset += $batchSize) {
+        $last = [Math]::Min($offset + $batchSize - 1, $rustFiles.Count - 1)
+        $batch = @($rustFiles[$offset..$last])
+        $arguments = @('--check', '--edition', '2024', '--config', 'skip_children=true') + $batch
+        Invoke-ExternalCommand -Name 'rustfmt --check (Windows batch)' -FilePath 'rustfmt' -ArgumentList $arguments
+    }
+}
+
 function Invoke-Checks {
+    Invoke-RustfmtCheck
+
     $checks = @(
-        [pscustomobject]@{ Name = 'cargo fmt --all --check'; Args = @('fmt', '--all', '--check') },
         [pscustomobject]@{ Name = 'cargo test -p cargo-oxide'; Args = @('test', '-p', 'cargo-oxide') },
         [pscustomobject]@{ Name = 'cargo test -p cuda-core --lib'; Args = @('test', '-p', 'cuda-core', '--lib') },
         [pscustomobject]@{ Name = 'cargo test -p cuda-async'; Args = @('test', '-p', 'cuda-async') },

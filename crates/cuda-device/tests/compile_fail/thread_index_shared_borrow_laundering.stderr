@@ -1,19 +1,19 @@
 error[E0716]: temporary value dropped while borrowed
-  --> tests/compile_fail/thread_index_shared_borrow_laundering.rs:11:1
+  --> tests/compile_fail/thread_index_shared_borrow_laundering.rs:10:1
    |
-11 | #[device]
+10 | #[device]
    | ^^^^^^^^^
    | |
    | creates a temporary value which is freed while still in use
    | assignment requires that borrow lasts for `'static`
 ...
-17 | }
+16 | }
    | - temporary value is freed at the end of this statement
    |
    = note: this error originates in the attribute macro `device` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0507]: cannot move out of index of `SharedArray<ThreadIndex<'_>, 1>`
-  --> tests/compile_fail/thread_index_shared_borrow_laundering.rs:15:29
+  --> tests/compile_fail/thread_index_shared_borrow_laundering.rs:14:29
    |
-15 |         let _ = out.get_mut(COURIER[0]);
+14 |         let _ = out.get_mut(COURIER[0]);
    |                             ^^^^^^^^^^ move occurs because value has type `ThreadIndex<'_>`, which does not implement the `Copy` trait

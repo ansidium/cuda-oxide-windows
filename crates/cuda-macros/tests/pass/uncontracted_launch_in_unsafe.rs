@@ -13,10 +13,7 @@ mod kernels {
     }
 }
 
-fn launch_with_unsafe(
-    module: &kernels::LoadedModule,
-    stream: &cuda_core::CudaStream,
-) {
+fn launch_with_unsafe(module: &kernels::LoadedModule, stream: &cuda_core::CudaStream) {
     unsafe {
         module
             .uncontracted(

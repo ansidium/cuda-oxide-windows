@@ -33,7 +33,7 @@ roadmap, **N/A** = not applicable or no identified need.
 | ABI Scalarization | **Full** | Slices are scalarized at kernel boundaries (`&[T]` -> `(ptr, len)`, reconstructed inside the function). Structs and closures pass by value as one byval `.param`; field flattening still applies on internal device-to-device calls. |
 
 Array value constants support primitive leaves (integers, `f16`, `f32`,
-`f64`), nested arrays, and tuples recursively composed from supported scalar,
+`f64`), nested arrays, and tuples recursively composed of supported scalar,
 enum, tuple, and zero-sized fields. Tuple element strides and field offsets
 come from rustc layout, including internal and trailing padding; direct tuple
 value constants use the same layout-aware decoder. Struct constants (direct
@@ -41,9 +41,19 @@ and promoted-by-reference) also read every field at its rustc layout offset,
 so padded, reordered, `#[repr(C)]`, and nested shapes decode correctly, and a
 struct's stored size is its padded size, which fixes the element stride for
 arrays of padded structs inside constants. Arrays whose elements are structs
-or initialized unions are not yet materialized as constants. Pointer-bearing
-array, tuple, and struct constants are rejected with a diagnostic until
-aggregate relocations can be represented without losing provenance.
+or initialized unions are not yet materialized as constants. Thin pointer
+fields in array, tuple, and struct **const** values that relocate to device
+statics are materialized via `MirGlobalAllocOp` per field, including
+non-zero byte addends into a static (see `struct_constant_provenance`,
+`tuple_constant_provenance`, `tuple_array_provenance`). Fat pointers, enum
+constants with relocations, and device-global *initializer* relocations
+remain rejected.
+
+Enum constants with direct thin-reference payloads preserve relocations to
+device statics, including non-zero byte addends. This includes niche-encoded
+`Option<&T>` and direct-tagged enum layouts. Anonymous promoted allocations and
+pointer relocations nested inside array, tuple, struct, or enum payload fields
+remain unsupported.
 
 ## Compiler: Closures
 
@@ -103,6 +113,8 @@ aggregate relocations can be represented without losing provenance.
 | LTOIR Linking | **Full** | Device-side LTO via libNVVM and nvJitLink. |
 | Float Math Intrinsics (libdevice) | **Full** | Rust `f32`/`f64` math methods (`sin`, `cos`, `exp`, `pow`, `sqrt`, ...) lower to CUDA libdevice (`__nv_*`) on pre-Blackwell and Blackwell GPUs. cuda-oxide selects the matching NVVM IR syntax automatically. On Blackwell, the runtime can also JIT PTX produced from a standard pre-Blackwell target such as `sm_86`. |
 | Pipeline Inspection | **Full** | `cargo oxide pipeline <example>` shows imported and post-`mem2reg` MIR, LLVM dialect, exported LLVM IR, and PTX. |
+| PTX Inspect | **Full** | `cargo oxide inspect <example>` builds and prints generated PTX without the full pipeline dump. |
+| Local Clean | **Full** | `cargo oxide clean` removes project-local `target/` directories and generated device artifacts (`.ptx`, `.ll`, `.opt.ll`, `.ltoir`, `.cubin`, `.target`, `.options`, `.cubin.target`), never the shared `~/.cargo/cuda-oxide/` cache. |
 | Compute Sanitizer Wrapper | **Full** | `cargo oxide sanitize <example>` builds the example and runs the host binary under NVIDIA Compute Sanitizer (`memcheck`, `racecheck`, `initcheck`, or `synccheck`). |
 | cuda-gdb Source Debugging | **Full** | `cargo oxide debug` builds device debug information on the PTX path and launches `cuda-gdb`. Legacy NVVM IR does not yet support debug metadata. |
 | cuda-gdb Local / Argument Inspection | **Partial** | `CUDA_OXIDE_DEBUG=full` is a `-G`-style build (optimization off, locals kept in memory) so `info args`/`info locals` show real values for scalars, pointers/references, and structs/tuples/arrays with their fields. Enums, ABI-split bare slices, closures, and projections (`x.0`) are not yet described. |
@@ -111,7 +123,7 @@ aggregate relocations can be represented without losing provenance.
 
 | Feature | Status | Description |
 |:--------|:-------|:------------|
-| `ptx_asm!` Macro | **Partial** | CUDA inline PTX with `%0` operands, `in`, up to 8 `out` operands (each with an `=`-prefixed constraint; two or more `out`s return a tuple destructured into the output places in declaration order), up to 16 inputs, CUDA register constraints `h`, `r`, `l`, `q`, `f`, and `d`, immediate integer constraint `n`, `clobber("memory")`, and `options(register_only)` for pure register snippets. By default, snippets are treated as side-effecting and stay inside their current control flow. Use `options(register_only, may_diverge)` only for pure snippets that are safe to move across divergent control flow; **never** use it for `.sync` instructions or collectives. More than 8 outputs, read-write operands, and the `"C"` constraint are not implemented yet. |
+| `ptx_asm!` Macro | **Partial** | CUDA inline PTX with `%0` operands, `in`, `out`, and `inout`; up to 16 output operands across `out` with `=`-prefixed constraints and `inout` with `+`-prefixed constraints; up to 16 explicit inputs; CUDA register constraints `h`, `r`, `l`, `q`, `f`, and `d`; immediate integer constraint `n`; compile-time string constraint `C`; `clobber("memory")`; and `options(register_only)` for pure register snippets. With multiple output operands, the macro writes tuple results back in declaration order. By default, snippets are treated as side-effecting and stay inside their current control flow. Use `options(register_only, may_diverge)` only for pure snippets that are safe to move across divergent control flow; **never** use it for `.sync` instructions or collectives. More than 16 output operands are not implemented yet. |
 
 ---
 
@@ -146,7 +158,7 @@ aggregate relocations can be represented without losing provenance.
 
 | Feature | Status | Description |
 |:--------|:-------|:------------|
-| Thread/Block/Grid Intrinsics | **Full** | `threadIdx`, `blockIdx`, `blockDim`, `gridDim`. Index witnesses are layout-typed; their uniqueness also depends on matching launch dimensionality. `index_2d_runtime(s)` adds a caller-proved stride. See [The Safety Model](../gpu-safety/the-safety-model.md). |
+| Thread/Block/Grid Intrinsics | **Full** | `threadIdx`, `blockIdx`, `blockDim`, `gridDim`. Index witnesses are layout-typed; their uniqueness also depends on matching launch dimensionality. `index_2d_runtime(&slice)` resolves against the slice's own row width, bound once by the host. See [The Safety Model](../gpu-safety/the-safety-model.md). |
 | Block Synchronization | **Full** | `sync_threads()` — thread block barrier. |
 | Async Barriers (mbarrier) | **Full** | Hardware async barriers for Hopper+: init, arrive, test_wait, try_wait, inval. |
 | Cluster Synchronization | **Full** | `cluster_sync()` for all blocks in a cluster. sm_90+. |
@@ -177,7 +189,7 @@ aggregate relocations can be represented without losing provenance.
 | Feature | Status | Description |
 |:--------|:-------|:------------|
 | `gpu_printf!` Macro | **Full** | Formatted GPU output with full format specifier support. Lowers to `vprintf`. |
-| `gpu_assert!` Macro | **Full** | Runtime GPU assertion. Calls `trap()` if condition is false. |
+| `gpu_assert!` Macro | **Full** | The no-message form calls `trap()` on failure. The string-literal message form calls CUDA's device-side `__assertfail`, reports message and call-site metadata, and surfaces `CUDA_ERROR_ASSERT`. |
 | Debug Intrinsics | **Full** | `clock()`, `clock64()`, `trap()`, `breakpoint()`, `prof_trigger::<N>()`. |
 
 ## Runtime Library: Kernel Launch

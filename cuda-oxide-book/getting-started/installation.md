@@ -249,10 +249,11 @@ rustup update stable
 rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain stable
 ```
 
-The two extra components are required by the codegen backend:
+These components are required by the codegen backend and doctor:
 
 - `rust-src` -- source of the Rust standard library, needed for cross-compiling to the NVPTX target.
 - `rustc-dev` -- compiler internals that the backend links against.
+- `llvm-tools` -- toolchain-bundled `llc` used to lower LLVM IR to PTX (doctor's floor check).
 
 :::{note}
 On Windows MSVC, install the same stable toolchain and components, then confirm
@@ -281,6 +282,31 @@ cargo +stable install --locked --git https://github.com/ansidium/cuda-oxide-wind
 ```
 
 On first run, `cargo-oxide` will automatically fetch and build the codegen backend. Subsequent runs reuse the cached build.
+
+To discover the examples available in a cuda-oxide checkout:
+
+```bash
+cargo oxide list
+cargo oxide list --json
+```
+
+The command reports each example's purpose and any documented GPU, architecture,
+CUDA Toolkit, or external SDK requirements.
+
+Useful day-to-day helpers once you are building kernels:
+
+```bash
+# Print generated PTX without the full MIR/LLVM pipeline dump
+cargo oxide inspect vecadd
+
+# Remove local target/ dirs and generated device artifacts (PTX, LLVM IR,
+# LTOIR, cubin, and their sidecar metadata)
+cargo oxide clean
+```
+
+`inspect` is the lightweight counterpart to `cargo oxide pipeline`. `clean`
+only touches project-local outputs; it leaves the shared backend cache at
+`~/.cargo/cuda-oxide/` alone.
 
 ---
 
@@ -314,8 +340,8 @@ If everything is configured correctly, this compiles a Rust kernel to PTX, launc
 :::{tip}
 **Common issues:**
 
-- `No working llc-21 or llc-22 found on PATH` -- install LLVM 21+ (`sudo apt install llvm-21`), add `/usr/lib/llvm-21/bin` to your `PATH`, or set `CUDA_OXIDE_LLC=/usr/bin/llc-21`.
+- `No working llc-21 or llc-22 found on PATH` -- prefer `rustup component add llvm-tools --toolchain stable`, or install LLVM 21+ (`sudo apt install llvm-21`), add `/usr/lib/llvm-21/bin` to your `PATH`, or set `CUDA_OXIDE_LLC=/usr/bin/llc-21`.
 - `'stddef.h' file not found` when building host `cuda-bindings` -- install clang dev headers: `sudo apt install clang-21` (or `libclang-common-21-dev`).
 - `cuda.h not found` -- Set `CUDA_TOOLKIT_PATH` to your CUDA install root, or ensure `/usr/local/cuda/include/cuda.h` exists.
-- `rust-src component missing` -- Run `rustup component add rust-src --toolchain stable`.
+- `rust-src` / `llvm-tools` component missing -- Run `rustup component add rust-src llvm-tools --toolchain stable`.
 :::

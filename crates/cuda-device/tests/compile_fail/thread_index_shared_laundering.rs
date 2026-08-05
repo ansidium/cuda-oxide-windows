@@ -3,10 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use cuda_device::{device, SharedArray};
+use cuda_device::{SharedArray, device};
 
-static mut COURIER: SharedArray<cuda_device::thread::ThreadIndex<'static>, 1> =
-    SharedArray::UNINIT;
+static mut COURIER: SharedArray<cuda_device::thread::ThreadIndex<'static>, 1> = SharedArray::UNINIT;
 
 #[device]
 pub fn bad_shared_laundering() {

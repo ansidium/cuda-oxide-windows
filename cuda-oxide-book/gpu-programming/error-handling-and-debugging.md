@@ -9,18 +9,27 @@ problems.
 
 ## What happens when a kernel goes wrong
 
-GPU errors fall into three categories:
+GPU errors fall into four categories:
 
-| Failure mode           | What you see                             | Example                                            |
-|:-----------------------|:-----------------------------------------|:---------------------------------------------------|
-| **Silent corruption**  | Wrong results, no error                  | Race condition, off-by-one index                   |
-| **Hardware trap**      | `CUDA_ERROR_ILLEGAL_INSTRUCTION` on host | `gpu_assert!` failure, panic, OOB access           |
-| **Launch failure**     | `DriverError` returned immediately       | Wrong grid dims, missing module, out of resources  |
+| Failure mode          | What you see                                  | Example                                                |
+|:----------------------|:----------------------------------------------|:-------------------------------------------------------|
+| **Silent corruption** | Wrong results, no error                       | Race condition, off-by-one index                       |
+| **Hardware trap**     | `CUDA_ERROR_ILLEGAL_INSTRUCTION` on sync      | `debug::trap()`, no-message `gpu_assert!`, panic, OOB  |
+| **Device assertion**  | Assertion diagnostic plus `CUDA_ERROR_ASSERT` | `gpu_assert!(condition, "message")`                    |
+| **Launch failure**    | `DriverError` returned immediately            | Wrong grid dims, missing module, out of resources      |
 
-The CUDA toolchain does not expose an exception mechanism today (the hardware
-could support it, but nvcc/ptxas do not wire it up). A trap instruction kills
-the kernel and poisons the CUDA context -- subsequent operations on the same
-context will fail until you handle or recreate it.
+The CUDA toolchain does not expose an exception or stack-unwinding mechanism
+today. A hardware trap terminates the kernel without structured assertion
+metadata. CUDA's device-side `__assertfail` system call also terminates
+execution, but reports the assertion message and call-site metadata before
+synchronization returns `CUDA_ERROR_ASSERT`.
+
+Both failures are asynchronous device errors and normally surface when the
+stream or context is synchronized. Both also leave the CUDA context unusable,
+but recovery differs: after a device assert (`CUDA_ERROR_ASSERT`), destroy and
+recreate the context to keep using CUDA; after a hardware trap
+(`CUDA_ERROR_ILLEGAL_INSTRUCTION`), CUDA documents the whole process as
+poisoned, so terminate and relaunch it.
 
 ## `gpu_printf!` -- printing from the GPU
 
@@ -63,7 +72,7 @@ requires dynamic dispatch, string allocation, and I/O -- none of which exist on
 the GPU. `gpu_printf!` bypasses all of this by lowering directly to a CUDA
 `vprintf` call.
 
-## `gpu_assert!` and `trap()`
+## `gpu_assert!`, `__assertfail`, and `trap()`
 
 For fatal error checking on the device, use `gpu_assert!` or `debug::trap()`:
 
@@ -73,7 +82,15 @@ use cuda_device::{kernel, thread, debug, gpu_assert, DisjointSlice};
 #[kernel]
 pub fn checked_kernel(data: &[f32], len: u32, mut out: DisjointSlice<f32>) {
     let idx = thread::index_1d();
-    gpu_assert!(idx.get() < len as usize);   // traps if false
+
+    // No-message form: lowers to trap()
+    gpu_assert!(idx.get() < len as usize);
+
+    // String-literal message form: lowers to CUDA's __assertfail
+    gpu_assert!(
+        data[idx.get()] >= 0.0,
+        "expected non-negative input"
+    );
 
     if let Some(out_elem) = out.get_mut(idx) {
         *out_elem = data[idx.get()];
@@ -81,29 +98,40 @@ pub fn checked_kernel(data: &[f32], len: u32, mut out: DisjointSlice<f32>) {
 }
 ```
 
-| Intrinsic                | What it does                | Host effect                                    |
-|:-------------------------|:----------------------------|:-----------------------------------------------|
-| `gpu_assert!(condition)` | Traps if condition is false | `CUDA_ERROR_ILLEGAL_INSTRUCTION`               |
-| `debug::trap()`          | Unconditional trap          | `CUDA_ERROR_ILLEGAL_INSTRUCTION`               |
-| `debug::breakpoint()`    | Emit `brkpt` instruction    | Pauses in cuda-gdb; crashes without debugger   |
+| Operation                           | Device behavior                         | Host effect                          |
+| :---------------------------------- | :-------------------------------------- | :----------------------------------- |
+| `gpu_assert!(condition)`            | Executes `trap()` if false              | `CUDA_ERROR_ILLEGAL_INSTRUCTION`     |
+| `gpu_assert!(condition, "message")` | Calls CUDA's device-side `__assertfail` | Diagnostic plus `CUDA_ERROR_ASSERT`  |
+| `debug::trap()`                     | Executes an unconditional trap          | `CUDA_ERROR_ILLEGAL_INSTRUCTION`     |
+| `debug::breakpoint()`               | Emits `brkpt`                           | Pauses in cuda-gdb; fails without it |
 
-### The trap-and-check pattern
+The message passed to `gpu_assert!` must be a string literal. Formatted
+assertion messages are not currently supported.
 
-A common workflow for catching device-side errors:
+### The launch-and-synchronize pattern
+
+Device failures are normally reported when the stream is synchronized:
 
 ```rust
-// Launch kernel
+// Launch kernel.
 // SAFETY: config matches vecadd's 1D indexing and all buffer bounds.
 unsafe { module.vecadd(&stream, config, &a, &b, &mut c) }
     .expect("Launch failed");
 
-// Synchronize and check for traps
-stream.synchronize().expect("Kernel trapped -- check gpu_assert! conditions");
+// Surface asynchronous traps or device assertions.
+stream.synchronize().expect("Kernel failed on the device");
 ```
 
-If a `gpu_assert!` fires, synchronization returns an error. The error message
-doesn't tell you *which* assertion failed, so use `gpu_printf!` alongside
-assertions to narrow down the problem.
+For `gpu_assert!(condition, "message")`, the CUDA driver prints the message,
+source file, source line, and module context before synchronization returns
+`CUDA_ERROR_ASSERT`.
+
+The no-message form does not carry assertion metadata. Use the message form
+when identifying the failing check matters, or use `gpu_printf!` when runtime
+values also need to be inspected.
+
+Ordinary Rust `assert!`, `debug_assert!`, and `panic!` paths are unchanged and
+continue to use the existing trap-based behavior.
 
 ## Host-side error handling
 
@@ -400,6 +428,8 @@ Doctor checks:
 | libdevice       | `libdevice.10.bc` discoverable (same)          |
 | LLVM            | `llc` (21+) available for PTX generation       |
 | Driver / GPU    | `nvidia-smi` reports a GPU and its compute cap |
+| cuda-gdb        | Optional; only needed for `cargo oxide debug`  |
+| compute-sanitizer | Optional; only needed for `cargo oxide sanitize` |
 
 The libNVVM / nvJitLink / libdevice checks fire only when a kernel calls
 CUDA libdevice math (`sin`, `cos`, `exp`, `pow`, `sqrt`, ...). If your
@@ -414,10 +444,39 @@ missing `.so` just means "run `cargo oxide setup`"; `run`/`build` build it
 on demand anyway) and the driver / GPU check (only `cargo oxide run` needs
 a GPU; `build` and `pipeline` work without one).
 
+## `cargo oxide inspect` -- show generated PTX
+
+When you only need the final device assembly (not the intermediate dumps), use
+`inspect`:
+
+```bash
+cargo oxide inspect vecadd
+```
+
+`inspect` builds the example the same way as `cargo oxide build`, then prints
+the generated PTX. Prefer it for a quick "what did the backend emit?" check.
+Use `pipeline` (below) when you need MIR / LLVM dialect / `.ll` stages as
+well. `inspect` is strictly a PTX view: it exits with an error when a non-PTX
+output mode is active in the environment (`CUDA_OXIDE_MATERIALIZE_CUBIN` or
+`CUDA_OXIDE_EMIT_NVVM_IR`).
+
+## `cargo oxide clean` -- remove local build outputs
+
+`clean` deletes project-local Cargo `target/` directories and generated
+cuda-oxide device artifacts (`.ptx`, `.ll`, `.opt.ll`, `.ltoir`, `.cubin`,
+plus the `.target` / `.options` / `.cubin.target` sidecars) under the current
+workspace or standalone project. It refuses (with an error) to remove a
+symlinked `target/` directory or artifact, and it does **not** wipe the
+shared codegen backend cache at `~/.cargo/cuda-oxide/`.
+
+```bash
+cargo oxide clean
+```
+
 ## `cargo oxide pipeline` -- inspecting the compilation
 
-When a kernel produces wrong results but no errors, inspect the compilation
-pipeline to see exactly what code was generated:
+When a kernel produces wrong results but no errors, inspect the full
+compilation pipeline to see exactly what code was generated:
 
 ```bash
 cargo oxide pipeline vecadd
@@ -476,7 +535,7 @@ for the full profiling toolkit.
 :align: center
 :width: 100%
 
-Debugging decision tree: kernel problems fall into three categories (compile
-error, runtime trap, silent corruption), each with different diagnostic tools.
-Common fixes are shown at the bottom.
+Debugging decision tree: kernel problems fall into three branches (compile
+error, runtime device failure, silent corruption), each with different
+diagnostic tools. Common fixes are shown at the bottom.
 ```

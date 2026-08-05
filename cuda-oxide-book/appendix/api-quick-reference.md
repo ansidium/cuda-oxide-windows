@@ -69,7 +69,8 @@ and 65,536 cloned operations. Larger requests warn and are not unrolled.
 use cuda_device::{gpu_printf, gpu_assert, ptx_asm};
 
 gpu_printf!("thread %d: val = %f\n", idx as i32, val as f64);
-gpu_assert!(val >= 0.0);
+gpu_assert!(val.is_finite());
+gpu_assert!(val >= 0.0, "expected non-negative value");
 
 let y: u32;
 unsafe {
@@ -77,11 +78,121 @@ unsafe {
 }
 ```
 
-| Macro                        | Purpose                                              |
-|:-----------------------------|:-----------------------------------------------------|
-| `gpu_printf!(fmt, args...)`  | Device-side formatted output (lowers to `vprintf`)   |
-| `gpu_assert!(condition)`     | Runtime assertion; calls `trap()` on failure         |
-| `ptx_asm!(...)`              | Unsafe CUDA inline PTX                               |
+| Macro                               | Purpose                                                           |
+|:------------------------------------|:------------------------------------------------------------------|
+| `gpu_printf!(fmt, args...)`         | Device-side formatted output (lowers to `vprintf`)                |
+| `gpu_assert!(condition)`            | Runtime assertion; calls `trap()` on failure                      |
+| `gpu_assert!(condition, "message")` | Runtime assertion with CUDA diagnostic; message must be a literal |
+| `ptx_asm!(...)`                     | Unsafe CUDA inline PTX                                            |
+
+The message form lowers to CUDA's device-side `__assertfail` system call.
+The driver reports the message and call-site metadata, and synchronization
+returns `CUDA_ERROR_ASSERT`.
+
+---
+
+## Compile-time policy configuration
+
+```rust
+use cuda_device::config::{
+    Atom, AtomKind, AtomSpec, Block, Cluster, ColumnMajor, Global, Layout,
+    MemorySpace, Policy, PolicyId, Register, RowMajor, Scope, Shape, Shape1,
+    Shape2, Shape3, Shared, TensorMemory, Thread, Tile, TileSpec, Warp,
+    WarpGroup,
+};
+```
+
+Policies describe compile-time kernel configurations using zero-sized Rust
+types. A generic kernel is monomorphized once for every concrete policy type;
+the policy is not passed as a runtime kernel argument.
+
+```rust
+trait VectorPolicy: Policy {
+    type BlockTile: TileSpec;
+    type ElementAtom: AtomSpec;
+
+    const MAX_THREADS: u32;
+    const MIN_BLOCKS: u32;
+    const UNROLL: u32;
+}
+
+enum SmallTilePolicy {}
+
+impl Policy for SmallTilePolicy {
+    const ID: PolicyId =
+        PolicyId::new(0x706f_6c69_6379_5f63, 1);
+}
+```
+
+| API                  | Description                                                                             |
+| :------------------- |:----------------------------------------------------------------------------------------|
+| `Policy`             | Minimal base trait for a named compile-time kernel policy                               |
+| `PolicyId`           | Explicit stable identity containing a project-specific namespace and policy-local value |
+| `Shape`              | Trait exposing a static shape's rank, extents, and checked element count                |
+| `Shape1<D0>`         | One-dimensional compile-time shape                                                      |
+| `Shape2<D0, D1>`     | Two-dimensional compile-time shape                                                      |
+| `Shape3<D0, D1, D2>` | Three-dimensional compile-time shape                                                    |
+| `Tile<S, L, M, Q>`   | Metadata-only description combining shape, layout, memory space, and execution scope    |
+| `TileSpec`           | Type-level access to the components of a tile description                               |
+| `Atom<K, S, Q>`      | Metadata-only description of an operation, logical footprint, and participating threads |
+| `AtomKind`           | Open marker trait identifying a domain-specific operation                               |
+| `AtomSpec`           | Type-level access to an atom's operation kind, shape, and scope                         |
+| `Layout`             | Open trait for memory-order metadata                                                    |
+| `RowMajor`           | Layout whose rightmost coordinate is contiguous                                         |
+| `ColumnMajor`        | Layout whose leftmost coordinate is contiguous                                          |
+| `MemorySpace`        | Open trait describing a CUDA storage location                                           |
+| `Global`             | Device global-memory marker                                                             |
+| `Shared`             | Per-block shared-memory marker                                                          |
+| `Register`           | Thread-local register-storage marker                                                    |
+| `TensorMemory`       | Hardware tensor-memory marker                                                           |
+| `Scope`              | Open trait describing the threads cooperating on an operation                           |
+| `Thread`             | Single-thread execution scope                                                           |
+| `Warp`               | Single-warp execution scope                                                             |
+| `WarpGroup`          | Hardware warpgroup execution scope                                                      |
+| `Block`              | Thread-block execution scope                                                            |
+| `Cluster`            | Thread-block-cluster execution scope                                                    |
+
+`Tile` and `Atom` are descriptions only. They do not allocate storage, provide
+pointer access, emit GPU instructions, synchronize threads, or establish a
+safety property. A domain-specific policy trait gives those descriptors
+meaning and validates supported combinations.
+
+`PolicyId` values are supplied explicitly by the policy library. They are not
+derived from Rust `TypeId`, type names, compiler mangling, or hashes. Keep an ID
+stable while the policy's generated behavior remains unchanged and allocate a
+new value when that behavior changes.
+
+Policy-associated constants can currently be used in compile-time
+`launch_bounds` and partial-loop `unroll` expressions:
+
+```rust
+use cuda_device::{kernel, launch_bounds};
+
+#[kernel]
+#[launch_bounds(P::MAX_THREADS, P::MIN_BLOCKS)]
+pub unsafe fn transform<P: VectorPolicy>(
+    input: *const u32,
+    output: *mut u32,
+    count: u32,
+) {
+    let mut lane = 0;
+
+    #[unroll(P::UNROLL)]
+    while lane < count {
+        // ...
+        lane += 1;
+    }
+}
+```
+
+Generic policy expressions require `#![feature(generic_const_exprs)]`.
+`launch_contract` fields, cluster dimensions, and dynamic shared-memory sizes
+currently remain literal.
+
+See the
+[`policy_config`](https://github.com/NVlabs/cuda-oxide/tree/main/crates/rustc-codegen-cuda/examples/policy_config)
+example for two concrete policies that generate independent PTX
+specializations and policy-specific prepared launches.
 
 ---
 
@@ -92,7 +203,9 @@ use cuda_device::thread;
 
 let idx     = thread::index_1d();                            // ThreadIndex<'_, Index1D>
 let idx2d   = thread::index_2d::<128>();                     // Option<ThreadIndex<'_, Index2D<128>>>
-let idx2d_r = unsafe { thread::index_2d_runtime(stride) };   // Option<ThreadIndex<'_, Runtime2DIndex>>
+let idx2d_r = thread::index_2d_runtime(&out);                // Option<ThreadIndex<'_, Runtime2DIndex>>
+//            `out` is the DisjointSlice<T, Runtime2DIndex> the index will address;
+//            its row width was bound once by the host via cuda_host::RowWidth.
 let idx32   = thread::index_1d_u32(launch_context);          // ThreadIndex32<'_>
 let pos32   = thread::coord_2d_u32(launch_context);          // ThreadCoord2D32<'_>
 
@@ -105,7 +218,7 @@ let bdim_x = thread::blockDim_x();     // u32
 |:--------------------------------------------|:-------------------------------------------------|:-----------------------------------------------------------|
 | `thread::index_1d()`                        | `ThreadIndex<'_, Index1D>`                       | Unique linear index (1D grids)                             |
 | `thread::index_2d::<S>()`                   | `Option<ThreadIndex<'_, Index2D<S>>>`            | Const-stride 2D index; mismatched strides are a type error |
-| `unsafe thread::index_2d_runtime(s)`        | `Option<ThreadIndex<'_, Runtime2DIndex>>`        | Runtime-stride 2D index; caller asserts `s` is uniform     |
+| `thread::index_2d_runtime(&slice)`          | `Option<ThreadIndex<'_, Runtime2DIndex>>`        | Runtime-width 2D index; row width read from the slice      |
 | `thread::index_1d_u32(launch_context)`      | `ThreadIndex32<'_>`                              | 1-D index as `u32`; requires checked `u32` coordinates     |
 | `thread::coord_2d_u32(launch_context)`      | `ThreadCoord2D32<'_>`                            | 2-D row/column as `u32`; requires checked `u32` coordinates|
 | `thread::index_2d_row()`                    | `usize`                                          | 2D row index                                               |
@@ -114,8 +227,8 @@ let bdim_x = thread::blockDim_x();     // u32
 | `thread::blockIdx_{x,y,z}()`                | `u32`                                            | Block index within grid                                    |
 | `thread::blockDim_{x,y,z}()`                | `u32`                                            | Block dimensions                                           |
 
-`thread::index_2d::<S>()` and `thread::index_2d_runtime(s)` return `None`
-when the computed column exceeds the stride — use it to skip the
+`thread::index_2d::<S>()` and `thread::index_2d_runtime(&slice)` return
+`None` when the computed column exceeds the stride, which skips the
 right-edge tail in non-aligned 2D kernels.
 
 `index_2d::<S>` is the safe const-stride form; the const generic encodes the
@@ -124,9 +237,12 @@ stride in the witness type so threads cannot use different strides.
 Z. A matching `PreparedLaunch<K>` proves this without device checks. Otherwise,
 the device rejects the wrong rank: `index_1d` creates an invalid witness and
 2D helpers return `None`. A raw launch remains unsafe because its other memory
-and launch obligations are unchecked. `index_2d_runtime` is the escape hatch
-for launches whose stride is only known at runtime; the caller takes on the
-"every thread used the same stride" obligation by writing `unsafe`. Full
+and launch obligations are unchecked. `index_2d_runtime` covers launches whose
+stride is only known at runtime: the row width travels inside the slice, written
+once by the host into the launch packet (`cuda_host::RowWidth`), so there is no
+`unsafe` and no per-call stride for threads to disagree about. The witness
+stores the thread's `(row, col)` coordinates and the addressed slice resolves
+them against its own row width. Full
 discussion in [The Safety Model](../gpu-safety/the-safety-model.md).
 
 ---
@@ -154,12 +270,14 @@ pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
 
 `get_mut_indexed` is gated on `IndexSpace: IndexFormula` (impl'd by
 `Index1D` and `Index2D<S>`). For `Runtime2DIndex` slices, use the
-explicit `unsafe { thread::index_2d_runtime(s) }` + `get_mut(idx)` pair.
+explicit `thread::index_2d_runtime(&slice)` + `get_mut(idx)` pair; the
+slice resolves the witness's coordinates against its own host-bound
+row width (`slice.row_width()`).
 
 For fixed-size tiles, use `DisjointSlice<T, LinearTiles<N>>::tile_thread32`
 or `DisjointSlice<T, RowMajorTiles<R, C, S>>::tile_2d32`. Each method checks a
 complete tile once, then `at_const` accesses known positions without another
-runtime bounds check. `S` is the caller-declared logical row pitch and must
+runtime bounds check. `S` is the caller-declared logical row width and must
 match the buffer layout. See {ref}`Check a tile once <check-a-tile-once>`.
 
 ---
@@ -420,6 +538,62 @@ and custom launch code.
 
 ---
 
+## Host-Side: Virtual Memory Management
+
+### VMM lifecycle
+
+| API                                         | Purpose                                     |
+|:--------------------------------------------|:--------------------------------------------|
+| `vmm::allocation_granularity(device)`       | Query the required allocation granularity   |
+| `vmm::align_size(size, granularity)`        | Round a size to the required granularity    |
+| `PhysicalAllocation::new(device, size)`     | Allocate physical memory                    |
+| `VirtualReservation::new(size, alignment)`  | Reserve a virtual address range             |
+| `Mapping::new(va, size, &physical, offset)` | Map physical memory into a VA range         |
+| `vmm::set_access(va, size, devices)`        | Grant read/write access to selected devices |
+
+Mappings must be dropped before their virtual reservations and physical
+allocations.
+
+---
+
+## Host-Side: Peer Access
+
+| API                                   | Purpose                                           |
+|:--------------------------------------|:--------------------------------------------------|
+| `peer::can_access_peer(from, to)`     | Query whether the topology supports direct access |
+| `peer::enable_peer_access(from, to)`  | Enable one-directional peer access                |
+| `peer::disable_peer_access(from, to)` | Disable one-directional peer access               |
+
+Peer access is directional. Enable both directions when both devices must
+initiate accesses.
+
+---
+
+## Host-Side: Kernel Families
+
+| Type | Purpose |
+|:-----|:--------|
+| `KernelFamily<Id, Entry, Meta, N>` | Fixed set of ahead-of-time compiled variants |
+| `KernelVariant<Id, Entry, Meta>` | Stable ID, callable entry, and policy metadata |
+| `KernelProblem<Variant>` | Validates whether a variant is eligible |
+| `KernelSelector<Problem, Variant, Id>` | Chooses among already eligible variants |
+| `KernelSelectionCache<Problem, Id>` | Stores stable selection IDs |
+| `NoKernelSelectionCache` | Disables caching |
+| `SelectionMode::Auto` | Uses validated cache results or invokes the selector |
+| `SelectionMode::Force(id)` | Bypasses cache and selector but still validates eligibility |
+| `SelectedVariant` | Returns the selected variant and its provenance |
+| `SelectionSource` | Reports override, cache, or selector provenance |
+
+`KernelFamily::try_new` rejects empty families, blank family names, and
+duplicate variant IDs. The family name and revision form the cache namespace.
+Increment the revision whenever variant semantics, membership, ordering, or
+selection policy changes.
+
+See [Kernel Families](../gpu-programming/kernel-families.md) for the complete
+selection model and example.
+
+---
+
 ## Debug Facilities
 
 ```rust
@@ -441,6 +615,7 @@ debug::prof_trigger::<7>();     // Nsight profiler trigger
 | Module               | Description                                                      | Min SM   |
 |:---------------------|:-----------------------------------------------------------------|:---------|
 | `thread`             | Thread/block IDs, `index_1d`, `sync_threads`                     | All      |
+| `config`             | Compile-time policies, shapes, tiles, atoms, layouts, memory spaces, and scopes | All |
 | `disjoint`           | `DisjointSlice<T>` — typed writes completed by a launch proof    | All      |
 | `shared`             | `SharedArray<T, N>`, `DynamicSharedArray<T>`                     | All      |
 | `warp`               | Shuffle, vote, match, lane/warp ID                               | All      |
@@ -464,7 +639,7 @@ debug::prof_trigger::<7>();     // Nsight profiler trigger
 | `cuda-device`     | Device intrinsics and types (`#![no_std]`)                             |
 | `cuda-macros`     | Proc macros (`#[kernel]`, `#[device]`, `gpu_printf!`, `ptx_asm!`)      |
 | `cuda-host`       | Typed module loading plus low-level launch helpers                     |
-| `cuda-core`       | Safe RAII wrappers (`CudaContext`, `CudaStream`, `DeviceBuffer<T>`)    |
+| `cuda-core`       | Safe RAII wrappers for contexts, streams, buffers, VMM, and P2P        |
 | `cuda-async`      | `DeviceOperation`, `DeviceFuture`, `DeviceBox<T>`                      |
 | `cuda-bindings`   | Raw `bindgen` FFI to `cuda.h`                                          |
-| `cargo-oxide`     | Cargo subcommand (`cargo oxide run`, `build`, `sanitize`, `debug`)     |
+| `cargo-oxide`     | Cargo subcommand (`cargo oxide run`, `build`, `inspect`, `clean`, `sanitize`, `debug`) |

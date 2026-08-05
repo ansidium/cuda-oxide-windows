@@ -123,12 +123,12 @@ pub fn translate_terminator(
         mir::TerminatorKind::Assert {
             cond,
             expected,
-            msg: _,
+            msg,
             target,
             unwind,
         } => translate_assert(
-            ctx, body, cond, *expected, *target, unwind, block_ptr, prev_op, value_map, block_map,
-            loc,
+            ctx, body, cond, *expected, msg, *target, unwind, block_ptr, prev_op, value_map,
+            block_map, loc,
         ),
 
         mir::TerminatorKind::Call {
@@ -352,12 +352,27 @@ fn translate_goto(
 /// If `expected == false`, the condition is negated before the assert:
 /// - `assert!(cond, expected=true)` → assert condition is true
 /// - `assert!(cond, expected=false)` → assert condition is false (negated)
+///
+/// # Unchecked indexing
+///
+/// When the body's unchecked-indexing policy is set (per-kernel
+/// `#[kernel(unchecked_indexing)]` marker or the whole-build
+/// `CUDA_OXIDE_UNCHECKED_INDEXING=1` switch), asserts whose message is
+/// `AssertMessage::BoundsCheck` are elided: control flows unconditionally to
+/// the success target and the condition is never materialized. This is legal
+/// because the success edge carries no block arguments. An out-of-bounds
+/// index then is undefined behavior, exactly like `get_unchecked`. Every
+/// other assert kind (overflow, division/remainder by zero, misaligned
+/// pointer, ...) keeps its compare-and-trap lowering, and panics that arrive
+/// as `core::panicking::*` calls (including range-indexing failures) are
+/// unaffected.
 #[allow(clippy::too_many_arguments)]
 fn translate_assert(
     ctx: &mut Context,
     body: &mir::Body,
     cond: &mir::Operand,
     expected: bool,
+    msg: &mir::AssertMessage,
     target: mir::BasicBlockIdx,
     unwind: &mir::UnwindAction,
     block_ptr: Ptr<BasicBlock>,
@@ -372,6 +387,13 @@ fn translate_assert(
     // may carry unwind edges in their MIR; those are dead code on GPU -- if a
     // panic occurs, the GPU thread traps.
     let _ = unwind;
+
+    // Opt-in bounds-check elision: replace the assert with an unconditional
+    // goto to the success target without translating the (now dead)
+    // condition. Only `BoundsCheck` messages qualify; see the doc comment.
+    if value_map.unchecked_indexing() && matches!(msg, mir::AssertMessage::BoundsCheck { .. }) {
+        return translate_goto(ctx, target, block_ptr, prev_op, block_map, loc);
+    }
 
     // Translate the condition operand.
     //
@@ -458,6 +480,33 @@ fn translate_assert(
     Ok(op)
 }
 
+/// Build the comparison constant for one `SwitchInt` arm, typed as the
+/// discriminant it is compared against.
+///
+/// Arm values arrive as `u128` bit patterns at the discriminant's width, so
+/// the constant is built at that width and a scrutinee wider than 64 bits
+/// keeps its whole value. Narrower widths truncate, which is what the
+/// discriminant's own type already did to the value.
+///
+/// Enum tags cannot reach here above 64 bits. `translate_adt_type` rejects a
+/// discriminant carrier wider than that when it builds the enum type, so the
+/// widths above 64 that arrive here belong to integer scrutinees.
+fn switch_arm_constant(
+    ctx: &mut Context,
+    val: u128,
+    width: usize,
+    signedness: Signedness,
+) -> pliron::builtin::attributes::IntegerAttr {
+    use pliron::utils::apint::APInt;
+    use std::num::NonZeroUsize;
+
+    let width_nz = NonZeroUsize::new(width).expect("integer discriminants have a non-zero width");
+    pliron::builtin::attributes::IntegerAttr::new(
+        IntegerType::get(ctx, width as u32, signedness),
+        APInt::from_u128(val, width_nz),
+    )
+}
+
 /// Translates a MIR `SwitchInt` terminator to conditional branches.
 ///
 /// Handles multi-way branches used for `match` expressions and enum dispatch:
@@ -489,9 +538,6 @@ fn translate_switch(
     block_map: &[Ptr<BasicBlock>],
     loc: Location,
 ) -> TranslationResult<Ptr<Operation>> {
-    use pliron::utils::apint::APInt;
-    use std::num::NonZeroUsize;
-
     // Translate discriminant
     let (discr_value, last_op) = match discr {
         mir::Operand::Copy(place) | mir::Operand::Move(place) => {
@@ -555,26 +601,7 @@ fn translate_switch(
                 };
 
             // Create constant for val with SAME type as discriminant.
-            // SwitchInt values are u128 bit patterns at the discriminant's
-            // width; the dialect stores tags as u64 (same limit as
-            // MirEnumType::variant_discriminants in types.rs), so values
-            // that need more than 64 bits must fail loudly instead of
-            // silently truncating.
-            let switch_val = u64::try_from(val).map_err(|_| {
-                input_error!(
-                    loc.clone(),
-                    TranslationErr::unsupported(format!(
-                        "SwitchInt value {} does not fit in 64 bits",
-                        val
-                    ))
-                )
-            })?;
-            let width_nz = NonZeroUsize::new(width).unwrap();
-            let apint = APInt::from_u64(switch_val, width_nz);
-            let int_attr = pliron::builtin::attributes::IntegerAttr::new(
-                IntegerType::get(ctx, width as u32, signedness),
-                apint,
-            );
+            let int_attr = switch_arm_constant(ctx, val, width, signedness);
 
             let const_op = Operation::new(
                 ctx,
@@ -697,24 +724,7 @@ fn translate_switch(
         };
 
         // Create constant for comparison with SAME type as discriminant.
-        // Same checked u128 -> u64 narrowing as the single-branch path
-        // above: a silently truncated switch value would compare against
-        // the wrong arm.
-        let switch_val = u64::try_from(*val).map_err(|_| {
-            input_error!(
-                loc.clone(),
-                TranslationErr::unsupported(format!(
-                    "SwitchInt value {} does not fit in 64 bits",
-                    val
-                ))
-            )
-        })?;
-        let width_nz = NonZeroUsize::new(width).unwrap();
-        let apint = APInt::from_u64(switch_val, width_nz);
-        let int_attr = pliron::builtin::attributes::IntegerAttr::new(
-            IntegerType::get(ctx, width as u32, signedness),
-            apint,
-        );
+        let int_attr = switch_arm_constant(ctx, *val, width, signedness);
 
         let const_op = Operation::new(
             ctx,
@@ -2518,6 +2528,22 @@ fn try_dispatch_intrinsic(
         ));
     }
 
+    if let Some(intrinsic) = intrinsics::exact_div::RustExactDivIntrinsic::from_core_path(name) {
+        return Ok(Some(intrinsics::exact_div::emit_rust_exact_div_intrinsic(
+            ctx,
+            body,
+            intrinsic,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?));
+    }
+
     if let Some(intrinsic) = intrinsics::bigint::RustBigIntIntrinsic::from_core_path(name) {
         return Ok(Some(intrinsics::bigint::emit_rust_bigint_intrinsic(
             ctx,
@@ -2641,6 +2667,21 @@ fn try_dispatch_intrinsic(
             )?))
         }
 
+        "core::intrinsics::arith_offset" | "std::intrinsics::arith_offset" => {
+            Ok(Some(intrinsics::memory::emit_arith_offset(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
+
         "core::intrinsics::ptr_offset_from" | "std::intrinsics::ptr_offset_from" => {
             Ok(Some(intrinsics::memory::emit_ptr_offset_from(
                 ctx,
@@ -2690,7 +2731,10 @@ fn try_dispatch_intrinsic(
         | "cuda_device::index_2d"
         | "cuda_device::thread::index_2d"
         | "cuda_device::index_2d_runtime"
-        | "cuda_device::thread::index_2d_runtime" => Ok(None),
+        | "cuda_device::thread::index_2d_runtime"
+        | "cuda_device::thread::__internal::warp_index"
+        | "cuda_device::warp_index"
+        | "cuda_device::thread::warp_index" => Ok(None),
 
         // =================================================================
         // Debug & Profiling (from intrinsics::debug)
@@ -2765,21 +2809,34 @@ fn try_dispatch_intrinsic(
         "cuda_device::__launch_bounds_config"
         | "cuda_device::thread::__launch_bounds_config"
         | "cuda_device::__launch_contract_config"
-        | "cuda_device::thread::__launch_contract_config" => {
+        | "cuda_device::thread::__launch_contract_config"
+        | "cuda_device::__launch_contract_block_config"
+        | "cuda_device::thread::__launch_contract_block_config"
+        | "cuda_device::__unchecked_indexing_config"
+        | "cuda_device::thread::__unchecked_indexing_config" => {
             let expected_marker = match name {
                 "cuda_device::__launch_bounds_config"
                 | "cuda_device::thread::__launch_bounds_config" => "__launch_bounds_config",
                 "cuda_device::__launch_contract_config"
                 | "cuda_device::thread::__launch_contract_config" => "__launch_contract_config",
+                "cuda_device::__launch_contract_block_config"
+                | "cuda_device::thread::__launch_contract_block_config" => {
+                    "__launch_contract_block_config"
+                }
+                "cuda_device::__unchecked_indexing_config"
+                | "cuda_device::thread::__unchecked_indexing_config" => {
+                    "__unchecked_indexing_config"
+                }
                 _ => unreachable!("launch metadata arm matched an unknown marker"),
             };
             if !is_cuda_device_const_marker(func, expected_marker) {
                 return Ok(None);
             }
-            // Compile-time launch metadata marker. Launch bounds are extracted
-            // in body.rs; the contract marker selects the kernel's typed launch
-            // context during macro expansion. Neither marker emits runtime code.
-            // Emit only the control-flow edge to the call's target.
+            // Compile-time metadata marker. Launch bounds and the
+            // unchecked-indexing flag are extracted in body.rs; the contract
+            // marker selects the kernel's typed launch context during macro
+            // expansion. No marker emits runtime code. Emit only the
+            // control-flow edge to the call's target.
             //
             // We need a prev_op to insert after. If none exists, create a dummy constant.
             let actual_prev_op = match prev_op {
@@ -2979,9 +3036,10 @@ fn try_dispatch_intrinsic(
             }
         }
 
-        // SharedArray::as_ptr and as_mut_ptr - convert shared memory pointer to generic
-        path if path.contains("SharedArray") && path.contains("as_ptr") => {
-            Ok(Some(intrinsics::memory::emit_shared_array_as_ptr(
+        // Explicit generic-to-shared address conversion for hardware SMEM
+        // descriptors (the CUDA C++ `__cvta_generic_to_shared_offset` analog).
+        "cuda_device::shared::cvta_generic_to_shared_offset" => Ok(Some(
+            intrinsics::memory::emit_cvta_generic_to_shared_offset(
                 ctx,
                 body,
                 args,
@@ -2992,9 +3050,13 @@ fn try_dispatch_intrinsic(
                 value_map,
                 block_map,
                 loc,
-            )?))
-        }
-        path if path.contains("SharedArray") && path.contains("as_mut_ptr") => {
+            )?,
+        )),
+
+        // Public SharedArray pointer conversions all narrow the shared-memory
+        // base to a generic pointer. Recognition is shared with destination
+        // address-space classification in translator::values.
+        path if super::shared_array_pointer_method(path).is_some() => {
             Ok(Some(intrinsics::memory::emit_shared_array_as_ptr(
                 ctx,
                 body,
@@ -3038,6 +3100,41 @@ fn try_dispatch_intrinsic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `SwitchInt` arm keeps its whole value at 128 bits, and narrower
+    /// discriminants truncate exactly as the previous `u64` construction did.
+    /// Every width at or below 64 is the behaviour this shares with the enum
+    /// tags that dominate the switches in the tree, so it is pinned here
+    /// alongside the widths that used to be rejected.
+    #[test]
+    fn switch_arm_constants_are_built_at_the_discriminant_width() {
+        use pliron::utils::apint::APInt;
+        use std::num::NonZeroUsize;
+
+        let ctx = &mut Context::new();
+
+        for (width, value) in [
+            (8usize, 0xffu128),
+            (16, 0xbeef),
+            (32, 0xdead_beef),
+            (64, u128::from(u64::MAX)),
+        ] {
+            let attr = switch_arm_constant(ctx, value, width, Signedness::Unsigned);
+            let expected = APInt::from_u64(value as u64, NonZeroUsize::new(width).unwrap());
+            assert_eq!(
+                attr.value(),
+                expected,
+                "width {width} must match the previous u64 construction"
+            );
+        }
+
+        // Above 64 bits the u64 construction could not represent the value at
+        // all, which is what used to be rejected.
+        let wide = (1u128 << 100) | 1;
+        let attr = switch_arm_constant(ctx, wide, 128, Signedness::Unsigned);
+        assert_eq!(attr.value().to_u128(), wide);
+        assert_eq!(attr.value().bw(), 128);
+    }
 
     /// The importer traps exactly the calls the codegen collector declines to
     /// collect. If the two predicates drift apart, one side emits a call to a

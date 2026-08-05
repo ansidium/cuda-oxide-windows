@@ -102,6 +102,41 @@ require_shape \
     "padded tuple-array enum value in LLVM slot 2" \
     'insertvalue \{ i1, \[3 x i8\], \{ i32 \} \} .* \{ i32 \} .* 2'
 
+bare_enum_symbol='array_constants__kernels__bare_enum_array_value'
+
+# A bare enum array must be constructed as six direct-tag values and indexed
+# dynamically. This distinguishes it from the already-covered enum nested in a
+# tuple array and prevents optimization-only success from hiding importer
+# coverage.
+for discriminant in 1 2 3 4 5 6; do
+    require_symbol_shape "${llvm_ir}" llvm "${bare_enum_symbol}" \
+        "bare enum-array discriminant ${discriminant}" \
+        "insertvalue \\{ i32 \\} undef, i32 ${discriminant}, 0"
+done
+require_symbol_shape "${llvm_ir}" llvm "${bare_enum_symbol}" \
+    "complete six-element enum array" \
+    'insertvalue \[6 x \{ i32 \}\] .* \{ i32 \} .* 5'
+require_symbol_shape "${llvm_ir}" llvm "${bare_enum_symbol}" \
+    "runtime enum-array index" \
+    'urem i64 .*, 6'
+require_symbol_shape "${llvm_ir}" llvm "${bare_enum_symbol}" \
+    "runtime enum-array element load" \
+    'load \{ i32 \},'
+
+pointer_tuple_symbol='array_constants__kernels__pointer_tuple_array_value'
+
+# Device globals use backend-generated internal symbols, so source-level static
+# names are not stable in LLVM IR. Runtime coverage checks the zero-addend
+# whole-static case. This assertion pins the non-zero interior-static
+# projection and ensures provenance is not reconstructed from placeholder bytes.
+require_symbol_shape "${llvm_ir}" llvm "${pointer_tuple_symbol}" \
+    "eight-byte device-static subobject projection" \
+    'getelementptr( inbounds)? i8,.*i64 8([^0-9]|$)'
+
+reject_symbol_shape "${llvm_ir}" llvm "${pointer_tuple_symbol}" \
+    "placeholder-byte inttoptr reconstruction" \
+    'inttoptr'
+
 # A non-empty tuple made entirely of ZST fields must still be decoded by the
 # tuple path. Its stripped LLVM representation leaves the outer u32 intact.
 require_shape \

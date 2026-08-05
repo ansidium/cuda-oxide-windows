@@ -71,12 +71,16 @@ mod contracted {
 const SMALL_CONTRACT_MAX: u32 =
     match <contracted::__configured_CudaKernel<SmallPolicy> as KernelLaunchContract>::SPEC.block() {
         BlockRequirement::MaxThreads(max) => max,
-        BlockRequirement::Exact(_) => panic!("policy contract unexpectedly requires an exact block"),
+        BlockRequirement::Exact(_) => {
+            panic!("policy contract unexpectedly requires an exact block")
+        }
     };
 const WIDE_CONTRACT_MAX: u32 =
     match <contracted::__configured_CudaKernel<WidePolicy> as KernelLaunchContract>::SPEC.block() {
         BlockRequirement::MaxThreads(max) => max,
-        BlockRequirement::Exact(_) => panic!("policy contract unexpectedly requires an exact block"),
+        BlockRequirement::Exact(_) => {
+            panic!("policy contract unexpectedly requires an exact block")
+        }
     };
 
 const _: () = assert!(SMALL_CONTRACT_MAX == 64);

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use cuda_device::thread::{LaunchContextRef, __internal};
+use cuda_device::thread::{__internal, LaunchContextRef};
 
 fn missing_contract<'kernel>(
     launch_context: LaunchContextRef<

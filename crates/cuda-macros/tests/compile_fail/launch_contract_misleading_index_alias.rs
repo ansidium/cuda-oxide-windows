@@ -16,11 +16,7 @@ mod kernels {
 }
 
 fn prepare(module: &kernels::LoadedModule) {
-    let _ = module.prepare_misleading_name(cuda_core::LaunchConfig2D::new(
-        (1, 1),
-        (8, 8),
-        0,
-    ));
+    let _ = module.prepare_misleading_name(cuda_core::LaunchConfig2D::new((1, 1), (8, 8), 0));
 }
 
 fn main() {}

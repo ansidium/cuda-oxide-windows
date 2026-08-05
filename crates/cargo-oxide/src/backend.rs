@@ -489,8 +489,36 @@ fn invalidate_cache(cache_dir: &Path, backend_filename: &str) {
         "Detected upgraded cargo-oxide; refreshing cached backend at {} (issue #49).",
         cache_dir.display()
     );
+    clear_cache_contents(cache_dir, backend_filename);
+}
+
+fn clear_cache_contents(cache_dir: &Path, backend_filename: &str) {
     let _ = std::fs::remove_file(cache_dir.join(backend_filename));
     let _ = std::fs::remove_dir_all(cache_dir.join("src"));
+}
+
+/// Invalidate the shared cache and rebuild via auto-fetch (external projects).
+///
+/// Returns the path to the freshly cached backend library.
+pub fn refresh_cached_backend() -> PathBuf {
+    let cache_dir = cache_directory().unwrap_or_else(|| {
+        eprintln!("Could not determine the cargo-oxide cache directory.");
+        std::process::exit(1);
+    });
+    let backend_filename = backend_filename_for_target(&active_host_target());
+
+    with_locked_backend_cache(&cache_dir, |locked_cache_dir| {
+        eprintln!(
+            "Clearing cached codegen backend at {}...",
+            locked_cache_dir.display()
+        );
+        clear_cache_contents(locked_cache_dir, &backend_filename);
+        auto_fetch_and_build(locked_cache_dir, &backend_filename)
+    })
+    .unwrap_or_else(|error| {
+        eprintln!("Failed to lock the cuda-oxide backend cache: {error}");
+        std::process::exit(1);
+    })
 }
 
 /// Builds the backend from a local source tree.
@@ -1532,6 +1560,21 @@ mod tests {
         let dir = tempdir();
         let so = dir.join("does_not_exist.so");
         assert_eq!(cached_backend_status(&so, None), CacheStatus::Fresh);
+    }
+
+    #[test]
+    fn clear_cache_contents_removes_so_and_src_tree() {
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        let src = dir.join("src/crates/rustc-codegen-cuda");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(&so, b"old").unwrap();
+        std::fs::write(src.join("lib.rs"), b"fn main() {}").unwrap();
+
+        clear_cache_contents(&dir, "librustc_codegen_cuda.so");
+
+        assert!(!so.exists());
+        assert!(!dir.join("src").exists());
     }
 
     /// A backend source input newer than the cached `.so` must report

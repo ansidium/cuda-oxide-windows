@@ -33,7 +33,8 @@ use crate::model::{
     PackedAtomicOrdering, PackedAtomicPointerContract, PackedAtomicReturnContract,
     PackedAtomicRounding, PackedAtomicScope, PackedAtomicScopeContract, PackedAtomicStateSpace,
     PackedAtomicSubnormal, PackedConversionAdapter, PackedConversionDestinationFormat,
-    PackedConversionFp8Admission, PackedConversionRounding, PackedConversionSaturation,
+    PackedConversionFp8Admission, PackedConversionFp8Direction, PackedConversionFp8F16x2Admission,
+    PackedConversionFp8Format, PackedConversionRounding, PackedConversionSaturation,
     PackedConversionSourceFormat, PreSm70MemberMaskRule, Prmt, PrmtAdapter, PrmtAdmission,
     PrmtMode, PtxVersion, ReduxAdapter, ReduxOperation, ReduxParticipation, RegisterMma,
     RegisterMmaAccumulator, RegisterMmaAdapter, RegisterMmaAmpereFloatAdmission,
@@ -77,7 +78,7 @@ use std::path::{Component, Path, PathBuf};
 
 const OVERLAY_SCHEMA: u32 = 44;
 const MINIMUM_OVERLAY_SHARD_SCHEMA: u32 = 26;
-const OVERLAY_SHARD_SCHEMA: u32 = 58;
+const OVERLAY_SHARD_SCHEMA: u32 = 60;
 const REGISTER_MMA_F8F6F4_SHARD_SCHEMA: u32 = 46;
 const REGISTER_MMA_F8F6F4_F16_SHARD_SCHEMA: u32 = 47;
 const REGISTER_MMA_FP8_SHARD_SCHEMA: u32 = 48;
@@ -86,6 +87,7 @@ const SPARSE_MMA_F8F6F4_SHARD_SCHEMA: u32 = 27;
 const SPARSE_MMA_F8F6F4_F16_SHARD_SCHEMA: u32 = 50;
 const PRMT_SHARD_SCHEMA: u32 = 28;
 const PACKED_CONVERSION_FP8_SHARD_SCHEMA: u32 = 29;
+const PACKED_CONVERSION_FP8_F16X2_SHARD_SCHEMA: u32 = 59;
 const CLUSTER_SREG_SHARD_SCHEMA: u32 = 30;
 const CLUSTER_BARRIER_SHARD_SCHEMA: u32 = 31;
 const SPECIAL_REGISTER_SHARD_SCHEMA: u32 = 32;
@@ -100,7 +102,7 @@ const WGMMA_CONTROL_SHARD_SCHEMA: u32 = 38;
 const TCGEN05_SHARD_SCHEMA: u32 = 42;
 const SCALAR_CONVERSION_SHARD_SCHEMA: u32 = 43;
 const SCALAR_ARITHMETIC_SHARD_SCHEMA: u32 = 45;
-const EXTENDED_MINMAX_SHARD_SCHEMA: u32 = 51;
+const EXTENDED_MINMAX_SHARD_SCHEMA: u32 = 60;
 const TCGEN05_CP_SHARD_SCHEMA: u32 = 52;
 const TCGEN05_LD_SHARD_SCHEMA: u32 = 53;
 const TCGEN05_ST_SHARD_SCHEMA: u32 = 54;
@@ -146,7 +148,7 @@ const TCGEN05_MMA_KINDS: [Tcgen05MmaKind; 4] = [
 const TCGEN05_MMA_DIALECT_OP_TYPE: &str = "Tcgen05MmaOp";
 const TCGEN05_MMA_DIALECT_OP_NAME: &str = "nvvm.tcgen05_mma";
 const REGISTER_MMA_F8F6F4_TARGETS: &str = "sm_120a|sm_120f|sm_121a|sm_121f";
-const SPARSE_MMA_F8F6F4_F16_TARGETS: &str = "sm_120a|sm_120f|sm_121a|sm_121f";
+const SPARSE_MMA_F8F6F4_TARGETS: &str = "sm_120a|sm_120f|sm_121a|sm_121f";
 
 struct ResolutionBase {
     overlay: OverlayFile,
@@ -932,6 +934,7 @@ fn read_overlay(repo_root: &Path, manifest_path: &Path) -> Result<(OverlayFile, 
         let sparse_mma_f8f6f4_f16_admission = shard.sparse_mma_f8f6f4_f16.take();
         let prmt_admission = shard.prmt.take();
         let packed_conversion_fp8_admission = shard.packed_conversion_fp8.take();
+        let packed_conversion_fp8_f16x2_admission = shard.packed_conversion_fp8_f16x2.take();
         let scalar_conversion_admission = shard.scalar_conversion.take();
         let scalar_arithmetic_admission = shard.scalar_arithmetic.take();
         let scalar_math_admission = shard.scalar_math.take();
@@ -1046,6 +1049,13 @@ fn read_overlay(repo_root: &Path, manifest_path: &Path) -> Result<(OverlayFile, 
                 "compact FP8 conversion admission must be the only content of a packed_conversion shard"
             );
             shard.intrinsics = expand_packed_conversion_fp8_admission(&admission)?;
+        }
+        if let Some(admission) = packed_conversion_fp8_f16x2_admission {
+            ensure!(
+                shard.family == "packed_conversion" && shard.intrinsics.is_empty(),
+                "compact FP8 f16x2 conversion admission must be the only content of a packed_conversion shard"
+            );
+            shard.intrinsics = expand_packed_conversion_fp8_f16x2_admission(&admission)?;
         }
         if let Some(admission) = scalar_conversion_admission {
             ensure!(
@@ -1244,6 +1254,12 @@ fn validate_overlay_shard_schema_with_max(
         shard.packed_conversion_fp8.is_none() || shard.schema >= PACKED_CONVERSION_FP8_SHARD_SCHEMA,
         "compact FP8 conversion admission requires overlay shard schema {}",
         PACKED_CONVERSION_FP8_SHARD_SCHEMA
+    );
+    ensure!(
+        shard.packed_conversion_fp8_f16x2.is_none()
+            || shard.schema >= PACKED_CONVERSION_FP8_F16X2_SHARD_SCHEMA,
+        "compact FP8 f16x2 conversion admission requires overlay shard schema {}",
+        PACKED_CONVERSION_FP8_F16X2_SHARD_SCHEMA
     );
     ensure!(
         shard.scalar_conversion.is_none() || shard.schema >= SCALAR_CONVERSION_SHARD_SCHEMA,
@@ -9779,8 +9795,9 @@ fn validate_selected_target_predicates(
                     && policy.sparse_mma.as_ref().is_some_and(|mma| {
                         policy.targets
                             == match mma.accumulator {
-                                SparseMmaAccumulator::F16 => SPARSE_MMA_F8F6F4_F16_TARGETS,
-                                SparseMmaAccumulator::F32 => "sm_120a",
+                                SparseMmaAccumulator::F16 | SparseMmaAccumulator::F32 => {
+                                    SPARSE_MMA_F8F6F4_TARGETS
+                                }
                                 SparseMmaAccumulator::S32 => return false,
                             }
                     })
@@ -12714,17 +12731,24 @@ struct PackedAluRecipe {
     source: PackedAluRecipeSource,
 }
 
-fn packed_alu_recipe(format: PackedAluFormat, operation: PackedAluOperation) -> PackedAluRecipe {
+/// Returns the closed recipe for a packed-ALU (format, operation) pair.
+///
+/// `None` means the pair is outside the family: the operation exists for some
+/// other format but this one has no reviewed lowering for it.
+fn packed_alu_recipe(
+    format: PackedAluFormat,
+    operation: PackedAluOperation,
+) -> Option<PackedAluRecipe> {
     match format {
         PackedAluFormat::Bf16x2 => packed_bf16x2_alu_recipe(operation),
-        PackedAluFormat::F16x2 => packed_f16x2_alu_recipe(operation),
+        PackedAluFormat::F16x2 => Some(packed_f16x2_alu_recipe(operation)),
     }
 }
 
-fn packed_bf16x2_alu_recipe(operation: PackedAluOperation) -> PackedAluRecipe {
+fn packed_bf16x2_alu_recipe(operation: PackedAluOperation) -> Option<PackedAluRecipe> {
     const PURE: &[&str] = &["IntrNoMem", "IntrSpeculatable"];
     const COMMUTATIVE_PURE: &[&str] = &["Commutative", "IntrNoMem", "IntrSpeculatable"];
-    match operation {
+    Some(match operation {
         PackedAluOperation::Fma => PackedAluRecipe {
             id: "fma_bf16x2",
             abi_id: "i0062",
@@ -12941,7 +12965,19 @@ fn packed_bf16x2_alu_recipe(operation: PackedAluOperation) -> PackedAluRecipe {
                 selection_asm: "abs.bf16x2 \t$dst, $src0;",
             },
         },
-    }
+        // The ftz and sat fma forms do not exist for bf16x2 in the PTX ISA at
+        // all: ptxas rejects hand-written `fma.rn.ftz.bf16x2` with
+        // "Illegal modifier '.ftz' for instruction 'fma'", and accepts
+        // `fma.rn.relu.bf16x2` beside it. LLVM declares the intrinsics anyway,
+        // so instruction selection is what fails first ("Cannot select:
+        // intrinsic %llvm.nvvm.fma.rn.ftz.bf16x2"), but the assembler is the
+        // authority here. Reject them rather than admit a recipe that has no
+        // instruction to lower to.
+        PackedAluOperation::FmaFtz
+        | PackedAluOperation::FmaSat
+        | PackedAluOperation::FmaFtzSat
+        | PackedAluOperation::FmaFtzRelu => return None,
+    })
 }
 
 fn packed_f16x2_alu_recipe(operation: PackedAluOperation) -> PackedAluRecipe {
@@ -12975,6 +13011,87 @@ fn packed_f16x2_alu_recipe(operation: PackedAluOperation) -> PackedAluRecipe {
                 selection_asm: "fma.rn.f16x2 \t$dst, $src0, $src1, $src2;",
             },
         },
+        PackedAluOperation::FmaFtz => PackedAluRecipe {
+            id: "fma_ftz_f16x2",
+            abi_id: "i0854",
+            operation_key: "packed.alu.f16x2.fma.ftz",
+            rust_name: "fma_ftz_f16x2",
+            dialect_op_type: "FmaFtzF16x2Op",
+            dialect_op_name: "nvvm.fma_ftz_f16x2",
+            arity: 3,
+            must_use: true,
+            ptx_mnemonic: "fma.rn.ftz.f16x2",
+            modifiers: &["rn", "ftz", "f16x2"],
+            native_minimum_sm: 53,
+            minimum_ptx: "4.2",
+            minimum_sm: "sm_70",
+            ptx_isa_section: "9.7.4.4 Half Precision Floating Point Instructions: fma",
+            ptx_isa_url: "https://docs.nvidia.com/cuda/parallel-thread-execution/#half-precision-floating-point-instructions-fma",
+            source: PackedAluRecipeSource::Imported {
+                record: "int_nvvm_fma_rn_ftz_f16x2",
+                symbol: "llvm.nvvm.fma.rn.ftz.f16x2",
+                resolved_symbol: None,
+                arguments: &["v2f16", "v2f16", "v2f16"],
+                results: &["v2f16"],
+                properties: PURE,
+                selection: "INT_NVVM_FMA_rn_ftz_f16x2",
+                selection_asm: "fma.rn.ftz.f16x2 \t$dst, $src0, $src1, $src2;",
+            },
+        },
+        PackedAluOperation::FmaSat => PackedAluRecipe {
+            id: "fma_sat_f16x2",
+            abi_id: "i0855",
+            operation_key: "packed.alu.f16x2.fma.sat",
+            rust_name: "fma_sat_f16x2",
+            dialect_op_type: "FmaSatF16x2Op",
+            dialect_op_name: "nvvm.fma_sat_f16x2",
+            arity: 3,
+            must_use: true,
+            ptx_mnemonic: "fma.rn.sat.f16x2",
+            modifiers: &["rn", "sat", "f16x2"],
+            native_minimum_sm: 53,
+            minimum_ptx: "4.2",
+            minimum_sm: "sm_70",
+            ptx_isa_section: "9.7.4.4 Half Precision Floating Point Instructions: fma",
+            ptx_isa_url: "https://docs.nvidia.com/cuda/parallel-thread-execution/#half-precision-floating-point-instructions-fma",
+            source: PackedAluRecipeSource::Imported {
+                record: "int_nvvm_fma_rn_sat_f16x2",
+                symbol: "llvm.nvvm.fma.rn.sat.f16x2",
+                resolved_symbol: None,
+                arguments: &["v2f16", "v2f16", "v2f16"],
+                results: &["v2f16"],
+                properties: PURE,
+                selection: "INT_NVVM_FMA_rn_sat_f16x2",
+                selection_asm: "fma.rn.sat.f16x2 \t$dst, $src0, $src1, $src2;",
+            },
+        },
+        PackedAluOperation::FmaFtzSat => PackedAluRecipe {
+            id: "fma_ftz_sat_f16x2",
+            abi_id: "i0856",
+            operation_key: "packed.alu.f16x2.fma.ftz.sat",
+            rust_name: "fma_ftz_sat_f16x2",
+            dialect_op_type: "FmaFtzSatF16x2Op",
+            dialect_op_name: "nvvm.fma_ftz_sat_f16x2",
+            arity: 3,
+            must_use: true,
+            ptx_mnemonic: "fma.rn.ftz.sat.f16x2",
+            modifiers: &["rn", "ftz", "sat", "f16x2"],
+            native_minimum_sm: 53,
+            minimum_ptx: "4.2",
+            minimum_sm: "sm_70",
+            ptx_isa_section: "9.7.4.4 Half Precision Floating Point Instructions: fma",
+            ptx_isa_url: "https://docs.nvidia.com/cuda/parallel-thread-execution/#half-precision-floating-point-instructions-fma",
+            source: PackedAluRecipeSource::Imported {
+                record: "int_nvvm_fma_rn_ftz_sat_f16x2",
+                symbol: "llvm.nvvm.fma.rn.ftz.sat.f16x2",
+                resolved_symbol: None,
+                arguments: &["v2f16", "v2f16", "v2f16"],
+                results: &["v2f16"],
+                properties: PURE,
+                selection: "INT_NVVM_FMA_rn_ftz_sat_f16x2",
+                selection_asm: "fma.rn.ftz.sat.f16x2 \t$dst, $src0, $src1, $src2;",
+            },
+        },
         PackedAluOperation::FmaRelu => PackedAluRecipe {
             id: "fma_relu_f16x2",
             abi_id: "i0073",
@@ -13000,6 +13117,33 @@ fn packed_f16x2_alu_recipe(operation: PackedAluOperation) -> PackedAluRecipe {
                 properties: PURE,
                 selection: "INT_NVVM_FMA_rn_relu_f16x2",
                 selection_asm: "fma.rn.relu.f16x2 \t$dst, $src0, $src1, $src2;",
+            },
+        },
+        PackedAluOperation::FmaFtzRelu => PackedAluRecipe {
+            id: "fma_ftz_relu_f16x2",
+            abi_id: "i0857",
+            operation_key: "packed.alu.f16x2.fma.ftz.relu",
+            rust_name: "fma_ftz_relu_f16x2",
+            dialect_op_type: "FmaFtzReluF16x2Op",
+            dialect_op_name: "nvvm.fma_ftz_relu_f16x2",
+            arity: 3,
+            must_use: true,
+            ptx_mnemonic: "fma.rn.ftz.relu.f16x2",
+            modifiers: &["rn", "ftz", "relu", "f16x2"],
+            native_minimum_sm: 80,
+            minimum_ptx: "7.0",
+            minimum_sm: "sm_80",
+            ptx_isa_section: "9.7.4.4 Half Precision Floating Point Instructions: fma",
+            ptx_isa_url: "https://docs.nvidia.com/cuda/parallel-thread-execution/#half-precision-floating-point-instructions-fma",
+            source: PackedAluRecipeSource::Imported {
+                record: "int_nvvm_fma_rn_ftz_relu_f16x2",
+                symbol: "llvm.nvvm.fma.rn.ftz.relu.f16x2",
+                resolved_symbol: None,
+                arguments: &["v2f16", "v2f16", "v2f16"],
+                results: &["v2f16"],
+                properties: PURE,
+                selection: "INT_NVVM_FMA_rn_ftz_relu_f16x2",
+                selection_asm: "fma.rn.ftz.relu.f16x2 \t$dst, $src0, $src1, $src2;",
             },
         },
         PackedAluOperation::Add => PackedAluRecipe {
@@ -13158,12 +13302,16 @@ fn packed_f16x2_alu_recipe(operation: PackedAluOperation) -> PackedAluRecipe {
     }
 }
 
+/// Per-backend PTX and SM floors, which can sit above the recipe's own floor.
+///
+/// Takes the caller's already-resolved recipe rather than looking it up again,
+/// so this cannot be reached with a pair the family rejects.
 fn packed_alu_backend_floor(
+    recipe: &PackedAluRecipe,
     format: PackedAluFormat,
     operation: PackedAluOperation,
     backend: IntrinsicBackend,
 ) -> (&'static str, &'static str) {
-    let recipe = packed_alu_recipe(format, operation);
     match (format, operation, backend) {
         (
             PackedAluFormat::F16x2,
@@ -13179,6 +13327,19 @@ fn packed_alu_backend_floor(
             | PackedAluOperation::Add
             | PackedAluOperation::Sub
             | PackedAluOperation::Mul,
+            IntrinsicBackend::LibNvvm,
+        ) => ("4.2", "sm_75"),
+        // The ftz and sat fma forms share the plain fma floors: PTX 4.2 natively,
+        // but the pinned LLVM backend needs 6.0 and CUDA 13.3 ptxas no longer
+        // targets sm_70, so libNVVM is checked at sm_75.
+        (
+            PackedAluFormat::F16x2,
+            PackedAluOperation::FmaFtz | PackedAluOperation::FmaSat | PackedAluOperation::FmaFtzSat,
+            IntrinsicBackend::LlvmNvptx,
+        ) => ("6.0", "sm_70"),
+        (
+            PackedAluFormat::F16x2,
+            PackedAluOperation::FmaFtz | PackedAluOperation::FmaSat | PackedAluOperation::FmaFtzSat,
             IntrinsicBackend::LibNvvm,
         ) => ("4.2", "sm_75"),
         (PackedAluFormat::F16x2, PackedAluOperation::Neg, IntrinsicBackend::LlvmNvptx) => {
@@ -13211,7 +13372,8 @@ fn validate_packed_alu_policy(
         "{} requests an unsupported packed-ALU adapter",
         policy.id
     );
-    let recipe = packed_alu_recipe(packed.format, packed.operation);
+    let recipe = packed_alu_recipe(packed.format, packed.operation)
+        .with_context(|| format!("{} is outside the closed packed-ALU recipe", policy.id))?;
     let rust_module = match packed.format {
         PackedAluFormat::Bf16x2 => "bf16x2",
         PackedAluFormat::F16x2 => "f16x2",
@@ -13342,10 +13504,18 @@ fn validate_packed_alu_policy(
             );
         }
     }
-    let llvm_floor =
-        packed_alu_backend_floor(packed.format, packed.operation, IntrinsicBackend::LlvmNvptx);
-    let libnvvm_floor =
-        packed_alu_backend_floor(packed.format, packed.operation, IntrinsicBackend::LibNvvm);
+    let llvm_floor = packed_alu_backend_floor(
+        &recipe,
+        packed.format,
+        packed.operation,
+        IntrinsicBackend::LlvmNvptx,
+    );
+    let libnvvm_floor = packed_alu_backend_floor(
+        &recipe,
+        packed.format,
+        packed.operation,
+        IntrinsicBackend::LibNvvm,
+    );
     ensure_exact_inline_ptx_backends(
         policy,
         [
@@ -14479,6 +14649,179 @@ fn validate_mbarrier_basic_policy(
 fn packed_conversion_recipe(
     conversion: &crate::model::PackedConversion,
 ) -> Option<PackedConversionRecipe> {
+    match conversion.source_format {
+        PackedConversionSourceFormat::F32x2 => packed_conversion_recipe_f32x2(conversion),
+        PackedConversionSourceFormat::E4m3x2
+        | PackedConversionSourceFormat::E5m2x2
+        | PackedConversionSourceFormat::F16x2 => packed_conversion_recipe_fp8_f16x2(conversion),
+    }
+}
+
+/// Recipes for the packed FP8 conversions whose other side is `f16x2`.
+///
+/// Keyed on source as well as destination: unpacking to `f16x2` shares its
+/// destination, rounding, and saturation with the scalar-`f32` recipe for
+/// `cvt.rn.f16x2.f32`, so the source format is what separates them.
+fn packed_conversion_recipe_fp8_f16x2(
+    conversion: &crate::model::PackedConversion,
+) -> Option<PackedConversionRecipe> {
+    match (
+        conversion.source_format,
+        conversion.destination_format,
+        conversion.rounding,
+        conversion.saturation,
+    ) {
+        (
+            PackedConversionSourceFormat::F16x2,
+            PackedConversionDestinationFormat::E4m3x2,
+            PackedConversionRounding::NearestEven,
+            PackedConversionSaturation::Satfinite,
+        ) => Some(PackedConversionRecipe {
+            id: "cvt_rn_satfinite_e4m3x2_f16x2",
+            abi_id: "i0822",
+            operation_key: "packed.convert.f16x2.e4m3x2.nearest_even.satfinite",
+            rust_name: "cvt_rn_satfinite_e4m3x2_f16x2",
+            compatibility_path: "cuda_device::convert::cvt_rn_satfinite_e4m3x2_f16x2",
+            dialect_op_type: "CvtRnSatfiniteE4m3x2F16x2Op",
+            dialect_op_name: "nvvm.cvt_rn_satfinite_e4m3x2_f16x2",
+            source_record: "int_nvvm_f16x2_to_e4m3x2_rn",
+            llvm_symbol: "llvm.nvvm.f16x2.to.e4m3x2.rn",
+            llvm_result: "i16",
+            summary: "Converts packed f16x2 to packed e4m3x2 with nearest-even finite saturation, preserving half order.",
+        }),
+        (
+            PackedConversionSourceFormat::F16x2,
+            PackedConversionDestinationFormat::E4m3x2,
+            PackedConversionRounding::NearestEven,
+            PackedConversionSaturation::SatfiniteRelu,
+        ) => Some(PackedConversionRecipe {
+            id: "cvt_rn_satfinite_relu_e4m3x2_f16x2",
+            abi_id: "i0823",
+            operation_key: "packed.convert.f16x2.e4m3x2.nearest_even.satfinite.relu",
+            rust_name: "cvt_rn_satfinite_relu_e4m3x2_f16x2",
+            compatibility_path: "cuda_device::convert::cvt_rn_satfinite_relu_e4m3x2_f16x2",
+            dialect_op_type: "CvtRnSatfiniteReluE4m3x2F16x2Op",
+            dialect_op_name: "nvvm.cvt_rn_satfinite_relu_e4m3x2_f16x2",
+            source_record: "int_nvvm_f16x2_to_e4m3x2_rn_relu",
+            llvm_symbol: "llvm.nvvm.f16x2.to.e4m3x2.rn.relu",
+            llvm_result: "i16",
+            summary: "Converts packed f16x2 to packed e4m3x2 with nearest-even finite saturation and ReLU, preserving half order.",
+        }),
+        (
+            PackedConversionSourceFormat::F16x2,
+            PackedConversionDestinationFormat::E5m2x2,
+            PackedConversionRounding::NearestEven,
+            PackedConversionSaturation::Satfinite,
+        ) => Some(PackedConversionRecipe {
+            id: "cvt_rn_satfinite_e5m2x2_f16x2",
+            abi_id: "i0824",
+            operation_key: "packed.convert.f16x2.e5m2x2.nearest_even.satfinite",
+            rust_name: "cvt_rn_satfinite_e5m2x2_f16x2",
+            compatibility_path: "cuda_device::convert::cvt_rn_satfinite_e5m2x2_f16x2",
+            dialect_op_type: "CvtRnSatfiniteE5m2x2F16x2Op",
+            dialect_op_name: "nvvm.cvt_rn_satfinite_e5m2x2_f16x2",
+            source_record: "int_nvvm_f16x2_to_e5m2x2_rn",
+            llvm_symbol: "llvm.nvvm.f16x2.to.e5m2x2.rn",
+            llvm_result: "i16",
+            summary: "Converts packed f16x2 to packed e5m2x2 with nearest-even finite saturation, preserving half order.",
+        }),
+        (
+            PackedConversionSourceFormat::F16x2,
+            PackedConversionDestinationFormat::E5m2x2,
+            PackedConversionRounding::NearestEven,
+            PackedConversionSaturation::SatfiniteRelu,
+        ) => Some(PackedConversionRecipe {
+            id: "cvt_rn_satfinite_relu_e5m2x2_f16x2",
+            abi_id: "i0825",
+            operation_key: "packed.convert.f16x2.e5m2x2.nearest_even.satfinite.relu",
+            rust_name: "cvt_rn_satfinite_relu_e5m2x2_f16x2",
+            compatibility_path: "cuda_device::convert::cvt_rn_satfinite_relu_e5m2x2_f16x2",
+            dialect_op_type: "CvtRnSatfiniteReluE5m2x2F16x2Op",
+            dialect_op_name: "nvvm.cvt_rn_satfinite_relu_e5m2x2_f16x2",
+            source_record: "int_nvvm_f16x2_to_e5m2x2_rn_relu",
+            llvm_symbol: "llvm.nvvm.f16x2.to.e5m2x2.rn.relu",
+            llvm_result: "i16",
+            summary: "Converts packed f16x2 to packed e5m2x2 with nearest-even finite saturation and ReLU, preserving half order.",
+        }),
+        (
+            PackedConversionSourceFormat::E4m3x2,
+            PackedConversionDestinationFormat::F16x2,
+            PackedConversionRounding::NearestEven,
+            PackedConversionSaturation::None,
+        ) => Some(PackedConversionRecipe {
+            id: "cvt_rn_f16x2_e4m3x2",
+            abi_id: "i0826",
+            operation_key: "packed.convert.e4m3x2.f16x2.nearest_even",
+            rust_name: "cvt_rn_f16x2_e4m3x2",
+            compatibility_path: "cuda_device::convert::cvt_rn_f16x2_e4m3x2",
+            dialect_op_type: "CvtRnF16x2E4m3x2Op",
+            dialect_op_name: "nvvm.cvt_rn_f16x2_e4m3x2",
+            source_record: "int_nvvm_e4m3x2_to_f16x2_rn",
+            llvm_symbol: "llvm.nvvm.e4m3x2.to.f16x2.rn",
+            llvm_result: "v2f16",
+            summary: "Converts packed e4m3x2 to packed f16x2, preserving byte order.",
+        }),
+        (
+            PackedConversionSourceFormat::E4m3x2,
+            PackedConversionDestinationFormat::F16x2,
+            PackedConversionRounding::NearestEven,
+            PackedConversionSaturation::Relu,
+        ) => Some(PackedConversionRecipe {
+            id: "cvt_rn_relu_f16x2_e4m3x2",
+            abi_id: "i0827",
+            operation_key: "packed.convert.e4m3x2.f16x2.nearest_even.relu",
+            rust_name: "cvt_rn_relu_f16x2_e4m3x2",
+            compatibility_path: "cuda_device::convert::cvt_rn_relu_f16x2_e4m3x2",
+            dialect_op_type: "CvtRnReluF16x2E4m3x2Op",
+            dialect_op_name: "nvvm.cvt_rn_relu_f16x2_e4m3x2",
+            source_record: "int_nvvm_e4m3x2_to_f16x2_rn_relu",
+            llvm_symbol: "llvm.nvvm.e4m3x2.to.f16x2.rn.relu",
+            llvm_result: "v2f16",
+            summary: "Converts packed e4m3x2 to packed f16x2 with ReLU, preserving byte order.",
+        }),
+        (
+            PackedConversionSourceFormat::E5m2x2,
+            PackedConversionDestinationFormat::F16x2,
+            PackedConversionRounding::NearestEven,
+            PackedConversionSaturation::None,
+        ) => Some(PackedConversionRecipe {
+            id: "cvt_rn_f16x2_e5m2x2",
+            abi_id: "i0828",
+            operation_key: "packed.convert.e5m2x2.f16x2.nearest_even",
+            rust_name: "cvt_rn_f16x2_e5m2x2",
+            compatibility_path: "cuda_device::convert::cvt_rn_f16x2_e5m2x2",
+            dialect_op_type: "CvtRnF16x2E5m2x2Op",
+            dialect_op_name: "nvvm.cvt_rn_f16x2_e5m2x2",
+            source_record: "int_nvvm_e5m2x2_to_f16x2_rn",
+            llvm_symbol: "llvm.nvvm.e5m2x2.to.f16x2.rn",
+            llvm_result: "v2f16",
+            summary: "Converts packed e5m2x2 to packed f16x2, preserving byte order.",
+        }),
+        (
+            PackedConversionSourceFormat::E5m2x2,
+            PackedConversionDestinationFormat::F16x2,
+            PackedConversionRounding::NearestEven,
+            PackedConversionSaturation::Relu,
+        ) => Some(PackedConversionRecipe {
+            id: "cvt_rn_relu_f16x2_e5m2x2",
+            abi_id: "i0829",
+            operation_key: "packed.convert.e5m2x2.f16x2.nearest_even.relu",
+            rust_name: "cvt_rn_relu_f16x2_e5m2x2",
+            compatibility_path: "cuda_device::convert::cvt_rn_relu_f16x2_e5m2x2",
+            dialect_op_type: "CvtRnReluF16x2E5m2x2Op",
+            dialect_op_name: "nvvm.cvt_rn_relu_f16x2_e5m2x2",
+            source_record: "int_nvvm_e5m2x2_to_f16x2_rn_relu",
+            llvm_symbol: "llvm.nvvm.e5m2x2.to.f16x2.rn.relu",
+            llvm_result: "v2f16",
+            summary: "Converts packed e5m2x2 to packed f16x2 with ReLU, preserving byte order.",
+        }),
+        _ => None,
+    }
+}
+
+fn packed_conversion_recipe_f32x2(
+    conversion: &crate::model::PackedConversion,
+) -> Option<PackedConversionRecipe> {
     match (
         conversion.destination_format,
         conversion.rounding,
@@ -14678,8 +15021,40 @@ fn packed_conversion_ptx_modifiers(
         PackedConversionSaturation::Satfinite => modifiers.push("satfinite"),
         PackedConversionSaturation::SatfiniteRelu => modifiers.extend(["satfinite", "relu"]),
     }
-    modifiers.extend([format, "f32"]);
+    modifiers.extend([format, conversion.source_format.ptx_token()]);
     modifiers
+}
+
+/// Whether either side of the conversion is a packed FP8 format.
+fn packed_conversion_uses_fp8(conversion: &crate::model::PackedConversion) -> bool {
+    matches!(
+        conversion.source_format,
+        PackedConversionSourceFormat::E4m3x2 | PackedConversionSourceFormat::E5m2x2
+    ) || matches!(
+        conversion.destination_format,
+        PackedConversionDestinationFormat::E4m3x2 | PackedConversionDestinationFormat::E5m2x2
+    )
+}
+
+/// Source operand types, in Rust, dialect, and LLVM spellings.
+///
+/// A packed source arrives in one register; `f32x2` names two scalar operands.
+fn packed_conversion_source_types(
+    conversion: &crate::model::PackedConversion,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    match conversion.source_format {
+        PackedConversionSourceFormat::F32x2 => (
+            vec!["f32".into(), "f32".into()],
+            vec!["f32".into(), "f32".into()],
+            vec!["f32".into(), "f32".into()],
+        ),
+        PackedConversionSourceFormat::F16x2 => {
+            (vec!["u32".into()], vec!["i32".into()], vec!["v2f16".into()])
+        }
+        PackedConversionSourceFormat::E4m3x2 | PackedConversionSourceFormat::E5m2x2 => {
+            (vec!["u16".into()], vec!["i16".into()], vec!["i16".into()])
+        }
+    }
 }
 
 fn packed_conversion_result_width(conversion: &crate::model::PackedConversion) -> u32 {
@@ -14692,6 +15067,11 @@ fn packed_conversion_result_width(conversion: &crate::model::PackedConversion) -
 fn packed_conversion_floor(
     conversion: &crate::model::PackedConversion,
 ) -> (&'static str, &'static str) {
+    // FP8 on either side carries the Ada floor, including when FP8 is the
+    // source and the destination is the older `f16x2`.
+    if packed_conversion_uses_fp8(conversion) {
+        return ("8.1", "sm_89");
+    }
     match conversion.destination_format {
         PackedConversionDestinationFormat::Bf16x2 | PackedConversionDestinationFormat::F16x2 => {
             ("7.0", "sm_80")
@@ -14706,23 +15086,33 @@ fn packed_conversion_backend_mechanism(
     conversion: &crate::model::PackedConversion,
     backend: IntrinsicBackend,
 ) -> BackendLoweringMechanism {
-    match (conversion.destination_format, backend) {
-        (
-            PackedConversionDestinationFormat::E4m3x2 | PackedConversionDestinationFormat::E5m2x2,
-            IntrinsicBackend::LlvmNvptx,
-        ) => BackendLoweringMechanism::TypedNvvm,
+    match (packed_conversion_uses_typed_nvvm(conversion), backend) {
+        (true, IntrinsicBackend::LlvmNvptx) => BackendLoweringMechanism::TypedNvvm,
         _ => BackendLoweringMechanism::InlinePtx,
     }
 }
 
+/// Whether the conversion lowers through a typed NVVM intrinsic call.
+///
+/// Only the scalar-`f32` pair does. The `f16x2` sources and destinations carry
+/// their halves in one integer register on the MIR side, while the typed
+/// intrinsics are declared over `<2 x half>`; routing them through inline PTX
+/// avoids a packed-half MIR type for no change in emitted code. The recorded
+/// evidence assembles both routes to a byte-identical cubin, so the typed route
+/// can be switched on later without changing the PTX contract.
+fn packed_conversion_uses_typed_nvvm(conversion: &crate::model::PackedConversion) -> bool {
+    conversion.source_format == PackedConversionSourceFormat::F32x2
+        && matches!(
+            conversion.destination_format,
+            PackedConversionDestinationFormat::E4m3x2 | PackedConversionDestinationFormat::E5m2x2
+        )
+}
+
 fn packed_conversion_lowering(conversion: &crate::model::PackedConversion) -> &'static str {
-    match conversion.destination_format {
-        PackedConversionDestinationFormat::Bf16x2 | PackedConversionDestinationFormat::F16x2 => {
-            "generated_packed_conversion_inline_ptx"
-        }
-        PackedConversionDestinationFormat::E4m3x2 | PackedConversionDestinationFormat::E5m2x2 => {
-            "generated_packed_conversion_backend"
-        }
+    if packed_conversion_uses_typed_nvvm(conversion) {
+        "generated_packed_conversion_backend"
+    } else {
+        "generated_packed_conversion_inline_ptx"
     }
 }
 
@@ -14781,6 +15171,102 @@ fn expand_packed_conversion_fp8_admission(
     Ok(records)
 }
 
+fn expand_packed_conversion_fp8_f16x2_admission(
+    admission: &PackedConversionFp8F16x2Admission,
+) -> Result<Vec<OverlayIntrinsic>> {
+    ensure!(
+        admission.runtime_validation == RuntimeValidation::Unexecuted,
+        "FP8 f16x2 conversion runtime validation may be marked executed only with GPU evidence"
+    );
+    ensure!(
+        admission.fp8_formats
+            == [
+                PackedConversionFp8Format::E4m3x2,
+                PackedConversionFp8Format::E5m2x2,
+            ],
+        "compact FP8 f16x2 conversion admission must list the canonical two formats"
+    );
+    ensure!(
+        admission.directions
+            == [
+                PackedConversionFp8Direction::Pack,
+                PackedConversionFp8Direction::Unpack,
+            ],
+        "compact FP8 f16x2 conversion admission must list both conversion directions"
+    );
+    ensure!(
+        admission.relu_variants,
+        "compact FP8 f16x2 conversion admission must admit the ReLU variants"
+    );
+    ensure!(
+        admission.product_count
+            == admission
+                .fp8_formats
+                .len()
+                .checked_mul(admission.directions.len())
+                .and_then(|count| count.checked_mul(2))
+                .context("compact FP8 f16x2 conversion product count overflow")?
+            && admission.product_count == 8,
+        "compact FP8 f16x2 conversion product_count must be exactly 8"
+    );
+
+    let mut records = Vec::with_capacity(admission.product_count);
+    for &fp8_format in &admission.fp8_formats {
+        for &direction in &admission.directions {
+            for relu in [false, true] {
+                let conversion = match direction {
+                    // Narrowing to FP8 always saturates to finite.
+                    PackedConversionFp8Direction::Pack => crate::model::PackedConversion {
+                        source_format: PackedConversionSourceFormat::F16x2,
+                        destination_format: match fp8_format {
+                            PackedConversionFp8Format::E4m3x2 => {
+                                PackedConversionDestinationFormat::E4m3x2
+                            }
+                            PackedConversionFp8Format::E5m2x2 => {
+                                PackedConversionDestinationFormat::E5m2x2
+                            }
+                        },
+                        rounding: PackedConversionRounding::NearestEven,
+                        saturation: if relu {
+                            PackedConversionSaturation::SatfiniteRelu
+                        } else {
+                            PackedConversionSaturation::Satfinite
+                        },
+                        adapter: PackedConversionAdapter::Identity,
+                    },
+                    // Widening back to f16x2 is exact, so it carries no
+                    // saturation modifier of its own.
+                    PackedConversionFp8Direction::Unpack => crate::model::PackedConversion {
+                        source_format: match fp8_format {
+                            PackedConversionFp8Format::E4m3x2 => {
+                                PackedConversionSourceFormat::E4m3x2
+                            }
+                            PackedConversionFp8Format::E5m2x2 => {
+                                PackedConversionSourceFormat::E5m2x2
+                            }
+                        },
+                        destination_format: PackedConversionDestinationFormat::F16x2,
+                        rounding: PackedConversionRounding::NearestEven,
+                        saturation: if relu {
+                            PackedConversionSaturation::Relu
+                        } else {
+                            PackedConversionSaturation::None
+                        },
+                        adapter: PackedConversionAdapter::Identity,
+                    },
+                };
+                records.push(packed_conversion_overlay_record(
+                    conversion,
+                    &admission.llvm_evidence_profile,
+                    &admission.libnvvm_evidence_profile,
+                )?);
+            }
+        }
+    }
+    ensure!(records.len() == admission.product_count);
+    Ok(records)
+}
+
 fn packed_conversion_overlay_record(
     conversion: crate::model::PackedConversion,
     llvm_evidence_profile: &str,
@@ -14792,6 +15278,14 @@ fn packed_conversion_overlay_record(
     let rust_result = format!("u{result_width}");
     let dialect_result = format!("i{result_width}");
     let (minimum_ptx, minimum_sm) = packed_conversion_floor(&conversion);
+    let (rust_arguments, dialect_operands, llvm_arguments) =
+        packed_conversion_source_types(&conversion);
+    // `cvt` writes one destination and reads every source operand.
+    let ptx_operands = conversion
+        .source_format
+        .operand_count()
+        .checked_add(1)
+        .context("packed-conversion operand count overflow")?;
     Ok(OverlayIntrinsic {
         id: recipe.id.into(),
         abi_id: String::new(),
@@ -14801,7 +15295,7 @@ fn packed_conversion_overlay_record(
         source_record: Some(recipe.source_record.into()),
         rust_module: "convert".into(),
         rust_name: recipe.rust_name.into(),
-        rust_arguments: vec!["f32".into(), "f32".into()],
+        rust_arguments,
         rust_result: rust_result.clone(),
         safe: true,
         must_use: false,
@@ -14810,11 +15304,11 @@ fn packed_conversion_overlay_record(
         compatibility_rust_paths: vec![recipe.compatibility_path.into()],
         dialect_op_type: recipe.dialect_op_type.into(),
         dialect_op_name: recipe.dialect_op_name.into(),
-        dialect_operands: vec!["f32".into(), "f32".into()],
+        dialect_operands,
         dialect_results: vec![dialect_result],
         llvm_symbol: Some(recipe.llvm_symbol.into()),
         resolved_llvm_symbol: None,
-        llvm_arguments: vec!["f32".into(), "f32".into()],
+        llvm_arguments,
         llvm_results: vec![recipe.llvm_result.into()],
         pure: true,
         memory: "none".into(),
@@ -14883,7 +15377,7 @@ fn packed_conversion_overlay_record(
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
-            operands: vec![OperandPattern::Register; 3],
+            operands: vec![OperandPattern::Register; ptx_operands],
         },
         summary: recipe.summary.into(),
     })
@@ -14898,15 +15392,23 @@ fn validate_packed_conversion_policy(
         .packed_conversion
         .as_ref()
         .with_context(|| format!("{} has no closed packed-conversion contract", policy.id))?;
+    // The adapter is a function of the source arity: two scalar operands are
+    // reversed so the first Rust argument lands in the low half, while a single
+    // packed operand is forwarded unchanged.
+    let expected_adapter = match conversion.source_format {
+        PackedConversionSourceFormat::F32x2 => PackedConversionAdapter::ReverseHighLowOperands,
+        PackedConversionSourceFormat::E4m3x2
+        | PackedConversionSourceFormat::E5m2x2
+        | PackedConversionSourceFormat::F16x2 => PackedConversionAdapter::Identity,
+    };
     ensure!(
-        conversion.source_format == PackedConversionSourceFormat::F32x2
-            && conversion.adapter == PackedConversionAdapter::ReverseHighLowOperands,
+        conversion.adapter == expected_adapter,
         "{} requests an unsupported packed-conversion source or adapter",
         policy.id
     );
     let recipe = packed_conversion_recipe(conversion).with_context(|| {
         format!(
-            "{} requests an unsupported packed-conversion destination, rounding, or saturation combination",
+            "{} requests an unsupported packed-conversion source, destination, rounding, or saturation combination",
             policy.id
         )
     })?;
@@ -14914,6 +15416,8 @@ fn validate_packed_conversion_policy(
     let rust_result = format!("u{result_width}");
     let dialect_result = format!("i{result_width}");
     let (minimum_ptx, minimum_sm) = packed_conversion_floor(conversion);
+    let (expected_rust_arguments, expected_dialect_operands, expected_llvm_arguments) =
+        packed_conversion_source_types(conversion);
     ensure!(
         policy.id == recipe.id
             && policy.abi_id == recipe.abi_id
@@ -14924,7 +15428,7 @@ fn validate_packed_conversion_policy(
                 }
             && policy.llvm_symbol.as_deref() == Some(recipe.llvm_symbol)
             && policy.resolved_llvm_symbol.is_none()
-            && policy.llvm_arguments == ["f32", "f32"]
+            && policy.llvm_arguments == expected_llvm_arguments
             && policy.llvm_results == [recipe.llvm_result],
         "{} packed-conversion identity or LLVM source changed",
         policy.id
@@ -14939,7 +15443,7 @@ fn validate_packed_conversion_policy(
     ensure!(
         policy.rust_module == "convert"
             && policy.rust_name == recipe.rust_name
-            && policy.rust_arguments == ["f32", "f32"]
+            && policy.rust_arguments == expected_rust_arguments
             && policy.rust_result == rust_result
             && policy.safe
             && !policy.must_use
@@ -14955,7 +15459,7 @@ fn validate_packed_conversion_policy(
     ensure!(
         policy.dialect_op_type == recipe.dialect_op_type
             && policy.dialect_op_name == recipe.dialect_op_name
-            && policy.dialect_operands == ["f32", "f32"]
+            && policy.dialect_operands == expected_dialect_operands
             && policy.dialect_results == [dialect_result.as_str()]
             && policy.lowering == packed_conversion_lowering(conversion),
         "{} is outside the closed packed-conversion dialect and lowering recipe",
@@ -14977,16 +15481,19 @@ fn validate_packed_conversion_policy(
         "{} packed-conversion effects, carrier, target floor, or PTX provenance disagree",
         policy.id
     );
+    let expected_ptx_operands = vec![
+        OperandPattern::Register;
+        conversion
+            .source_format
+            .operand_count()
+            .checked_add(1)
+            .context("packed-conversion operand count overflow")?
+    ];
     ensure!(
         policy.expected_ptx.mnemonic == "cvt"
             && policy.expected_ptx.modifiers == packed_conversion_ptx_modifiers(conversion)
-            && policy.expected_ptx.operands
-                == [
-                    OperandPattern::Register,
-                    OperandPattern::Register,
-                    OperandPattern::Register,
-                ],
-        "{} expected PTX does not match the reversed high/low conversion recipe",
+            && policy.expected_ptx.operands == expected_ptx_operands,
+        "{} expected PTX does not match its closed conversion recipe",
         policy.id
     );
     ensure!(
@@ -16806,7 +17313,7 @@ struct ExtendedMinMaxRecipe {
 }
 
 fn canonical_extended_minmax_variants() -> Vec<ExtendedMinMaxVariant> {
-    use ExtendedMinMaxFormat::{Bf16x2, F16x2, F32};
+    use ExtendedMinMaxFormat::{Bf16, Bf16x2, F16, F16x2, F32};
     use ExtendedMinMaxNan::{Nan, Number};
     use ExtendedMinMaxOperation::{Max, Min};
     use ExtendedMinMaxSubnormal::{Ftz, Preserve};
@@ -16829,15 +17336,81 @@ fn canonical_extended_minmax_variants() -> Vec<ExtendedMinMaxVariant> {
             (F16x2, operation, Preserve, Number, true),
         ]
     };
+    // The scalar 16-bit forms. LLVM declares every `f16` modifier combination
+    // and the four `bf16` combinations that do not request `ftz`; the four
+    // `bf16` `ftz` declarations exist but have no NVPTX selection pattern and
+    // fail instruction selection, so they are deliberately absent here.
+    //
+    // These variants were admitted after the first block, so they continue the
+    // ABI id space at a second base - see `extended_minmax_abi_id`.
+    let scalar_halves = |operation| {
+        [
+            (F16, operation, Preserve, Number, false),
+            (F16, operation, Ftz, Number, false),
+            (F16, operation, Preserve, Nan, false),
+            (F16, operation, Ftz, Nan, false),
+            (F16, operation, Preserve, Number, true),
+            (F16, operation, Ftz, Number, true),
+            (F16, operation, Preserve, Nan, true),
+            (F16, operation, Ftz, Nan, true),
+            (Bf16, operation, Preserve, Number, false),
+            (Bf16, operation, Preserve, Nan, false),
+            (Bf16, operation, Preserve, Number, true),
+            (Bf16, operation, Preserve, Nan, true),
+        ]
+    };
     one_operation(Min)
         .into_iter()
         .chain(one_operation(Max))
+        .chain(scalar_halves(Min))
+        .chain(scalar_halves(Max))
         .collect()
+}
+
+/// Maps a canonical variant index to its reserved ABI id.
+///
+/// The family was admitted as one contiguous block at
+/// `EXTENDED_MINMAX_FIRST_ABI_BASE`. Later additions cannot continue that block
+/// because the ids immediately after it were already reserved by other
+/// families, so they open a second block instead. The ledger is append-only,
+/// which makes the discontinuity permanent.
+fn extended_minmax_abi_id(index: usize) -> String {
+    const EXTENDED_MINMAX_FIRST_ABI_BASE: usize = 550;
+    const EXTENDED_MINMAX_FIRST_ABI_COUNT: usize = 28;
+    const EXTENDED_MINMAX_SECOND_ABI_BASE: usize = 830;
+
+    if index < EXTENDED_MINMAX_FIRST_ABI_COUNT {
+        format!("i{:04}", EXTENDED_MINMAX_FIRST_ABI_BASE + index)
+    } else {
+        format!(
+            "i{:04}",
+            EXTENDED_MINMAX_SECOND_ABI_BASE + index - EXTENDED_MINMAX_FIRST_ABI_COUNT
+        )
+    }
+}
+
+/// Joins an operation name, its modifiers, and its format into one identifier.
+///
+/// `min.f16` and `min.bf16` carry no modifier at all, so the separators have to
+/// come from joining the parts that are present rather than from a format
+/// string with fixed separators.
+fn extended_minmax_joined_name(
+    leading: &str,
+    trailing: &str,
+    modifiers: &[&str],
+    separator: &str,
+) -> String {
+    let mut parts = vec![leading];
+    parts.extend(modifiers.iter().copied());
+    parts.push(trailing);
+    parts.join(separator)
 }
 
 fn extended_minmax_format_name(format: ExtendedMinMaxFormat) -> &'static str {
     match format {
         ExtendedMinMaxFormat::F32 => "f32",
+        ExtendedMinMaxFormat::F16 => "f16",
+        ExtendedMinMaxFormat::Bf16 => "bf16",
         ExtendedMinMaxFormat::F16x2 => "f16x2",
         ExtendedMinMaxFormat::Bf16x2 => "bf16x2",
     }
@@ -16876,11 +17449,16 @@ fn extended_minmax_recipe(variant: ExtendedMinMaxVariant) -> Option<ExtendedMinM
         source_modifiers.extend(["xorsign", "abs"]);
         ptx_modifiers.extend(["xorsign".to_owned(), "abs".to_owned()]);
     }
-    let source_modifier = source_modifiers.join("_");
-    let llvm_modifier = source_modifiers.join(".");
-    let id = format!("{operation_name}_{source_modifier}_{format_name}");
-    let source_record = format!("int_nvvm_f{operation_name}_{source_modifier}_{source_type}");
-    let llvm_symbol = format!("llvm.nvvm.f{operation_name}.{llvm_modifier}.{source_type}");
+    let id = extended_minmax_joined_name(operation_name, format_name, &source_modifiers, "_");
+    let intrinsic_name = format!("f{operation_name}");
+    let source_record = format!(
+        "int_nvvm_{}",
+        extended_minmax_joined_name(&intrinsic_name, source_type, &source_modifiers, "_")
+    );
+    let llvm_symbol = format!(
+        "llvm.nvvm.{}",
+        extended_minmax_joined_name(&intrinsic_name, source_type, &source_modifiers, ".")
+    );
     let selection_record = if format == ExtendedMinMaxFormat::F32 {
         format!(
             "INT_NVVM_{}",
@@ -16890,15 +17468,17 @@ fn extended_minmax_recipe(variant: ExtendedMinMaxVariant) -> Option<ExtendedMinM
         )
     } else {
         let prefix = match operation {
-            ExtendedMinMaxOperation::Min => "INT_NVVM_FMIN",
-            ExtendedMinMaxOperation::Max => "INT_NVVM_FMAN",
+            ExtendedMinMaxOperation::Min => "FMIN",
+            ExtendedMinMaxOperation::Max => "FMAN",
         };
         let selection_modifiers = source_modifiers
             .iter()
             .map(|modifier| if *modifier == "nan" { "NaN" } else { modifier })
-            .collect::<Vec<_>>()
-            .join("_");
-        format!("{prefix}_{selection_modifiers}_{format_name}")
+            .collect::<Vec<_>>();
+        format!(
+            "INT_NVVM_{}",
+            extended_minmax_joined_name(prefix, format_name, &selection_modifiers, "_")
+        )
     };
     let ptx_format = if format == ExtendedMinMaxFormat::F32 {
         "f32"
@@ -16936,6 +17516,28 @@ fn extended_minmax_recipe(variant: ExtendedMinMaxVariant) -> Option<ExtendedMinM
             "f32",
             "f32",
             ExtendedMinMaxAdapter::DirectF32,
+            vec![
+                "ClangBuiltin",
+                "NVVMBuiltin",
+                "SDPatternOperator",
+                "Intrinsic",
+                "DefaultAttrsIntrinsic",
+            ],
+        ),
+        ExtendedMinMaxFormat::F16 => (
+            "f16",
+            "f16",
+            "u16",
+            "i16",
+            ExtendedMinMaxAdapter::DirectHalfU16,
+            vec!["SDPatternOperator", "Intrinsic", "DefaultAttrsIntrinsic"],
+        ),
+        ExtendedMinMaxFormat::Bf16 => (
+            "bf16",
+            "bf16",
+            "u16",
+            "i16",
+            ExtendedMinMaxAdapter::DirectHalfU16,
             vec![
                 "ClangBuiltin",
                 "NVVMBuiltin",
@@ -16987,7 +17589,7 @@ fn extended_minmax_recipe(variant: ExtendedMinMaxVariant) -> Option<ExtendedMinM
     };
     Some(ExtendedMinMaxRecipe {
         id,
-        abi_id: format!("i{:04}", 550 + index),
+        abi_id: extended_minmax_abi_id(index),
         operation_key: format!(
             "floating.minmax.{format_name}.{operation_name}.{}.{}.{}",
             match subnormal {
@@ -17213,10 +17815,14 @@ fn validate_extended_minmax_policy(
         "{} extended-minmax runtime may be executed only with GPU evidence",
         policy.id
     );
-    let expected_adapter = if minmax.format == ExtendedMinMaxFormat::F32 {
-        ExtendedMinMaxAdapter::DirectF32
-    } else {
-        ExtendedMinMaxAdapter::DirectPackedU32
+    let expected_adapter = match minmax.format {
+        ExtendedMinMaxFormat::F32 => ExtendedMinMaxAdapter::DirectF32,
+        ExtendedMinMaxFormat::F16 | ExtendedMinMaxFormat::Bf16 => {
+            ExtendedMinMaxAdapter::DirectHalfU16
+        }
+        ExtendedMinMaxFormat::F16x2 | ExtendedMinMaxFormat::Bf16x2 => {
+            ExtendedMinMaxAdapter::DirectPackedU32
+        }
     };
     ensure!(
         minmax.adapter == expected_adapter,
@@ -18660,7 +19266,7 @@ fn is_dense_f8f6f4_register_mma_policy(policy: &OverlayIntrinsic) -> bool {
 
 fn is_sparse_f8f6f4_f16_policy(policy: &OverlayIntrinsic) -> bool {
     policy.family == "sparse_mma"
-        && policy.targets == SPARSE_MMA_F8F6F4_F16_TARGETS
+        && policy.targets == SPARSE_MMA_F8F6F4_TARGETS
         && policy.sparse_mma.as_ref().is_some_and(|mma| {
             mma.shape == SparseMmaShape::M16n8k64
                 && mma.accumulator == SparseMmaAccumulator::F16
@@ -20029,8 +20635,7 @@ fn sparse_mma_minimum_ptx(mma: &SparseMma) -> &'static str {
 
 fn sparse_mma_hardware(mma: &SparseMma) -> (&'static str, Option<&'static str>) {
     match mma.accumulator {
-        SparseMmaAccumulator::F16 => (SPARSE_MMA_F8F6F4_F16_TARGETS, None),
-        SparseMmaAccumulator::F32 => ("sm_120a", None),
+        SparseMmaAccumulator::F16 | SparseMmaAccumulator::F32 => (SPARSE_MMA_F8F6F4_TARGETS, None),
         SparseMmaAccumulator::S32 => ("all", Some("sm_80")),
     }
 }
@@ -22070,7 +22675,15 @@ fn expand_debug_control_admission(
                         mechanism: BackendLoweringMechanism::InlinePtx,
                         evidence_profile: admission.libnvvm_evidence_profile.clone(),
                         targets: None,
-                        minimum_ptx: Some("9.3".into()),
+                        // PTX floor is the inline-PTX mechanism floor, same as
+                        // the LlvmNvptx entry above; the hardware floor stays at
+                        // the probed sm_75 (backend-codegen evidence must sit
+                        // exactly at the hardware floor, and CUDA 13 cannot
+                        // probe older targets). Writing the probe PTX version
+                        // (9.3) here made every panic path unbuildable on the
+                        // NVVM-IR route: the floor exceeded the newest PTX
+                        // version cuda-oxide can request.
+                        minimum_ptx: Some("3.2".into()),
                         minimum_sm: Some("sm_75".into()),
                     },
                 ],
@@ -22215,7 +22828,7 @@ fn validate_debug_control_policy(
         policy,
         [
             (IntrinsicBackend::LlvmNvptx, "3.2", Some("sm_20")),
-            (IntrinsicBackend::LibNvvm, "9.3", Some("sm_75")),
+            (IntrinsicBackend::LibNvvm, "3.2", Some("sm_75")),
         ],
         "debug-control",
     )?;
@@ -23792,8 +24405,8 @@ fn validate_movmatrix_policy(policy: &OverlayIntrinsic, source: &IntrinsicSource
             && policy.dialect_op_name == "nvvm.movmatrix_trans_b16"
             && policy.dialect_operands == ["i32"]
             && policy.dialect_results == ["i32"]
-            && policy.pure
-            && policy.memory == "none"
+            && !policy.pure
+            && policy.memory == "inaccessible_read_write"
             && policy.convergent
             && policy.execution_scope == "warp"
             && policy.minimum_ptx == "7.8"
@@ -26272,8 +26885,8 @@ mod tests {
         record.resolved_llvm_symbol = None;
         record.llvm_arguments.clear();
         record.llvm_results.clear();
-        record.pure = true;
-        record.memory = "none".into();
+        record.pure = false;
+        record.memory = "inaccessible_read_write".into();
         record.convergent = true;
         record.execution_scope = "warp".into();
         record.minimum_ptx = "7.8".into();
@@ -26635,7 +27248,7 @@ mod tests {
         format: PackedAluFormat,
         operation: PackedAluOperation,
     ) -> OverlayIntrinsic {
-        let recipe = packed_alu_recipe(format, operation);
+        let recipe = packed_alu_recipe(format, operation).expect("test recipe pair");
         let rust_module = match format {
             PackedAluFormat::Bf16x2 => "bf16x2",
             PackedAluFormat::F16x2 => "f16x2",
@@ -26700,7 +27313,7 @@ mod tests {
             .into_iter()
             .map(|backend| {
                 let (minimum_ptx, minimum_sm) =
-                    packed_alu_backend_floor(format, operation, backend);
+                    packed_alu_backend_floor(&recipe, format, operation, backend);
                 crate::model::OverlayBackendLowering {
                     backend,
                     mechanism: BackendLoweringMechanism::InlinePtx,
@@ -26730,7 +27343,7 @@ mod tests {
         format: PackedAluFormat,
         operation: PackedAluOperation,
     ) -> Option<ImportedIntrinsic> {
-        let recipe = packed_alu_recipe(format, operation);
+        let recipe = packed_alu_recipe(format, operation).expect("test recipe pair");
         let PackedAluRecipeSource::Imported {
             record,
             symbol,
@@ -27662,8 +28275,8 @@ mod tests {
         let (overlay, hash) =
             read_overlay(&repo_root, &repo_root.join("intrinsics/overlay.toml")).unwrap();
         assert_eq!(overlay.schema, OVERLAY_SCHEMA);
-        assert_eq!(overlay.shards.len(), 58);
-        assert_eq!(overlay.intrinsics.len(), 821);
+        assert_eq!(overlay.shards.len(), 59);
+        assert_eq!(overlay.intrinsics.len(), 857);
         assert_eq!(
             overlay
                 .intrinsics
@@ -27710,7 +28323,7 @@ mod tests {
                 .iter()
                 .filter(|record| record.family == "packed_alu")
                 .count(),
-            18
+            22
         );
         assert_eq!(
             overlay
@@ -27718,7 +28331,7 @@ mod tests {
                 .iter()
                 .filter(|record| record.family == "packed_conversion")
                 .count(),
-            10
+            18
         );
         assert_eq!(
             overlay
@@ -27972,6 +28585,24 @@ mod tests {
                 PackedConversionSaturation::SatfiniteRelu,
             ],
             product_count: 4,
+        }
+    }
+
+    fn test_fp8_f16x2_conversion_admission() -> PackedConversionFp8F16x2Admission {
+        PackedConversionFp8F16x2Admission {
+            llvm_evidence_profile: "llvm-test".into(),
+            libnvvm_evidence_profile: "libnvvm-test".into(),
+            runtime_validation: RuntimeValidation::Unexecuted,
+            fp8_formats: vec![
+                PackedConversionFp8Format::E4m3x2,
+                PackedConversionFp8Format::E5m2x2,
+            ],
+            directions: vec![
+                PackedConversionFp8Direction::Pack,
+                PackedConversionFp8Direction::Unpack,
+            ],
+            relu_variants: true,
+            product_count: 8,
         }
     }
 
@@ -28451,6 +29082,7 @@ mod tests {
             sparse_mma_f8f6f4_f16: None,
             prmt,
             packed_conversion_fp8: None,
+            packed_conversion_fp8_f16x2: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
             scalar_math: None,
@@ -28572,6 +29204,7 @@ mod tests {
             sparse_mma_f8f6f4_f16: None,
             prmt: None,
             packed_conversion_fp8: Some(test_fp8_conversion_admission()),
+            packed_conversion_fp8_f16x2: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
             scalar_math: None,
@@ -28614,6 +29247,7 @@ mod tests {
             sparse_mma_f8f6f4_f16: None,
             prmt: None,
             packed_conversion_fp8: None,
+            packed_conversion_fp8_f16x2: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
             scalar_math: None,
@@ -28657,6 +29291,7 @@ mod tests {
             sparse_mma_f8f6f4_f16: None,
             prmt: None,
             packed_conversion_fp8: None,
+            packed_conversion_fp8_f16x2: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
             scalar_math: None,
@@ -28900,6 +29535,7 @@ record_count = 14
             sparse_mma_f8f6f4_f16: None,
             prmt: None,
             packed_conversion_fp8: None,
+            packed_conversion_fp8_f16x2: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
             scalar_math: None,
@@ -29362,7 +29998,7 @@ scope = "system"
         );
         assert_eq!(first.minimum_ptx, "8.7");
         assert_eq!(first.minimum_sm, None);
-        assert_eq!(first.targets, SPARSE_MMA_F8F6F4_F16_TARGETS);
+        assert_eq!(first.targets, SPARSE_MMA_F8F6F4_TARGETS);
         assert!(first.convergent && !first.pure);
         assert!(first.backend_lowerings.iter().all(|route| {
             route.mechanism == BackendLoweringMechanism::InlinePtx
@@ -30223,6 +30859,87 @@ scope = "system"
     }
 
     #[test]
+    fn compact_fp8_f16x2_conversion_axes_require_the_exact_closed_product() {
+        let records =
+            expand_packed_conversion_fp8_f16x2_admission(&test_fp8_f16x2_conversion_admission())
+                .unwrap();
+        assert_eq!(records.len(), 8);
+        assert_eq!(records[0].id, "cvt_rn_satfinite_e4m3x2_f16x2");
+        assert_eq!(records[1].id, "cvt_rn_satfinite_relu_e4m3x2_f16x2");
+        assert_eq!(records[2].id, "cvt_rn_f16x2_e4m3x2");
+        assert_eq!(records[3].id, "cvt_rn_relu_f16x2_e4m3x2");
+        assert_eq!(records[4].id, "cvt_rn_satfinite_e5m2x2_f16x2");
+        assert_eq!(records[5].id, "cvt_rn_satfinite_relu_e5m2x2_f16x2");
+        assert_eq!(records[6].id, "cvt_rn_f16x2_e5m2x2");
+        assert_eq!(records[7].id, "cvt_rn_relu_f16x2_e5m2x2");
+
+        // Every form takes one packed operand and carries the Ada floor,
+        // including the unpacks whose destination is the older f16x2.
+        assert!(records.iter().all(|record| {
+            record.rust_arguments.len() == 1
+                && record.dialect_operands.len() == 1
+                && record.llvm_arguments.len() == 1
+                && record.expected_ptx.operands.len() == 2
+                && record.minimum_ptx == "8.1"
+                && record.minimum_sm.as_deref() == Some("sm_89")
+                && record.pure
+                && !record.convergent
+        }));
+
+        // Packing narrows f16x2 to a 16-bit FP8 pair; unpacking widens back.
+        assert!(
+            records
+                .iter()
+                .filter(|record| record.id.ends_with("_f16x2"))
+                .all(|record| {
+                    record.rust_arguments == ["u32"]
+                        && record.rust_result == "u16"
+                        && record.llvm_arguments == ["v2f16"]
+                        && record.llvm_results == ["i16"]
+                })
+        );
+        assert!(
+            records
+                .iter()
+                .filter(|record| !record.id.ends_with("_f16x2"))
+                .all(|record| {
+                    record.rust_arguments == ["u16"]
+                        && record.rust_result == "u32"
+                        && record.llvm_arguments == ["i16"]
+                        && record.llvm_results == ["v2f16"]
+                })
+        );
+
+        let mut missing_format = test_fp8_f16x2_conversion_admission();
+        missing_format.fp8_formats.pop();
+        assert!(expand_packed_conversion_fp8_f16x2_admission(&missing_format).is_err());
+
+        let mut reversed_formats = test_fp8_f16x2_conversion_admission();
+        reversed_formats.fp8_formats.reverse();
+        assert!(expand_packed_conversion_fp8_f16x2_admission(&reversed_formats).is_err());
+
+        let mut missing_direction = test_fp8_f16x2_conversion_admission();
+        missing_direction.directions.pop();
+        assert!(expand_packed_conversion_fp8_f16x2_admission(&missing_direction).is_err());
+
+        let mut reversed_directions = test_fp8_f16x2_conversion_admission();
+        reversed_directions.directions.reverse();
+        assert!(expand_packed_conversion_fp8_f16x2_admission(&reversed_directions).is_err());
+
+        let mut without_relu = test_fp8_f16x2_conversion_admission();
+        without_relu.relu_variants = false;
+        assert!(expand_packed_conversion_fp8_f16x2_admission(&without_relu).is_err());
+
+        let mut wrong_count = test_fp8_f16x2_conversion_admission();
+        wrong_count.product_count = 4;
+        assert!(expand_packed_conversion_fp8_f16x2_admission(&wrong_count).is_err());
+
+        let mut executed = test_fp8_f16x2_conversion_admission();
+        executed.runtime_validation = RuntimeValidation::Executed;
+        assert!(expand_packed_conversion_fp8_f16x2_admission(&executed).is_err());
+    }
+
+    #[test]
     fn compact_debug_control_admission_is_closed() {
         let records = expand_debug_control_admission(&test_debug_control_admission()).unwrap();
         assert_eq!(records.len(), 3);
@@ -30386,6 +31103,7 @@ scope = "system"
             sparse_mma_f8f6f4_f16: None,
             prmt: None,
             packed_conversion_fp8: None,
+            packed_conversion_fp8_f16x2: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
             scalar_math: None,
@@ -30520,6 +31238,7 @@ scope = "system"
             sparse_mma_f8f6f4_f16: None,
             prmt: None,
             packed_conversion_fp8: None,
+            packed_conversion_fp8_f16x2: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
             scalar_math: None,
@@ -31670,6 +32389,7 @@ scope = "system"
             sparse_mma_f8f6f4_f16: None,
             prmt: None,
             packed_conversion_fp8: None,
+            packed_conversion_fp8_f16x2: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
             scalar_math: None,
@@ -31869,6 +32589,7 @@ scope = "system"
             sparse_mma_f8f6f4_f16: None,
             prmt: None,
             packed_conversion_fp8: None,
+            packed_conversion_fp8_f16x2: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
             scalar_math: None,
@@ -31915,6 +32636,7 @@ scope = "system"
             sparse_mma_f8f6f4_f16: None,
             prmt: None,
             packed_conversion_fp8: None,
+            packed_conversion_fp8_f16x2: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
             scalar_math: None,
@@ -32358,6 +33080,7 @@ scope = "system"
             sparse_mma_f8f6f4_f16: None,
             prmt: None,
             packed_conversion_fp8: None,
+            packed_conversion_fp8_f16x2: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
             scalar_math: None,
@@ -33131,7 +33854,9 @@ scope = "system"
             assert_eq!(record.llvm_results, ["f32", "f32", "f32", "f32"]);
             assert_eq!(record.minimum_ptx, "8.7");
             assert_eq!(record.minimum_sm, None);
-            assert_eq!(record.targets, "sm_120a");
+            // Same contract as the F16 accumulator: both float forms are gated
+            // on `hasMMABlockScale()`, so neither is narrower than the other.
+            assert_eq!(record.targets, SPARSE_MMA_F8F6F4_TARGETS);
             assert_eq!(record.backend_lowerings.len(), 2);
             assert!(record.backend_lowerings.iter().all(|lowering| {
                 lowering.mechanism == BackendLoweringMechanism::InlinePtx
@@ -33189,7 +33914,7 @@ scope = "system"
             assert_eq!(record.llvm_results, ["v2f16", "v2f16"]);
             assert_eq!(record.minimum_ptx, "8.7");
             assert_eq!(record.minimum_sm, None);
-            assert_eq!(record.targets, SPARSE_MMA_F8F6F4_F16_TARGETS);
+            assert_eq!(record.targets, SPARSE_MMA_F8F6F4_TARGETS);
             assert!(record.convergent && !record.pure);
             assert!(record.backend_lowerings.iter().all(|lowering| {
                 lowering.mechanism == BackendLoweringMechanism::InlinePtx
@@ -33970,6 +34695,17 @@ scope = "system"
         let mut wrong_participation = valid.clone();
         wrong_participation.convergent = false;
         reject(&wrong_participation, "closed movmatrix recipe");
+
+        // A warp collective is not a function of its own operand, so the
+        // pure/no-memory pair every other collective avoids must stay rejected
+        // here too.
+        let mut wrong_purity = valid.clone();
+        wrong_purity.pure = true;
+        reject(&wrong_purity, "closed movmatrix recipe");
+
+        let mut wrong_memory = valid.clone();
+        wrong_memory.memory = "none".into();
+        reject(&wrong_memory, "closed movmatrix recipe");
 
         let mut wrong_floor = valid.clone();
         wrong_floor.backend_lowerings[0].minimum_ptx = Some("8.0".into());
@@ -36932,7 +37668,7 @@ scope = "system"
             .iter()
             .filter(|record| record.family == "packed_alu")
             .collect();
-        assert_eq!(packed.len(), 18);
+        assert_eq!(packed.len(), 22);
         for policy in packed {
             let source = resolve_policy_source(policy).unwrap();
             let declaration = policy
@@ -36959,7 +37695,7 @@ scope = "system"
             .iter()
             .filter(|record| record.family == "packed_conversion")
             .collect();
-        assert_eq!(packed.len(), 10);
+        assert_eq!(packed.len(), 18);
         for policy in packed {
             let source = resolve_policy_source(policy).unwrap();
             let declaration = policy
@@ -37066,7 +37802,7 @@ scope = "system"
 
         let mut wrong_shape = valid.clone();
         wrong_shape.expected_ptx.modifiers.swap(1, 2);
-        reject(&wrong_shape, &declaration, "reversed high/low");
+        reject(&wrong_shape, &declaration, "expected PTX does not match");
 
         let mut wrong_identity = valid.clone();
         wrong_identity.id = "cvt_f16x2_f32".into();
@@ -37079,7 +37815,7 @@ scope = "system"
         reject(
             &unsupported,
             &declaration,
-            "unsupported packed-conversion destination",
+            "unsupported packed-conversion source, destination",
         );
 
         let mut wrong_compatibility = valid.clone();
@@ -37406,25 +38142,31 @@ scope = "system"
                 .collect(),
         };
         let records = expand_extended_minmax_admission(&admission).unwrap();
-        assert_eq!(records.len(), 28);
+        assert_eq!(records.len(), 52);
         assert_eq!(records.first().unwrap().id, "min_ftz_f16x2");
         assert_eq!(records.first().unwrap().abi_id, "i0550");
-        assert_eq!(records.last().unwrap().id, "max_xorsign_abs_f16x2");
-        assert_eq!(records.last().unwrap().abi_id, "i0577");
+        // The first reserved block ends here; the scalar 16-bit forms admitted
+        // afterwards continue at a second base rather than at i0578.
+        assert_eq!(records[27].id, "max_xorsign_abs_f16x2");
+        assert_eq!(records[27].abi_id, "i0577");
+        assert_eq!(records[28].id, "min_f16");
+        assert_eq!(records[28].abi_id, "i0830");
+        assert_eq!(records.last().unwrap().id, "max_nan_xorsign_abs_bf16");
+        assert_eq!(records.last().unwrap().abi_id, "i0853");
         validate_unique_overlay(&records, 1).unwrap();
         assert_eq!(
             records
                 .iter()
                 .filter(|record| record.minimum_sm.as_deref() == Some("sm_80"))
                 .count(),
-            8
+            20
         );
         assert_eq!(
             records
                 .iter()
                 .filter(|record| record.minimum_sm.as_deref() == Some("sm_86"))
                 .count(),
-            20
+            32
         );
         assert!(records.iter().all(|record| {
             record.backend_lowerings.len() == 2

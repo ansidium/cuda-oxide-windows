@@ -150,6 +150,18 @@ pub fn all_outputs(
         "crates/cuda-device/src/generated/bf16x2.rs".into(),
         render_compat_packed_alu(catalog, catalog_sha256, PackedAluFormat::Bf16x2),
     );
+    for (module, format) in [
+        ("f16", ExtendedMinMaxFormat::F16),
+        ("bf16", ExtendedMinMaxFormat::Bf16),
+    ] {
+        if extended_minmax(catalog).any(|record| extended_minmax_contract(record).format == format)
+        {
+            outputs.insert(
+                format!("crates/cuda-device/src/generated/{module}.rs").into(),
+                render_compat_scalar_minmax(catalog, catalog_sha256, module),
+            );
+        }
+    }
     outputs.insert(
         "crates/cuda-device/src/generated/f16x2.rs".into(),
         render_compat_packed_alu(catalog, catalog_sha256, PackedAluFormat::F16x2),
@@ -516,8 +528,8 @@ fn validate_renderable(catalog: &CatalogFile) -> Result<()> {
                     && record.dialect.op_name == "nvvm.movmatrix_trans_b16"
                     && record.dialect.operands == ["i32"]
                     && record.dialect.results == ["i32"]
-                    && record.semantics.pure
-                    && record.semantics.memory == "none"
+                    && !record.semantics.pure
+                    && record.semantics.memory == "inaccessible_read_write"
                     && record.semantics.convergent
                     && record.lowering == "generated_movmatrix_inline_ptx"
                     && record.movmatrix.is_some(),
@@ -631,66 +643,17 @@ fn validate_renderable(catalog: &CatalogFile) -> Result<()> {
             ),
             "packed_conversion" => ensure!(
                 record.rust.module == "convert"
-                    && record.rust.arguments == ["f32", "f32"]
+                    && record.rust.arguments == packed_conversion_rust_arguments(record)
                     && record.rust.result == packed_conversion_rust_type(record)
                     && record.rust.safe
                     && !record.rust.must_use
-                    && record.dialect.operands == ["f32", "f32"]
+                    && record.dialect.operands == packed_conversion_dialect_operands(record)
                     && record.dialect.results == [packed_conversion_dialect_type(record)]
                     && record.lowering == packed_conversion_lowering_name(record)
-                    && record.packed_conversion.as_ref().is_some_and(|conversion| {
-                        conversion.source_format == PackedConversionSourceFormat::F32x2
-                            && conversion.adapter
-                                == PackedConversionAdapter::ReverseHighLowOperands
-                            && matches!(
-                                (
-                                    conversion.destination_format,
-                                    conversion.rounding,
-                                    conversion.saturation,
-                                ),
-                                (
-                                    PackedConversionDestinationFormat::Bf16x2,
-                                    PackedConversionRounding::NearestEven,
-                                    PackedConversionSaturation::None,
-                                ) | (
-                                    PackedConversionDestinationFormat::F16x2,
-                                    PackedConversionRounding::NearestEven,
-                                    PackedConversionSaturation::None,
-                                ) | (
-                                    PackedConversionDestinationFormat::F16x2,
-                                    PackedConversionRounding::TowardZero,
-                                    PackedConversionSaturation::None,
-                                ) | (
-                                    PackedConversionDestinationFormat::F16x2,
-                                    PackedConversionRounding::NearestEven,
-                                    PackedConversionSaturation::Relu,
-                                ) | (
-                                    PackedConversionDestinationFormat::Bf16x2,
-                                    PackedConversionRounding::NearestEven,
-                                    PackedConversionSaturation::Relu,
-                                ) | (
-                                    PackedConversionDestinationFormat::Bf16x2,
-                                    PackedConversionRounding::TowardZero,
-                                    PackedConversionSaturation::None,
-                                ) | (
-                                    PackedConversionDestinationFormat::E4m3x2,
-                                    PackedConversionRounding::NearestEven,
-                                    PackedConversionSaturation::Satfinite,
-                                ) | (
-                                    PackedConversionDestinationFormat::E4m3x2,
-                                    PackedConversionRounding::NearestEven,
-                                    PackedConversionSaturation::SatfiniteRelu,
-                                ) | (
-                                    PackedConversionDestinationFormat::E5m2x2,
-                                    PackedConversionRounding::NearestEven,
-                                    PackedConversionSaturation::Satfinite,
-                                ) | (
-                                    PackedConversionDestinationFormat::E5m2x2,
-                                    PackedConversionRounding::NearestEven,
-                                    PackedConversionSaturation::SatfiniteRelu,
-                                )
-                            )
-                    }),
+                    && record
+                        .packed_conversion
+                        .as_ref()
+                        .is_some_and(packed_conversion_is_closed_recipe),
                 "{} is outside the closed generated packed-conversion recipe",
                 record.id
             ),
@@ -770,6 +733,18 @@ fn validate_renderable(catalog: &CatalogFile) -> Result<()> {
                             "f32",
                             "f32",
                             ExtendedMinMaxAdapter::DirectF32,
+                        ),
+                        ExtendedMinMaxFormat::F16 => (
+                            "f16",
+                            "u16",
+                            "i16",
+                            ExtendedMinMaxAdapter::DirectHalfU16,
+                        ),
+                        ExtendedMinMaxFormat::Bf16 => (
+                            "bf16",
+                            "u16",
+                            "i16",
+                            ExtendedMinMaxAdapter::DirectHalfU16,
                         ),
                         ExtendedMinMaxFormat::F16x2 => (
                             "f16x2",
@@ -1832,6 +1807,8 @@ fn extended_minmax_contract(record: &CatalogIntrinsic) -> &crate::model::Extende
 fn extended_minmax_format_attr(record: &CatalogIntrinsic) -> &'static str {
     match extended_minmax_contract(record).format {
         ExtendedMinMaxFormat::F32 => "ExtendedMinMaxFormatAttr::F32",
+        ExtendedMinMaxFormat::F16 => "ExtendedMinMaxFormatAttr::F16",
+        ExtendedMinMaxFormat::Bf16 => "ExtendedMinMaxFormatAttr::Bf16",
         ExtendedMinMaxFormat::F16x2 => "ExtendedMinMaxFormatAttr::F16x2",
         ExtendedMinMaxFormat::Bf16x2 => "ExtendedMinMaxFormatAttr::Bf16x2",
     }
@@ -1866,9 +1843,18 @@ fn extended_minmax_xorsign_abs_attr(record: &CatalogIntrinsic) -> &'static str {
     }
 }
 
+fn extended_minmax_carrier(record: &CatalogIntrinsic) -> &'static str {
+    match extended_minmax_contract(record).format {
+        ExtendedMinMaxFormat::F32 => "MinMaxCarrier::F32",
+        ExtendedMinMaxFormat::F16 | ExtendedMinMaxFormat::Bf16 => "MinMaxCarrier::Half16",
+        ExtendedMinMaxFormat::F16x2 | ExtendedMinMaxFormat::Bf16x2 => "MinMaxCarrier::PackedU32",
+    }
+}
+
 fn extended_minmax_rust_type(record: &CatalogIntrinsic) -> &'static str {
     match extended_minmax_contract(record).format {
         ExtendedMinMaxFormat::F32 => "f32",
+        ExtendedMinMaxFormat::F16 | ExtendedMinMaxFormat::Bf16 => "u16",
         ExtendedMinMaxFormat::F16x2 | ExtendedMinMaxFormat::Bf16x2 => "u32",
     }
 }
@@ -3434,6 +3420,22 @@ fn packed_alu_ptx_mnemonic(record: &CatalogIntrinsic) -> &'static str {
             PackedAluOperation::FmaRelu,
             PackedAluAdapter::DirectPackedU32,
         ) => "fma.rn.relu.f16x2",
+        (PackedAluFormat::F16x2, PackedAluOperation::FmaFtz, PackedAluAdapter::DirectPackedU32) => {
+            "fma.rn.ftz.f16x2"
+        }
+        (PackedAluFormat::F16x2, PackedAluOperation::FmaSat, PackedAluAdapter::DirectPackedU32) => {
+            "fma.rn.sat.f16x2"
+        }
+        (
+            PackedAluFormat::F16x2,
+            PackedAluOperation::FmaFtzSat,
+            PackedAluAdapter::DirectPackedU32,
+        ) => "fma.rn.ftz.sat.f16x2",
+        (
+            PackedAluFormat::F16x2,
+            PackedAluOperation::FmaFtzRelu,
+            PackedAluAdapter::DirectPackedU32,
+        ) => "fma.rn.ftz.relu.f16x2",
         (PackedAluFormat::F16x2, PackedAluOperation::Min, PackedAluAdapter::DirectPackedU32) => {
             "min.f16x2"
         }
@@ -3446,6 +3448,9 @@ fn packed_alu_ptx_mnemonic(record: &CatalogIntrinsic) -> &'static str {
         (PackedAluFormat::F16x2, PackedAluOperation::Abs, PackedAluAdapter::DirectPackedU32) => {
             "abs.f16x2"
         }
+        // bf16x2 has no NVPTX selection pattern for the ftz and sat fma forms;
+        // `packed_alu_recipe` rejects those pairs before a record can exist.
+        combination => panic!("unsupported generated packed-ALU recipe {combination:?}"),
     }
 }
 
@@ -3477,6 +3482,107 @@ fn packed_conversion_element(record: &CatalogIntrinsic) -> &'static str {
     }
 }
 
+/// Whether the conversion is one of the closed, reviewed packed-conversion
+/// recipes: scalar `f32` pairs narrowed to a packed format, `f16x2` narrowed to
+/// packed FP8, or packed FP8 widened back to `f16x2`.
+fn packed_conversion_is_closed_recipe(conversion: &crate::model::PackedConversion) -> bool {
+    use PackedConversionDestinationFormat as Dst;
+    use PackedConversionRounding as Round;
+    use PackedConversionSaturation as Sat;
+    use PackedConversionSourceFormat as Src;
+
+    let adapter_matches = conversion.adapter
+        == match conversion.source_format {
+            Src::F32x2 => PackedConversionAdapter::ReverseHighLowOperands,
+            Src::E4m3x2 | Src::E5m2x2 | Src::F16x2 => PackedConversionAdapter::Identity,
+        };
+
+    adapter_matches
+        && matches!(
+            (
+                conversion.source_format,
+                conversion.destination_format,
+                conversion.rounding,
+                conversion.saturation,
+            ),
+            (Src::F32x2, Dst::Bf16x2, Round::NearestEven, Sat::None)
+                | (Src::F32x2, Dst::Bf16x2, Round::NearestEven, Sat::Relu)
+                | (Src::F32x2, Dst::Bf16x2, Round::TowardZero, Sat::None)
+                | (Src::F32x2, Dst::F16x2, Round::NearestEven, Sat::None)
+                | (Src::F32x2, Dst::F16x2, Round::NearestEven, Sat::Relu)
+                | (Src::F32x2, Dst::F16x2, Round::TowardZero, Sat::None)
+                | (Src::F32x2, Dst::E4m3x2, Round::NearestEven, Sat::Satfinite)
+                | (
+                    Src::F32x2,
+                    Dst::E4m3x2,
+                    Round::NearestEven,
+                    Sat::SatfiniteRelu
+                )
+                | (Src::F32x2, Dst::E5m2x2, Round::NearestEven, Sat::Satfinite)
+                | (
+                    Src::F32x2,
+                    Dst::E5m2x2,
+                    Round::NearestEven,
+                    Sat::SatfiniteRelu
+                )
+                | (Src::F16x2, Dst::E4m3x2, Round::NearestEven, Sat::Satfinite)
+                | (
+                    Src::F16x2,
+                    Dst::E4m3x2,
+                    Round::NearestEven,
+                    Sat::SatfiniteRelu
+                )
+                | (Src::F16x2, Dst::E5m2x2, Round::NearestEven, Sat::Satfinite)
+                | (
+                    Src::F16x2,
+                    Dst::E5m2x2,
+                    Round::NearestEven,
+                    Sat::SatfiniteRelu
+                )
+                | (Src::E4m3x2, Dst::F16x2, Round::NearestEven, Sat::None)
+                | (Src::E4m3x2, Dst::F16x2, Round::NearestEven, Sat::Relu)
+                | (Src::E5m2x2, Dst::F16x2, Round::NearestEven, Sat::None)
+                | (Src::E5m2x2, Dst::F16x2, Round::NearestEven, Sat::Relu)
+        )
+}
+
+fn packed_conversion_source(record: &CatalogIntrinsic) -> PackedConversionSourceFormat {
+    record
+        .packed_conversion
+        .as_ref()
+        .expect("packed-conversion record")
+        .source_format
+}
+
+/// Register width of a single packed source operand.
+fn packed_conversion_source_width(record: &CatalogIntrinsic) -> u32 {
+    match packed_conversion_source(record) {
+        PackedConversionSourceFormat::F16x2 => 32,
+        PackedConversionSourceFormat::E4m3x2 | PackedConversionSourceFormat::E5m2x2 => 16,
+        PackedConversionSourceFormat::F32x2 => {
+            unreachable!("f32x2 conversions do not have a single packed source")
+        }
+    }
+}
+
+/// Rust argument types, one per source operand.
+fn packed_conversion_rust_arguments(record: &CatalogIntrinsic) -> Vec<&'static str> {
+    match packed_conversion_source(record) {
+        PackedConversionSourceFormat::F32x2 => vec!["f32", "f32"],
+        PackedConversionSourceFormat::F16x2 => vec!["u32"],
+        PackedConversionSourceFormat::E4m3x2 | PackedConversionSourceFormat::E5m2x2 => vec!["u16"],
+    }
+}
+
+/// Dialect operand types, one per source operand.
+fn packed_conversion_dialect_operands(record: &CatalogIntrinsic) -> Vec<&'static str> {
+    match packed_conversion_source(record) {
+        PackedConversionSourceFormat::F32x2 => vec!["f32", "f32"],
+        PackedConversionSourceFormat::F16x2 => vec!["i32"],
+        PackedConversionSourceFormat::E4m3x2 | PackedConversionSourceFormat::E5m2x2 => vec!["i16"],
+    }
+}
+
 fn packed_conversion_result_width(record: &CatalogIntrinsic) -> u32 {
     match record
         .packed_conversion
@@ -3505,19 +3611,41 @@ fn packed_conversion_dialect_type(record: &CatalogIntrinsic) -> &'static str {
     }
 }
 
+/// Inline-asm constraint string: one result register, then one per source
+/// operand. `h` is a 16-bit register, `r` a 32-bit one, and `f` an f32.
 fn packed_conversion_constraint(record: &CatalogIntrinsic) -> &'static str {
-    match packed_conversion_result_width(record) {
-        16 => "=h,f,f",
-        32 => "=r,f,f",
-        _ => unreachable!("closed packed-conversion result width"),
+    match (
+        packed_conversion_result_width(record),
+        packed_conversion_source(record),
+    ) {
+        (16, PackedConversionSourceFormat::F32x2) => "=h,f,f",
+        (32, PackedConversionSourceFormat::F32x2) => "=r,f,f",
+        (16, PackedConversionSourceFormat::F16x2) => "=h,r",
+        (32, PackedConversionSourceFormat::E4m3x2 | PackedConversionSourceFormat::E5m2x2) => "=r,h",
+        _ => unreachable!("closed packed-conversion result width and source format"),
     }
 }
 
+/// Whether the conversion lowers through a typed NVVM intrinsic call rather
+/// than inline PTX. Only the scalar-`f32` pair narrowed to FP8 does; see the
+/// matching predicate in `resolve.rs` for why.
+fn packed_conversion_uses_typed_nvvm(record: &CatalogIntrinsic) -> bool {
+    let conversion = record
+        .packed_conversion
+        .as_ref()
+        .expect("packed-conversion record");
+    conversion.source_format == PackedConversionSourceFormat::F32x2
+        && matches!(
+            conversion.destination_format,
+            PackedConversionDestinationFormat::E4m3x2 | PackedConversionDestinationFormat::E5m2x2
+        )
+}
+
 fn packed_conversion_lowering_name(record: &CatalogIntrinsic) -> &'static str {
-    match packed_conversion_result_width(record) {
-        16 => "generated_packed_conversion_backend",
-        32 => "generated_packed_conversion_inline_ptx",
-        _ => unreachable!("closed packed-conversion result width"),
+    if packed_conversion_uses_typed_nvvm(record) {
+        "generated_packed_conversion_backend"
+    } else {
+        "generated_packed_conversion_inline_ptx"
     }
 }
 
@@ -3539,12 +3667,13 @@ fn packed_conversion_ptx_mnemonic(record: &CatalogIntrinsic) -> String {
         .as_ref()
         .expect("packed-conversion record");
     debug_assert_eq!(
-        conversion.source_format,
-        PackedConversionSourceFormat::F32x2
-    );
-    debug_assert_eq!(
         conversion.adapter,
-        PackedConversionAdapter::ReverseHighLowOperands
+        match conversion.source_format {
+            PackedConversionSourceFormat::F32x2 => PackedConversionAdapter::ReverseHighLowOperands,
+            PackedConversionSourceFormat::E4m3x2
+            | PackedConversionSourceFormat::E5m2x2
+            | PackedConversionSourceFormat::F16x2 => PackedConversionAdapter::Identity,
+        }
     );
     let rounding = match conversion.rounding {
         PackedConversionRounding::NearestEven => "rn",
@@ -3557,8 +3686,9 @@ fn packed_conversion_ptx_mnemonic(record: &CatalogIntrinsic) -> String {
         PackedConversionSaturation::SatfiniteRelu => ".satfinite.relu",
     };
     format!(
-        "cvt.{rounding}{saturation}.{}.f32",
-        packed_conversion_destination(record)
+        "cvt.{rounding}{saturation}.{}.{}",
+        packed_conversion_destination(record),
+        conversion.source_format.ptx_token()
     )
 }
 
@@ -5158,7 +5288,9 @@ fn render_compat_movmatrix(catalog: &CatalogFile, hash: &str) -> String {
         output.push_str(
             "///\n\
              /// Each lane supplies two packed b16 values. The warp collectively transposes the 8x8 tile.\n\
-             /// This register-only operation does not access or order memory.\n\
+             /// No addressable memory is touched, but the result depends on every lane's\n\
+             /// input, so the call is modelled as reading and writing inaccessible state:\n\
+             /// two calls with equal operands are not interchangeable.\n\
              ///\n\
              /// # Safety\n\
              /// All 32 warp lanes must execute the same call, and no lane may have exited.\n",
@@ -6268,6 +6400,17 @@ fn render_compat_packed_alu(catalog: &CatalogFile, hash: &str, format: PackedAlu
     output
 }
 
+fn render_compat_scalar_minmax(catalog: &CatalogFile, hash: &str, module: &str) -> String {
+    let mut output = rust_header(catalog, hash);
+    writeln!(
+        output,
+        "// Included inside `cuda_device::{module}` to keep existing paths stable.\n"
+    )
+    .unwrap();
+    render_compat_extended_minmax_into(&mut output, catalog, module);
+    output
+}
+
 fn render_compat_extended_minmax_into(output: &mut String, catalog: &CatalogFile, module: &str) {
     for record in extended_minmax(catalog).filter(|record| record.rust.module == module) {
         let path = record
@@ -6321,20 +6464,35 @@ fn render_compat_packed_conversion(
             .iter()
             .find(|path| path.starts_with(path_prefix))
             .expect("packed-conversion compatibility path");
+        // A packed source arrives in one register, so the parameter list
+        // follows the record's own argument types rather than a fixed f32 pair.
+        let parameter_names: Vec<&str> = match packed_conversion_source(record) {
+            PackedConversionSourceFormat::F32x2 => vec![argument_names.0, argument_names.1],
+            PackedConversionSourceFormat::E4m3x2
+            | PackedConversionSourceFormat::E5m2x2
+            | PackedConversionSourceFormat::F16x2 => vec!["packed"],
+        };
+        let parameter_types = packed_conversion_rust_arguments(record);
+        let parameters = parameter_names
+            .iter()
+            .zip(&parameter_types)
+            .map(|(name, ty)| format!("{name}: {ty}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let discards = parameter_names.join(", ");
         writeln!(output, "/// {}", record.summary).unwrap();
         output.push_str("#[inline(never)]\n");
         writeln!(
             output,
-            "pub fn {}({}: f32, {}: f32) -> {} {{",
-            record.rust.name, argument_names.0, argument_names.1, record.rust.result,
+            "pub fn {}({parameters}) -> {} {{",
+            record.rust.name, record.rust.result,
         )
         .unwrap();
-        writeln!(
-            output,
-            "    let _ = ({}, {});",
-            argument_names.0, argument_names.1
-        )
-        .unwrap();
+        if parameter_names.len() == 1 {
+            writeln!(output, "    let _ = {discards};").unwrap();
+        } else {
+            writeln!(output, "    let _ = ({discards});").unwrap();
+        }
         writeln!(
             output,
             "    unreachable!(\"generated CUDA intrinsic `{path}` executed outside device compilation\")"
@@ -8904,40 +9062,77 @@ fn render_dialect_packed_conversion(catalog: &CatalogFile, hash: &str) -> String
         "//! Structural operation for generated packed conversion.\n\nuse pliron::{\n    builtin::{\n        op_interfaces::{NOpdsInterface, NResultsInterface},\n        types::{FP32Type, IntegerType, Signedness},\n    },\n    common_traits::Verify,\n    context::{Context, Ptr},\n    location::Located,\n    op::Op,\n    operation::Operation,\n    result::Error,\n    r#type::Typed,\n    value::Value,\n    verify_err,\n};\nuse pliron_derive::pliron_op;\n\nfn is_f32(ctx: &Context, ty: pliron::r#type::TypeHandle) -> bool {\n    ty.deref(ctx).downcast_ref::<FP32Type>().is_some()\n}\n\nfn is_integer_width(\n    ctx: &Context,\n    ty: pliron::r#type::TypeHandle,\n    width: u32,\n) -> bool {\n    ty.deref(ctx)\n        .downcast_ref::<IntegerType>()\n        .is_some_and(|integer| integer.width() == width)\n}\n\n",
     );
     for record in packed_conversions(catalog) {
+        let result_width = packed_conversion_result_width(record);
         writeln!(output, "/// {}", record.summary).unwrap();
-        writeln!(
-            output,
-            "///\n/// The first input becomes the low {} lane; the second becomes the high lane.",
-            packed_conversion_element(record)
-        )
-        .unwrap();
-        writeln!(
-            output,
-            "#[pliron_op(\n    name = {:?},\n    format,\n    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],\n)]",
-            record.dialect.op_name
-        )
-        .unwrap();
-        writeln!(output, "pub struct {};", record.dialect.op_type).unwrap();
-        writeln!(output, "\nimpl {} {{", record.dialect.op_type).unwrap();
-        writeln!(
-            output,
-            "    pub fn new(op: Ptr<Operation>) -> Self {{\n        Self {{ op }}\n    }}\n\n    pub fn build(ctx: &mut Context, low: Value, high: Value) -> Ptr<Operation> {{\n        let result_ty = IntegerType::get(ctx, {}, Signedness::Unsigned);\n        Operation::new(\n            ctx,\n            Self::get_concrete_op_info(),\n            vec![result_ty.into()],\n            vec![low, high],\n            vec![],\n            0,\n        )\n    }}\n}}",
-            packed_conversion_result_width(record)
-        )
-        .unwrap();
-        writeln!(output, "\nimpl Verify for {} {{", record.dialect.op_type).unwrap();
-        writeln!(
-            output,
-            "    fn verify(&self, ctx: &Context) -> Result<(), Error> {{\n        let op = self.get_operation().deref(ctx);\n        if op.get_num_operands() != 2 || op.get_num_results() != 1 {{\n            return verify_err!(op.loc(), {:?});\n        }}\n        if !is_f32(ctx, op.get_operand(0).get_type(ctx))\n            || !is_f32(ctx, op.get_operand(1).get_type(ctx))\n            || !is_integer_width(ctx, op.get_result(0).get_type(ctx), {})\n        {{\n            return verify_err!(op.loc(), {:?});\n        }}\n        Ok(())\n    }}\n}}\n",
-            format!("{} requires two operands and one result", record.dialect.op_name),
-            packed_conversion_result_width(record),
-            format!(
-                "{} requires f32 operands and one {}-bit integer result",
-                record.dialect.op_name,
-                packed_conversion_result_width(record),
-            ),
-        )
-        .unwrap();
+        match packed_conversion_source(record) {
+            PackedConversionSourceFormat::F32x2 => {
+                writeln!(
+                    output,
+                    "///\n/// The first input becomes the low {} lane; the second becomes the high lane.",
+                    packed_conversion_element(record)
+                )
+                .unwrap();
+                writeln!(
+                    output,
+                    "#[pliron_op(\n    name = {:?},\n    format,\n    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],\n)]",
+                    record.dialect.op_name
+                )
+                .unwrap();
+                writeln!(output, "pub struct {};", record.dialect.op_type).unwrap();
+                writeln!(output, "\nimpl {} {{", record.dialect.op_type).unwrap();
+                writeln!(
+                    output,
+                    "    pub fn new(op: Ptr<Operation>) -> Self {{\n        Self {{ op }}\n    }}\n\n    pub fn build(ctx: &mut Context, low: Value, high: Value) -> Ptr<Operation> {{\n        let result_ty = IntegerType::get(ctx, {result_width}, Signedness::Unsigned);\n        Operation::new(\n            ctx,\n            Self::get_concrete_op_info(),\n            vec![result_ty.into()],\n            vec![low, high],\n            vec![],\n            0,\n        )\n    }}\n}}",
+                )
+                .unwrap();
+                writeln!(output, "\nimpl Verify for {} {{", record.dialect.op_type).unwrap();
+                writeln!(
+                    output,
+                    "    fn verify(&self, ctx: &Context) -> Result<(), Error> {{\n        let op = self.get_operation().deref(ctx);\n        if op.get_num_operands() != 2 || op.get_num_results() != 1 {{\n            return verify_err!(op.loc(), {:?});\n        }}\n        if !is_f32(ctx, op.get_operand(0).get_type(ctx))\n            || !is_f32(ctx, op.get_operand(1).get_type(ctx))\n            || !is_integer_width(ctx, op.get_result(0).get_type(ctx), {})\n        {{\n            return verify_err!(op.loc(), {:?});\n        }}\n        Ok(())\n    }}\n}}\n",
+                    format!("{} requires two operands and one result", record.dialect.op_name),
+                    result_width,
+                    format!(
+                        "{} requires f32 operands and one {result_width}-bit integer result",
+                        record.dialect.op_name,
+                    ),
+                )
+                .unwrap();
+            }
+            PackedConversionSourceFormat::E4m3x2
+            | PackedConversionSourceFormat::E5m2x2
+            | PackedConversionSourceFormat::F16x2 => {
+                let source_width = packed_conversion_source_width(record);
+                writeln!(
+                    output,
+                    "///\n/// The single input carries both packed lanes, and lane order is preserved."
+                )
+                .unwrap();
+                writeln!(
+                    output,
+                    "#[pliron_op(\n    name = {:?},\n    format,\n    interfaces = [NOpdsInterface<1>, NResultsInterface<1>],\n)]",
+                    record.dialect.op_name
+                )
+                .unwrap();
+                writeln!(output, "pub struct {};", record.dialect.op_type).unwrap();
+                writeln!(output, "\nimpl {} {{", record.dialect.op_type).unwrap();
+                writeln!(
+                    output,
+                    "    pub fn new(op: Ptr<Operation>) -> Self {{\n        Self {{ op }}\n    }}\n\n    pub fn build(ctx: &mut Context, packed: Value) -> Ptr<Operation> {{\n        let result_ty = IntegerType::get(ctx, {result_width}, Signedness::Unsigned);\n        Operation::new(\n            ctx,\n            Self::get_concrete_op_info(),\n            vec![result_ty.into()],\n            vec![packed],\n            vec![],\n            0,\n        )\n    }}\n}}",
+                )
+                .unwrap();
+                writeln!(output, "\nimpl Verify for {} {{", record.dialect.op_type).unwrap();
+                writeln!(
+                    output,
+                    "    fn verify(&self, ctx: &Context) -> Result<(), Error> {{\n        let op = self.get_operation().deref(ctx);\n        if op.get_num_operands() != 1 || op.get_num_results() != 1 {{\n            return verify_err!(op.loc(), {:?});\n        }}\n        if !is_integer_width(ctx, op.get_operand(0).get_type(ctx), {source_width})\n            || !is_integer_width(ctx, op.get_result(0).get_type(ctx), {result_width})\n        {{\n            return verify_err!(op.loc(), {:?});\n        }}\n        Ok(())\n    }}\n}}\n",
+                    format!("{} requires one operand and one result", record.dialect.op_name),
+                    format!(
+                        "{} requires one {source_width}-bit integer operand and one {result_width}-bit integer result",
+                        record.dialect.op_name,
+                    ),
+                )
+                .unwrap();
+            }
+        }
     }
     output.push_str("\npub(super) fn register(ctx: &mut Context) {\n");
     for record in packed_conversions(catalog) {
@@ -9434,7 +9629,7 @@ use pliron_derive::{pliron_attr, pliron_op};
 
 #[pliron_attr(name = "nvvm.extended_minmax_format", format, verifier = "succ")]
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
-pub enum ExtendedMinMaxFormatAttr { F32, F16x2, Bf16x2 }
+pub enum ExtendedMinMaxFormatAttr { F32, F16, Bf16, F16x2, Bf16x2 }
 
 #[pliron_attr(name = "nvvm.extended_minmax_operation", format, verifier = "succ")]
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
@@ -9483,6 +9678,9 @@ impl ExtendedMinMaxOp {
     ) -> Ptr<Operation> {
         let result_ty = match &format {
             ExtendedMinMaxFormatAttr::F32 => FP32Type::get(ctx).into(),
+            ExtendedMinMaxFormatAttr::F16 | ExtendedMinMaxFormatAttr::Bf16 => {
+                IntegerType::get(ctx, 16, Signedness::Unsigned).into()
+            }
             ExtendedMinMaxFormatAttr::F16x2 | ExtendedMinMaxFormatAttr::Bf16x2 => {
                 IntegerType::get(ctx, 32, Signedness::Unsigned).into()
             }
@@ -9549,6 +9747,10 @@ impl Verify for ExtendedMinMaxOp {
         }
         let type_matches = |ty: pliron::r#type::TypeHandle| match &*format {
             ExtendedMinMaxFormatAttr::F32 => ty.deref(ctx).downcast_ref::<FP32Type>().is_some(),
+            ExtendedMinMaxFormatAttr::F16 | ExtendedMinMaxFormatAttr::Bf16 => ty
+                .deref(ctx)
+                .downcast_ref::<IntegerType>()
+                .is_some_and(|integer| integer.width() == 16),
             ExtendedMinMaxFormatAttr::F16x2 | ExtendedMinMaxFormatAttr::Bf16x2 => ty
                 .deref(ctx)
                 .downcast_ref::<IntegerType>()
@@ -13584,7 +13786,7 @@ fn tcgen05_inline_asm(record: &CatalogIntrinsic) -> (String, String, Option<usiz
 fn render_lowering(catalog: &CatalogFile, hash: &str) -> String {
     let mut output = rust_header(catalog, hash);
     output.push_str(
-        "//! Generated conversion interfaces for admitted CUDA intrinsic families.\n\nuse crate::conversion_interface::MirToLlvmConversion;\nuse crate::convert::intrinsics::{atomic::convert_packed_atom_add, basic::convert_sreg_read_inline, common::{call_intrinsic, create_i32_const, inline_asm_convergent}, cp_async::{convert_generated_cp_async_control, convert_generated_cp_async_copy, convert_generated_cp_async_mbarrier}, dotprod::convert_generated_dot_product, ldmatrix::convert_generated_ldmatrix, mbarrier::{convert_arrive, convert_init, convert_inval, convert_test_wait}, packed::{convert_generated_packed_alu, convert_generated_packed_f32x2}, prmt::convert_generated_prmt, warp::{convert_active_mask, convert_bar_warp_sync, convert_match_all, convert_match_any, convert_redux, convert_shuffle_f32, convert_shuffle_i32, convert_shuffle_i64, convert_vote}, wmma::{convert_generated_register_mma, convert_generated_sparse_mma, GeneratedMmaResultType}};\nuse crate::{context, IntrinsicBackend};\nuse dialect_nvvm::ops::{",
+        "//! Generated conversion interfaces for admitted CUDA intrinsic families.\n\nuse crate::conversion_interface::MirToLlvmConversion;\nuse crate::convert::intrinsics::{atomic::convert_packed_atom_add, basic::convert_sreg_read_inline, common::{call_intrinsic, create_i32_const, inline_asm_convergent}, cp_async::{convert_generated_cp_async_control, convert_generated_cp_async_copy, convert_generated_cp_async_mbarrier}, dotprod::convert_generated_dot_product, ldmatrix::convert_generated_ldmatrix, mbarrier::{convert_arrive, convert_init, convert_inval, convert_test_wait}, packed::{convert_generated_packed_alu, convert_generated_packed_f32x2, convert_generated_packed_unary}, prmt::convert_generated_prmt, warp::{convert_active_mask, convert_bar_warp_sync, convert_match_all, convert_match_any, convert_redux, convert_shuffle_f32, convert_shuffle_i32, convert_shuffle_i64, convert_vote}, wmma::{convert_generated_register_mma, convert_generated_sparse_mma, GeneratedMmaResultType}};\nuse crate::{context, IntrinsicBackend};\nuse dialect_nvvm::ops::{",
     );
     if debug_controls(catalog).next().is_some() {
         output = output.replace(
@@ -13631,7 +13833,7 @@ fn render_lowering(catalog: &CatalogFile, hash: &str) -> String {
     if extended_minmax(catalog).next().is_some() {
         output = output.replace(
             "dotprod::convert_generated_dot_product, ",
-            "dotprod::convert_generated_dot_product, extended_minmax::convert_generated_extended_minmax, ",
+            "dotprod::convert_generated_dot_product, extended_minmax::{MinMaxCarrier, convert_generated_extended_minmax}, ",
         );
     }
     if elect_intrinsics(catalog).next().is_some() {
@@ -13888,11 +14090,13 @@ fn render_lowering(catalog: &CatalogFile, hash: &str) -> String {
         "};\nuse llvm_export::{ops::AsmKind, types as llvm_types};\nuse pliron::{\n    builtin::types::{IntegerType, Signedness},\n    context::{Context, Ptr},\n    derive::op_interface_impl,\n    irbuild::{\n        dialect_conversion::{DialectConversionRewriter, OperandsInfo},\n        rewriter::Rewriter,\n    },\n    op::Op,\n    operation::Operation,\n    result::Result,\n};\n\n",
     );
     if cluster_memory(catalog).next().is_some() {
-        output = output
-            .replace(
+        if !output.contains("cast_to_shared_addrspace") {
+            output = output.replace(
                 "common::{call_intrinsic, ",
                 "common::{call_intrinsic, cast_to_shared_addrspace, ",
-            )
+            );
+        }
+        output = output
             .replace(
                 "use llvm_export::{ops::AsmKind, types as llvm_types};",
                 "use llvm_export::{op_interfaces::CastOpInterface, ops as llvm_ops, ops::AsmKind, types as llvm_types};",
@@ -14453,7 +14657,7 @@ fn convert_generated_tcgen05_load(
                 extended_minmax_nan_attr(record),
                 extended_minmax_xorsign_abs_attr(record),
                 extended_minmax_ptx_mnemonic(record),
-                extended_minmax_contract(record).format != ExtendedMinMaxFormat::F32,
+                extended_minmax_carrier(record),
             )
             .unwrap();
         }
@@ -14797,10 +15001,10 @@ fn convert_generated_tcgen05_load(
         output.push_str("    }\n}\n\n");
     }
     for record in packed_conversions(catalog) {
-        debug_assert_eq!(
-            record.packed_conversion.as_ref().unwrap().adapter,
-            PackedConversionAdapter::ReverseHighLowOperands
-        );
+        let conversion = record
+            .packed_conversion
+            .as_ref()
+            .expect("packed-conversion record");
         writeln!(
             output,
             "#[op_interface_impl]\nimpl MirToLlvmConversion for {} {{",
@@ -14810,16 +15014,37 @@ fn convert_generated_tcgen05_load(
         output.push_str(
             "    fn convert(\n        &self,\n        ctx: &mut Context,\n        rewriter: &mut DialectConversionRewriter,\n        _operands_info: &OperandsInfo,\n    ) -> Result<()> {\n",
         );
-        let typed_intrinsic = packed_conversion_typed_llvm_name(record)
-            .map(|name| format!("Some({name:?})"))
-            .unwrap_or_else(|| "None".into());
-        writeln!(
-            output,
-            "        convert_generated_packed_f32x2(ctx, rewriter, self.get_operation(), {typed_intrinsic}, {:?}, {})",
-            packed_conversion_ptx_mnemonic(record),
-            packed_conversion_result_width(record),
-        )
-        .unwrap();
+        match conversion.source_format {
+            PackedConversionSourceFormat::F32x2 => {
+                debug_assert_eq!(
+                    conversion.adapter,
+                    PackedConversionAdapter::ReverseHighLowOperands
+                );
+                let typed_intrinsic = packed_conversion_typed_llvm_name(record)
+                    .map(|name| format!("Some({name:?})"))
+                    .unwrap_or_else(|| "None".into());
+                writeln!(
+                    output,
+                    "        convert_generated_packed_f32x2(ctx, rewriter, self.get_operation(), {typed_intrinsic}, {:?}, {})",
+                    packed_conversion_ptx_mnemonic(record),
+                    packed_conversion_result_width(record),
+                )
+                .unwrap();
+            }
+            PackedConversionSourceFormat::E4m3x2
+            | PackedConversionSourceFormat::E5m2x2
+            | PackedConversionSourceFormat::F16x2 => {
+                debug_assert_eq!(conversion.adapter, PackedConversionAdapter::Identity);
+                writeln!(
+                    output,
+                    "        convert_generated_packed_unary(ctx, rewriter, self.get_operation(), {:?}, {}, {})",
+                    packed_conversion_ptx_mnemonic(record),
+                    packed_conversion_result_width(record),
+                    packed_conversion_source_width(record),
+                )
+                .unwrap();
+            }
+        }
         output.push_str("    }\n}\n\n");
     }
     for record in cp_async_copies(catalog) {
@@ -15704,6 +15929,8 @@ fn generated_intrinsic_variant(record: &CatalogIntrinsic) -> String {
     if let Some(minmax) = &record.extended_minmax {
         let format = match minmax.format {
             ExtendedMinMaxFormat::F32 => "GeneratedExtendedMinMaxFormat::F32",
+            ExtendedMinMaxFormat::F16 => "GeneratedExtendedMinMaxFormat::F16",
+            ExtendedMinMaxFormat::Bf16 => "GeneratedExtendedMinMaxFormat::Bf16",
             ExtendedMinMaxFormat::F16x2 => "GeneratedExtendedMinMaxFormat::F16x2",
             ExtendedMinMaxFormat::Bf16x2 => "GeneratedExtendedMinMaxFormat::Bf16x2",
         };
@@ -15933,7 +16160,7 @@ impl GeneratedIntrinsicTarget {
         replace_exact_render_fragment(
             &mut output,
             "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum GeneratedIntrinsicVariant {",
-            "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum GeneratedExtendedMinMaxFormat { F32, F16x2, Bf16x2 }\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum GeneratedExtendedMinMaxOperation { Min, Max }\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum GeneratedExtendedMinMaxSubnormal { Preserve, Ftz }\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum GeneratedExtendedMinMaxNan { Number, Nan }\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum GeneratedIntrinsicVariant {",
+            "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum GeneratedExtendedMinMaxFormat { F32, F16, Bf16, F16x2, Bf16x2 }\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum GeneratedExtendedMinMaxOperation { Min, Max }\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum GeneratedExtendedMinMaxSubnormal { Preserve, Ftz }\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum GeneratedExtendedMinMaxNan { Number, Nan }\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum GeneratedIntrinsicVariant {",
         );
         replace_exact_render_fragment(
             &mut output,
@@ -16208,6 +16435,8 @@ impl GeneratedIntrinsicTarget {
             let Some(op) = Operation::get_op::<ExtendedMinMaxOp>(operation, ctx) else { return false; };
             let format_matches = match format {
                 GeneratedExtendedMinMaxFormat::F32 => op.get_attr_nvvm_extended_minmax_format(ctx).as_deref() == Some(&ExtendedMinMaxFormatAttr::F32),
+                GeneratedExtendedMinMaxFormat::F16 => op.get_attr_nvvm_extended_minmax_format(ctx).as_deref() == Some(&ExtendedMinMaxFormatAttr::F16),
+                GeneratedExtendedMinMaxFormat::Bf16 => op.get_attr_nvvm_extended_minmax_format(ctx).as_deref() == Some(&ExtendedMinMaxFormatAttr::Bf16),
                 GeneratedExtendedMinMaxFormat::F16x2 => op.get_attr_nvvm_extended_minmax_format(ctx).as_deref() == Some(&ExtendedMinMaxFormatAttr::F16x2),
                 GeneratedExtendedMinMaxFormat::Bf16x2 => op.get_attr_nvvm_extended_minmax_format(ctx).as_deref() == Some(&ExtendedMinMaxFormatAttr::Bf16x2),
             };
@@ -17302,7 +17531,7 @@ pub(crate) fn render_probe(catalog: &CatalogFile, record: &CatalogIntrinsic, has
                 "  %result = call {result_ty} @{symbol}(float %high, float %low)"
             )
             .unwrap();
-        } else {
+        } else if packed_conversion_source(record) == PackedConversionSourceFormat::F32x2 {
             writeln!(
                 output,
                 "define {result_ty} @probe_{}(float %low, float %high) {{",
@@ -17312,6 +17541,23 @@ pub(crate) fn render_probe(catalog: &CatalogFile, record: &CatalogIntrinsic, has
             writeln!(
                 output,
                 "  %result = call {result_ty} asm \"{} $0, $2, $1;\", \"{}\"(float %low, float %high)",
+                packed_conversion_ptx_mnemonic(record),
+                packed_conversion_constraint(record),
+            )
+            .unwrap();
+        } else {
+            // A packed source arrives in one integer register, so the probe
+            // takes a single operand and needs no reordering.
+            let source_ty = format!("i{}", packed_conversion_source_width(record));
+            writeln!(
+                output,
+                "define {result_ty} @probe_{}({source_ty} %packed) {{",
+                record.id,
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "  %result = call {result_ty} asm \"{} $0, $1;\", \"{}\"({source_ty} %packed)",
                 packed_conversion_ptx_mnemonic(record),
                 packed_conversion_constraint(record),
             )
@@ -17985,9 +18231,11 @@ pub(crate) fn render_probe(catalog: &CatalogFile, record: &CatalogIntrinsic, has
         }
         writeln!(output, "  ret {ty} %result\n}}").unwrap();
     } else if record.extended_minmax.is_some() {
-        let packed = extended_minmax_contract(record).format != ExtendedMinMaxFormat::F32;
-        let ty = if packed { "i32" } else { "float" };
-        let register = if packed { "r" } else { "f" };
+        let (ty, register) = match extended_minmax_contract(record).format {
+            ExtendedMinMaxFormat::F32 => ("float", "f"),
+            ExtendedMinMaxFormat::F16 | ExtendedMinMaxFormat::Bf16 => ("i16", "h"),
+            ExtendedMinMaxFormat::F16x2 | ExtendedMinMaxFormat::Bf16x2 => ("i32", "r"),
+        };
         writeln!(
             output,
             "define {ty} @probe_{}({ty} %a, {ty} %b) {{",
@@ -19274,8 +19522,8 @@ mod tests {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let catalog = crate::resolve::resolve(&repo_root).unwrap();
         validate_renderable(&catalog).unwrap();
-        assert_eq!(packed_alus(&catalog).count(), 18);
-        assert_eq!(packed_conversions(&catalog).count(), 10);
+        assert_eq!(packed_alus(&catalog).count(), 22);
+        assert_eq!(packed_conversions(&catalog).count(), 18);
 
         let dialect = render_dialect_packed_alu(&catalog, "test-hash");
         for op in [
@@ -19408,9 +19656,18 @@ mod tests {
                 assert!(probe.contains(&format!("declare i16 @{symbol}(float, float)")));
                 assert!(probe.contains(&format!("call i16 @{symbol}(float %high, float %low)")));
                 assert!(!probe.contains(" asm "));
-            } else {
+            } else if packed_conversion_source(conversion) == PackedConversionSourceFormat::F32x2 {
                 assert!(probe.contains(&format!(
                     "asm \"{} $0, $2, $1;\", \"{}\"(float %low, float %high)",
+                    packed_conversion_ptx_mnemonic(conversion),
+                    packed_conversion_constraint(conversion),
+                )));
+                assert!(!probe.contains("declare "));
+            } else {
+                // One packed source operand, so no high/low reordering.
+                let source_ty = format!("i{}", packed_conversion_source_width(conversion));
+                assert!(probe.contains(&format!(
+                    "asm \"{} $0, $1;\", \"{}\"({source_ty} %packed)",
                     packed_conversion_ptx_mnemonic(conversion),
                     packed_conversion_constraint(conversion),
                 )));
@@ -20620,8 +20877,8 @@ mod tests {
         record.dialect.op_name = "nvvm.movmatrix_trans_b16".into();
         record.dialect.operands = vec!["i32".into()];
         record.dialect.results = vec!["i32".into()];
-        record.semantics.pure = true;
-        record.semantics.memory = "none".into();
+        record.semantics.pure = false;
+        record.semantics.memory = "inaccessible_read_write".into();
         record.semantics.convergent = true;
         record.semantics.execution_scope = "warp".into();
         record.packed_atomic = None;
@@ -20790,7 +21047,7 @@ mod tests {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let catalog = crate::resolve::resolve(&repo_root).unwrap();
         validate_renderable(&catalog).unwrap();
-        assert_eq!(catalog.intrinsics.len(), 821);
+        assert_eq!(catalog.intrinsics.len(), 857);
         let records: Vec<_> = register_mmas(&catalog).collect();
         assert_eq!(records.len(), 129);
         let generated_records = records
@@ -21786,6 +22043,55 @@ mod tests {
     }
 
     #[test]
+    fn lowering_imports_cast_to_shared_addrspace_exactly_once_across_families() {
+        // The stmatrix, cluster_memory, and mbarrier_extended families all
+        // insert the `cast_to_shared_addrspace` helper into the same
+        // `common::{call_intrinsic, ...}` use group. An unguarded second
+        // insert duplicates the name inside one use group, which is a hard
+        // rustc error (E0252) in the raw generator output. The rustfmt pass
+        // run over generated files silently dedupes the duplicate, so assert
+        // on the raw (pre-rustfmt) output to catch a regressed guard loudly.
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = crate::resolve::resolve(&repo_root).unwrap();
+        assert!(stmatrices(&catalog).next().is_some());
+        assert!(cluster_memory(&catalog).next().is_some());
+        assert!(mbarrier_extended(&catalog).next().is_some());
+
+        let import_count = |lowering: &str| {
+            // Everything before the first rendered helper function is the
+            // module header plus the use block; helper call sites in the
+            // function bodies below must not count.
+            let bodies_start = lowering
+                .find("fn convert_zero_operand_scalar_direct")
+                .expect("lowering output must contain the first helper function");
+            lowering[..bodies_start]
+                .matches("cast_to_shared_addrspace")
+                .count()
+        };
+
+        assert_eq!(
+            import_count(&render_lowering(&catalog, "test-hash")),
+            1,
+            "cast_to_shared_addrspace must be imported exactly once in the \
+             raw lowering output when multiple families need it"
+        );
+
+        // The guard must not suppress the import either: with stmatrix
+        // absent, cluster_memory still needs the helper and must insert it.
+        let mut without_stmatrix = catalog;
+        without_stmatrix
+            .intrinsics
+            .retain(|record| record.family != "stmatrix");
+        assert!(stmatrices(&without_stmatrix).next().is_none());
+        assert_eq!(
+            import_count(&render_lowering(&without_stmatrix, "test-hash")),
+            1,
+            "cast_to_shared_addrspace must still be imported when only \
+             cluster_memory and mbarrier_extended need it"
+        );
+    }
+
+    #[test]
     fn clc_rendering_preserves_api_and_uses_typed_llvm_routes() {
         let catalog = catalog_with_clc();
         validate_renderable(&catalog).unwrap();
@@ -22706,20 +23012,20 @@ mod tests {
         let catalog = crate::resolve::resolve(&repo_root).unwrap();
         validate_renderable(&catalog).unwrap();
         let records = extended_minmax(&catalog).collect::<Vec<_>>();
-        assert_eq!(records.len(), 28);
+        assert_eq!(records.len(), 52);
         assert_eq!(
             records
                 .iter()
                 .filter(|record| record.target.minimum_ptx.encoded() == 70)
                 .count(),
-            8
+            20
         );
         assert_eq!(
             records
                 .iter()
                 .filter(|record| record.target.minimum_ptx.encoded() == 72)
                 .count(),
-            20
+            32
         );
         for id in ["min_f16x2", "max_f16x2", "min_bf16x2", "max_bf16x2"] {
             assert_eq!(
@@ -22747,7 +23053,7 @@ mod tests {
             dialect
                 .matches("            (ExtendedMinMaxFormatAttr::")
                 .count(),
-            28
+            52
         );
         for attr in [
             "ExtendedMinMaxFormatAttr",
@@ -22762,7 +23068,7 @@ mod tests {
         assert!(dialect.contains("variant is not admitted"));
 
         let importer = render_importer(&catalog, "test-hash");
-        assert_eq!(importer.matches("ExtendedMinMaxOp::build(ctx").count(), 28);
+        assert_eq!(importer.matches("ExtendedMinMaxOp::build(ctx").count(), 52);
         assert!(importer.contains("cuda_device::float::min_xorsign_abs_f32"));
         assert!(importer.contains("cuda_device::bf16x2::max_nan_bf16x2"));
 
@@ -22804,12 +23110,31 @@ mod tests {
             f32_probe
                 .contains("call float asm \"max.ftz.NaN.xorsign.abs.f32 $0, $1, $2;\", \"=f,f,f\"")
         );
+        // Scalar 16-bit forms ride in `h` registers, not the packed `r` pair.
+        let half_record = records
+            .iter()
+            .copied()
+            .find(|record| record.id == "min_ftz_nan_f16")
+            .unwrap();
+        let half_probe = render_probe(&catalog, half_record, "test-hash");
+        assert!(half_probe.contains("call i16 asm \"min.ftz.NaN.f16 $0, $1, $2;\", \"=h,h,h\""));
+        let bf16_record = records
+            .iter()
+            .copied()
+            .find(|record| record.id == "max_nan_xorsign_abs_bf16")
+            .unwrap();
+        let bf16_probe = render_probe(&catalog, bf16_record, "test-hash");
+        assert!(
+            bf16_probe
+                .contains("call i16 asm \"max.NaN.xorsign.abs.bf16 $0, $1, $2;\", \"=h,h,h\"")
+        );
+        assert!(lowering.contains("MinMaxCarrier::Half16"));
 
         let outputs = all_outputs(&catalog, "{}\n".into(), "test-hash").unwrap();
         assert!(outputs.contains_key(&PathBuf::from(
             "crates/dialect-nvvm/src/ops/generated/extended_minmax.rs"
         )));
-        for module in ["float", "f16x2", "bf16x2"] {
+        for module in ["float", "f16", "bf16", "f16x2", "bf16x2"] {
             assert!(outputs.contains_key(&PathBuf::from(format!(
                 "crates/cuda-device/src/generated/{module}.rs"
             ))));

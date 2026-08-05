@@ -24,11 +24,7 @@ mod kernels {
     }
 }
 
-fn wrong_type(
-    child: &kernels::child::LoadedModule,
-    stream: &CudaStream,
-    config: LaunchConfig,
-) {
+fn wrong_type(child: &kernels::child::LoadedModule, stream: &CudaStream, config: LaunchConfig) {
     let _ = child.child_typed(stream, config, kernels::Params { value: 1 });
 }
 

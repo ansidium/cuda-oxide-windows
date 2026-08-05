@@ -69,6 +69,19 @@ pub struct LaunchBounds {
     pub min_blocks: u32,
 }
 
+/// Exact block shape declared by `#[launch_contract(block = (x, y, z))]`.
+///
+/// Detected by scanning MIR for
+/// `cuda_device::thread::__launch_contract_block_config::<X, Y, Z>()` marker
+/// calls. Emitted as `.reqntid x, y, z`, which the CUDA driver enforces per
+/// axis at launch.
+#[derive(Debug, Clone, Copy)]
+pub struct ContractBlock {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
 /// Minimum extern-shared alignment declared by `#[launch_contract]`.
 #[derive(Debug, Clone, Copy)]
 pub struct DynamicSharedAlignment {
@@ -218,6 +231,182 @@ fn detect_launch_bounds_config(
         }
     }
     Ok(detected)
+}
+
+/// Scans MIR for `__launch_contract_block_config::<X, Y, Z>()` and extracts the
+/// exact block shape declared by `#[launch_contract(block = (x, y, z))]`.
+///
+/// Returns `Some(ContractBlock)` if found, `None` otherwise.
+fn detect_contract_block_config(
+    body: &mir::Body,
+    reachable: &std::collections::BTreeSet<usize>,
+) -> Result<Option<ContractBlock>, String> {
+    use rustc_public::ty::TyConstKind;
+
+    let mut detected: Option<ContractBlock> = None;
+    for &block_idx in reachable {
+        let block = &body.blocks[block_idx];
+        let mir::TerminatorKind::Call { func, .. } = &block.terminator.kind else {
+            continue;
+        };
+        let mir::Operand::Constant(constant) = func else {
+            continue;
+        };
+        let ConstantKind::ZeroSized = constant.const_.kind() else {
+            continue;
+        };
+        let TyKind::RigidTy(RigidTy::FnDef(def_id, args)) = constant.const_.ty().kind() else {
+            continue;
+        };
+
+        let definition_name = def_id.name();
+        if def_id.krate().name.as_str() != "cuda_device"
+            || (definition_name != "__launch_contract_block_config"
+                && !definition_name.ends_with("::__launch_contract_block_config"))
+        {
+            continue;
+        }
+
+        if args.0.len() != 3 {
+            return Err(format!(
+                "cuda_device launch-contract block marker has {} generic arguments; expected exactly 3",
+                args.0.len()
+            ));
+        }
+        let mut values = [0u32; 3];
+        for (index, (axis, arg)) in ["x", "y", "z"].into_iter().zip(args.0.iter()).enumerate() {
+            let rustc_public::ty::GenericArgKind::Const(value) = arg else {
+                return Err(format!(
+                    "cuda_device launch-contract block {axis} argument is not a constant"
+                ));
+            };
+            let raw = match value.kind() {
+                TyConstKind::Value(_, allocation) => allocation.read_uint().map_err(|error| {
+                    format!("could not read launch-contract block {axis} constant: {error:?}")
+                })?,
+                _ => u128::from(value.eval_target_usize().map_err(|error| {
+                    format!("could not evaluate launch-contract block {axis} constant: {error:?}")
+                })?),
+            };
+            values[index] = u32::try_from(raw).map_err(|_| {
+                format!("launch-contract block {axis} value {raw} does not fit in u32")
+            })?;
+            if values[index] == 0 {
+                return Err(format!(
+                    "launch-contract block {axis} dimension must be greater than zero"
+                ));
+            }
+        }
+        let shape = ContractBlock {
+            x: values[0],
+            y: values[1],
+            z: values[2],
+        };
+        if let Some(existing) = detected {
+            if existing.x != shape.x || existing.y != shape.y || existing.z != shape.z {
+                return Err(format!(
+                    "a kernel contains conflicting cuda_device launch-contract block markers: ({}, {}, {}) and ({}, {}, {})",
+                    existing.x, existing.y, existing.z, shape.x, shape.y, shape.z,
+                ));
+            }
+        } else {
+            detected = Some(shape);
+        }
+    }
+    Ok(detected)
+}
+
+/// Rejects an exact block shape that needs more threads than
+/// `#[launch_bounds]` allows.
+///
+/// An exact block displaces the thread maximum in the emitted PTX, because
+/// ptxas rejects an entry carrying both `.maxntid` and `.reqntid`. A maximum
+/// below the required thread count would therefore be dropped in silence, and
+/// the kernel would launch at a shape its author ruled out. A maximum at or
+/// above the required count is redundant rather than contradictory, since
+/// `.reqntid` is the stronger statement, so it stays allowed.
+fn validate_block_against_bounds(bounds: LaunchBounds, block: ContractBlock) -> Result<(), String> {
+    let required = u64::from(block.x) * u64::from(block.y) * u64::from(block.z);
+    if required > u64::from(bounds.max_threads) {
+        return Err(format!(
+            "a kernel declares #[launch_contract(block = ({}, {}, {}))], needing {} threads per block, and #[launch_bounds({})], allowing at most {}",
+            block.x, block.y, block.z, required, bounds.max_threads, bounds.max_threads,
+        ));
+    }
+    Ok(())
+}
+
+/// Scans MIR for the `__unchecked_indexing_config::<ENABLED>()` marker
+/// injected by `#[kernel(unchecked_indexing)]` and extracts its const bool.
+///
+/// Returns `Ok(true)` when a marker with `ENABLED = true` is reachable in
+/// this body. The marker call itself is stripped later during terminator
+/// translation; this scan only records the policy.
+fn detect_unchecked_indexing_config(
+    body: &mir::Body,
+    reachable: &std::collections::BTreeSet<usize>,
+) -> Result<bool, String> {
+    use rustc_public::ty::TyConstKind;
+
+    for &block_idx in reachable {
+        let block = &body.blocks[block_idx];
+        let mir::TerminatorKind::Call { func, .. } = &block.terminator.kind else {
+            continue;
+        };
+        let mir::Operand::Constant(constant) = func else {
+            continue;
+        };
+        let ConstantKind::ZeroSized = constant.const_.kind() else {
+            continue;
+        };
+        let TyKind::RigidTy(RigidTy::FnDef(def_id, args)) = constant.const_.ty().kind() else {
+            continue;
+        };
+
+        let definition_name = def_id.name();
+        if def_id.krate().name.as_str() != "cuda_device"
+            || (definition_name != "__unchecked_indexing_config"
+                && !definition_name.ends_with("::__unchecked_indexing_config"))
+        {
+            continue;
+        }
+
+        if args.0.len() != 1 {
+            return Err(format!(
+                "cuda_device unchecked-indexing marker has {} generic arguments; expected exactly 1",
+                args.0.len()
+            ));
+        }
+        let rustc_public::ty::GenericArgKind::Const(value) = &args.0[0] else {
+            return Err(
+                "cuda_device unchecked-indexing marker argument is not a constant".to_string(),
+            );
+        };
+        let enabled = match value.kind() {
+            TyConstKind::Value(_, allocation) => allocation.read_bool().map_err(|error| {
+                format!("could not read unchecked-indexing marker constant: {error:?}")
+            })?,
+            _ => {
+                value.eval_target_usize().map_err(|error| {
+                    format!("could not evaluate unchecked-indexing marker constant: {error:?}")
+                })? != 0
+            }
+        };
+        if enabled {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the whole-build unchecked-indexing switch is on.
+///
+/// `CUDA_OXIDE_UNCHECKED_INDEXING=1` (or `true`) elides bounds-check asserts
+/// in every translated body, including separately translated `#[device]`
+/// functions that the per-kernel marker cannot reach.
+fn unchecked_indexing_env_enabled() -> bool {
+    std::env::var("CUDA_OXIDE_UNCHECKED_INDEXING")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 /// Scans MIR for the dynamic-shared alignment marker injected by
@@ -832,6 +1021,24 @@ pub fn translate_body(
     let num_locals = body.locals().len();
     let mut value_map = ValueMap::new(num_locals);
 
+    // Resolve the per-body unchecked-indexing policy. Like the dynamic-shared
+    // marker, the `#[kernel(unchecked_indexing)]` marker is scanned on any
+    // function: generic kernel expansion forwards it to the generated entry
+    // but also keeps the original in the `#[inline(always)]` implementation
+    // helper, and either body may be the one translated here. The whole-build
+    // environment switch additionally covers separately translated
+    // `#[device]` functions that carry no marker.
+    let unchecked_indexing = match detect_unchecked_indexing_config(body, &reachable) {
+        Ok(marker_enabled) => marker_enabled || unchecked_indexing_env_enabled(),
+        Err(error) => {
+            return input_err_noloc!(TranslationErr::invalid_op(error));
+        }
+    };
+    value_map.set_unchecked_indexing(unchecked_indexing);
+    if unchecked_indexing && std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
+        eprintln!("  Unchecked indexing enabled: bounds-check asserts elided");
+    }
+
     // Get function argument types for the first block
     // In MIR, locals[0] is the return value, locals[1..arg_count+1] are function arguments
     let mut arg_types = Vec::new();
@@ -1012,6 +1219,23 @@ pub fn translate_body(
                 return input_err_noloc!(TranslationErr::invalid_op(error));
             }
         };
+
+        // Detect the exact block shape from #[launch_contract(block = (x,y,z))].
+        // The exporter emits this as reqntid and suppresses maxntid, which ptxas
+        // rejects alongside it.
+        let contract_block = match detect_contract_block_config(body, &reachable) {
+            Ok(block) => block,
+            Err(error) => {
+                return input_err_noloc!(TranslationErr::invalid_op(error));
+            }
+        };
+
+        if let (Some(bounds), Some(block)) = (launch_bounds, contract_block)
+            && let Err(error) = validate_block_against_bounds(bounds, block)
+        {
+            return input_err_noloc!(TranslationErr::invalid_op(error));
+        }
+
         if let Some(launch_bounds) = launch_bounds {
             use pliron::builtin::attributes::IntegerAttr;
             use pliron::builtin::types::Signedness;
@@ -1051,6 +1275,34 @@ pub fn translate_body(
                         launch_bounds.max_threads
                     );
                 }
+            }
+        }
+
+        if let Some(contract_block) = contract_block {
+            use pliron::builtin::attributes::IntegerAttr;
+            use pliron::builtin::types::Signedness;
+            use pliron::utils::apint::APInt;
+            use std::num::NonZero;
+
+            let u32_ty = pliron::builtin::types::IntegerType::get(ctx, 32, Signedness::Unsigned);
+            let width = NonZero::new(32).unwrap();
+
+            let mut op_mut = mir_func_op.get_operation().deref_mut(ctx);
+            for (key, value) in [
+                ("reqntid_x", contract_block.x),
+                ("reqntid_y", contract_block.y),
+                ("reqntid_z", contract_block.z),
+            ] {
+                let attr = IntegerAttr::new(u32_ty, APInt::from_u32(value, width));
+                let key: Identifier = key.try_into().unwrap();
+                op_mut.attributes.set(key, attr);
+            }
+
+            if std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
+                eprintln!(
+                    "  Launch contract block detected: reqntid={}x{}x{}",
+                    contract_block.x, contract_block.y, contract_block.z
+                );
             }
         }
     }
@@ -1235,6 +1487,34 @@ mod tests {
             validate_monomorphized_successor_shape(4, 4, &[vec![4], vec![], vec![], vec![]])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn an_exact_block_may_not_need_more_threads_than_launch_bounds_allows() {
+        let block = |x, y, z| ContractBlock { x, y, z };
+        let bounds = |max_threads| LaunchBounds {
+            max_threads,
+            min_blocks: 0,
+        };
+
+        // The shapes the `cuda_module_contract` example declares: the maximum
+        // equals the required thread count on every axis product.
+        assert!(validate_block_against_bounds(bounds(256), block(256, 1, 1)).is_ok());
+        assert!(validate_block_against_bounds(bounds(64), block(8, 8, 1)).is_ok());
+        // A maximum above the requirement is redundant, and allowed.
+        assert!(validate_block_against_bounds(bounds(1024), block(16, 16, 1)).is_ok());
+
+        // A maximum below the requirement contradicts it. Without this the
+        // exporter would drop the maximum and emit the larger shape.
+        let error = validate_block_against_bounds(bounds(128), block(16, 16, 1))
+            .expect_err("256 threads exceed a 128-thread maximum");
+        assert!(error.contains("256 threads per block"), "{error}");
+        assert!(error.contains("at most 128"), "{error}");
+        assert!(validate_block_against_bounds(bounds(255), block(256, 1, 1)).is_err());
+
+        // The product is computed in u64, so a shape whose axes multiply past
+        // u32 is rejected rather than wrapping to a value under the maximum.
+        assert!(validate_block_against_bounds(bounds(1024), block(65_536, 65_536, 1)).is_err());
     }
 
     #[test]

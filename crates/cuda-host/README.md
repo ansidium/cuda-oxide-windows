@@ -73,7 +73,19 @@ Kernel parameters are mapped into host launch parameters:
 | `&[T]` | `&DeviceBuffer<T>` |
 | `&mut [T]` | `&mut DeviceBuffer<T>` |
 | `DisjointSlice<T>` | `&mut DeviceBuffer<T>` |
+| `Uniform<T>` | `T` |
 | `Copy` scalar, struct, closure, or raw pointer | unchanged |
+
+A `Uniform<T>` parameter takes the bare scalar on the host because the host is
+what makes the value uniform: one marshalled value reaches every thread of the
+launch. The device side receives the witness, which is what device APIs needing
+a launch-uniform scalar require in place of an `unsafe` assertion.
+
+A slice whose index space carries a runtime row width takes `RowWidth<T>`, which
+binds the width to that slice for the launch. The same reasoning applies and for
+the same reason, one step earlier: the row width reaches the device as one word the
+host wrote, so `DisjointSlice::tile_2d32_rt` needs neither a stride argument nor
+an `unsafe` assertion. The owned async launches take `RowWidthOwned<B>`.
 
 Because the launches are ordinary methods, rust-analyzer and rustc can complete
 kernel names, show argument names, and type-check arguments before the program
@@ -138,6 +150,13 @@ host-side maximum. For example, `prepare_transform::<SmallPolicy>` can enforce
 maximum, not an exact size; declare `block = (x, y, z)` when the full shape must
 match.
 
+An exact `block` is additionally carried into the compiled artifact as
+`.reqntid x, y, z`, which the CUDA driver enforces per axis. Preparation and
+the driver check the shape on independent paths, so a mismatch is rejected even
+when preparation is bypassed. A thread maximum gives no such guarantee: under
+`.maxntid 256, 1, 1` the driver accepts `(16, 16, 1)` as readily as
+`(256, 1, 1)`.
+
 For contracted kernels, raw `LaunchConfig` is available only through generated
 unsafe methods such as `reduce_unchecked`. Uncontracted generated methods are
 also unsafe because there is no prepared proof for their raw configuration.
@@ -160,10 +179,11 @@ the marker emitted by `#[launch_contract]` is merged with alignment requests in
 the body and reachable local helpers, and the stronger value reaches PTX.
 Prelinked external helpers keep the alignment recorded when they were compiled.
 
-Cluster and cooperative contracts are validated separately. A contract that
-combines both currently fails preparation because the available occupancy query
-cannot prove the combined residency rule; the unsafe launch method remains the
-explicit expert escape hatch.
+Cluster and cooperative contracts may be declared together. Preparation proves
+cluster geometry first (`cuOccupancyMaxActiveClusters`), then checks that the
+full grid fits in that concurrent cluster capacity so a cooperative
+`grid::sync()` cannot hang waiting for non-resident blocks. Oversized grids
+fail with `LaunchContractError::CooperativeGridTooLarge`.
 
 This closes the unsafe gap from issue #115. A 1-D contract rejects a 2-D launch
 in safe code, while an uncontracted or deliberately mismatched launch requires

@@ -54,11 +54,19 @@ LTOIR_EXAMPLES=(addressof_sharedarray cpp_consumes_rust_device device_ffi_test l
 LTOIR_MODERN_EXAMPLES=(small_type_ffi_test)
 AUTO_NVVM_EXAMPLES=(libdevice_math)
 BLACKWELL_COMPILE_EXAMPLES=(generated_intrinsics_blackwell)
-NVVM_VERIFY_EXAMPLES=(cp_async_small device_global generated_intrinsics generated_intrinsics_blackwell generated_ldmatrix legacy_atomic_fadd libdevice_math legacy_nvvm_pointer_shapes packed_atomic_add primitive_stress shuffle_64 tcgen05)
-ERROR_EXAMPLES=(error error_wgmma_mma_unimplemented error_set_discriminant_uninhabited error_enum_constant_provenance error_enum_pointer_overlap error_enum_shared_pointer_layout error_static_initializer_provenance error_tuple_array_provenance error_tuple_constant_provenance error_struct_constant_provenance error_heap_alloc error_missing_device_attr error_generated_intrinsic_abi error_generated_intrinsic_unknown_id error_generated_intrinsic_fn_pointer error_generated_intrinsic_callable)
+NVVM_VERIFY_EXAMPLES=(cp_async_small device_global enum_constant_provenance generated_intrinsics generated_intrinsics_blackwell generated_ldmatrix legacy_atomic_fadd libdevice_math legacy_nvvm_pointer_shapes packed_atomic_add primitive_stress shuffle_64 tcgen05 tuple_constant_provenance wgmma_mma_bf16)
+ERROR_EXAMPLES=(error error_set_discriminant_uninhabited error_enum_bool_payload_addr error_enum_pointer_overlap error_enum_shared_pointer_layout error_heap_alloc error_missing_device_attr error_generated_intrinsic_abi error_generated_intrinsic_unknown_id error_generated_intrinsic_fn_pointer error_generated_intrinsic_callable)
 
 # Examples that pin RUSTFLAGS=-Zinline-mir=no (verdict rules are unaffected)
 NOINLINE_MIR_EXAMPLES=(disjoint_slice_len)
+
+# Examples whose verify-code-shape.sh asserts on `#[inline(never)]` marker
+# symbols. Those markers are private, so once the middle end inlines them into
+# their single caller it deletes them, and they survive only in the
+# unoptimized IR. The optimized build still runs and still decides the verdict;
+# these get one extra CUDA_OXIDE_NO_OPT=1 build afterwards purely to produce
+# artifacts the shape check can read.
+NO_OPT_SHAPE_EXAMPLES=(const_bool_dead_branch)
 
 classify() {
     local ex="$1" cat
@@ -87,6 +95,10 @@ verify_nvvm_in_compile_only() {
 nvvm_verify_arch() {
     local ex="$1" arch="${LTOIR_ARCH}" floor=0 number
     case "${ex}" in
+        wgmma_mma_bf16)
+            printf '%s\n' 'sm_90a'
+            return
+            ;;
         cp_async_small) floor=80 ;;
         generated_intrinsics) floor=80 ;;
         generated_ldmatrix) floor=75 ;;
@@ -352,9 +364,10 @@ verdict_error() {
     # The generated-intrinsic fixtures protect fail-closed compiler contracts,
     # so merely observing an unrelated compile error is not enough.
     case "${ex}" in
-        error_enum_constant_provenance)
-            if ! grep -Fq 'Enum constant contains 1 pointer relocation(s); cuda-oxide cannot yet preserve enum pointer provenance' "${log}"; then
-                echo "FAIL (missing enum pointer-relocation diagnostic)"
+        error_enum_bool_payload_addr)
+            if ! grep -Fq 'canonical storage type' "${log}" \
+                || ! grep -Fq 'in-place mutation of bool or shared-pointer enum payloads is not supported' "${log}"; then
+                echo "FAIL (missing canonical-storage payload-address diagnostic)"
                 return 1
             fi
             ;;
@@ -365,26 +378,8 @@ verdict_error() {
             fi
             ;;
         error_enum_shared_pointer_layout)
-            if ! grep -Fq 'contains a shared-memory pointer whose size is target-mode dependent' "${log}"; then
-                echo "FAIL (missing target-dependent shared-pointer layout diagnostic)"
-                return 1
-            fi
-            ;;
-        error_tuple_array_provenance)
-            if ! grep -Fq 'Array value constant contains 2 pointer relocation(s); cuda-oxide cannot yet preserve array pointer provenance' "${log}"; then
-                echo "FAIL (missing tuple-array pointer-relocation diagnostic)"
-                return 1
-            fi
-            ;;
-        error_tuple_constant_provenance)
-            if ! grep -Fq 'Tuple constant contains 1 pointer relocation(s); cuda-oxide cannot yet preserve tuple pointer provenance' "${log}"; then
-                echo "FAIL (missing direct-tuple pointer-relocation diagnostic)"
-                return 1
-            fi
-            ;;
-        error_struct_constant_provenance)
-            if ! grep -Fq 'Struct constant contains 1 pointer relocation(s); cuda-oxide cannot yet preserve struct pointer provenance' "${log}"; then
-                echo "FAIL (missing struct pointer-relocation diagnostic)"
+            if ! grep -Fq 'arrays containing shared-memory pointers are not supported' "${log}"; then
+                echo "FAIL (missing shared-pointer array layout diagnostic)"
                 return 1
             fi
             ;;
@@ -414,6 +409,30 @@ verdict_error() {
                 return 1
             fi
             ;;
+        # These three pin an exact diagnostic in their own source or README
+        # ("Expected: the build FAILS with this exact diagnostic (pinned)"),
+        # so an unrelated compile error must not satisfy them either.
+        error_heap_alloc)
+            if ! grep -Fq 'heap allocation is not supported in kernels' "${log}"; then
+                echo "FAIL (missing heap-allocation diagnostic)"
+                return 1
+            fi
+            ;;
+        error_missing_device_attr)
+            if ! grep -Fq 'only works inside `#[kernel]` / `#[device]`' "${log}"; then
+                echo "FAIL (missing host-only-stub diagnostic)"
+                return 1
+            fi
+            ;;
+        error_set_discriminant_uninhabited)
+            if ! grep -Fq 'cannot select uninhabited variant' "${log}"; then
+                echo "FAIL (missing uninhabited-variant diagnostic)"
+                return 1
+            fi
+            ;;
+        # `error` stays on the generic check below: unlike the fixtures above it
+        # pins no single message, carrying two kernels to show that a valid one
+        # still compiles while `core::fmt` machinery is refused.
     esac
 
     if grep -qE 'Device codegen failed|Translation failed|Compilation error|Unsupported construct' "${log}"; then
@@ -1328,10 +1347,31 @@ run_cargo() {
         invoke_cargo_oxide "${args[@]}" >"${log}" 2>&1
         CARGO_EC=$?
     fi
-    if [[ ${CARGO_EC} -eq 0 && "${ex}" == "array_constants" ]]; then
-        local shape_check="crates/rustc-codegen-cuda/examples/${ex}/verify-code-shape.sh"
-        if ! "${shape_check}" >>"${log}" 2>&1; then
-            printf 'array_constants failed its exact unoptimized LLVM, optimized LLVM, or PTX shape assertions\n' >>"${log}"
+    # Any example may ship a verify-code-shape.sh; running whichever exist keeps
+    # a new one from being added and then silently never executed. Presence, not
+    # the executable bit, is the trigger -- a script committed without +x would
+    # otherwise be skipped in exactly the silence this is meant to remove -- so
+    # it runs through `bash` rather than being executed directly.
+    local shape_check="crates/rustc-codegen-cuda/examples/${ex}/verify-code-shape.sh"
+    if [[ ${CARGO_EC} -eq 0 && -f "${shape_check}" ]]; then
+        local no_opt_shape
+        for no_opt_shape in "${NO_OPT_SHAPE_EXAMPLES[@]}"; do
+            if [[ "${ex}" == "${no_opt_shape}" ]]; then
+                # Re-emit unoptimized artifacts for the check, reusing this
+                # example's own flags so the rebuild differs from the build
+                # above only in optimization. The optimized build already ran
+                # and already set CARGO_EC.
+                local -a no_opt_args=("${args[@]}")
+                no_opt_args[0]="build"
+                CUDA_OXIDE_NO_OPT=1 invoke_cargo_oxide "${no_opt_args[@]}" >>"${log}" 2>&1 \
+                    || CARGO_EC=$?
+                break
+            fi
+        done
+    fi
+    if [[ ${CARGO_EC} -eq 0 && -f "${shape_check}" ]]; then
+        if ! bash "${shape_check}" >>"${log}" 2>&1; then
+            printf '%s failed its verify-code-shape.sh assertions\n' "${ex}" >>"${log}"
             CARGO_EC=1
         fi
     fi

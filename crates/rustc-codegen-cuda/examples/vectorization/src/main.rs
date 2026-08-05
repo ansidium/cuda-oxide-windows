@@ -15,7 +15,10 @@
 //! Run: `cargo oxide run vectorization`
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
-use cuda_device::cuda_module;
+use cuda_device::{access, cuda_module};
+
+/// Elements (or quads, for the view kernel) per launch; one per thread.
+const N: usize = 256;
 
 /// One row of the per-type report.
 struct Row {
@@ -124,10 +127,77 @@ vector_suite! {
     f64x4_a32: f64; 4; align 32; size 32; "double4_32a",
 }
 
+/// Kernels over *flat* `f32` buffers: no over-aligned host type at all. The
+/// view is taken inside the kernel with `cuda_device::vector::as_vectors`,
+/// which is the intended path when the host allocation is flat.
+#[cuda_module]
+mod view_kernels {
+    use cuda_device::vector::{self, F32x4};
+    use cuda_device::{DisjointSlice, kernel, thread};
+
+    /// Copy one `F32x4` quad per thread between flat `f32` buffers through
+    /// checked [`vector::as_vectors`] views. The quad is moved whole, never
+    /// decomposed into lanes, so both the load and the store fuse into
+    /// 128-bit transactions (`ld/st.global.v4.f32`).
+    #[kernel]
+    pub fn f32x4_view_copy(input: &[f32], mut output: DisjointSlice<f32>) {
+        let i = thread::index_1d().get();
+        let out_len = output.len();
+        // SAFETY: `DisjointSlice` grants this launch exclusive access to the
+        // whole output buffer; the flat view aliases nothing else.
+        let out_flat = unsafe { core::slice::from_raw_parts_mut(output.as_mut_ptr(), out_len) };
+        let Some(quads) = vector::as_vectors::<F32x4>(input) else {
+            return;
+        };
+        let Some(out_quads) = vector::as_vectors_mut::<F32x4>(out_flat) else {
+            return;
+        };
+        if i < quads.len() && i < out_quads.len() {
+            out_quads[i] = quads[i];
+        }
+    }
+}
+
+/// The shape `f32x4_view_copy` relies on, derived by [`access::plan`] instead
+/// of by hand: a 128-bit transaction of `f32` is one 4-element quad per
+/// thread and needs `F32x4`'s 16-byte alignment, and the flat `N * 4`-element
+/// buffer is exactly one pass for the `N`-thread block `main` launches.
+const _: () = {
+    let plan = match access::plan::<f32>(access::TXN_128, N) {
+        Some(p) => p,
+        None => panic!("128 bits is a whole number of f32"),
+    };
+    assert!(plan.elems_per_thread == 4, "one F32x4 quad per thread");
+    assert!(plan.align == core::mem::align_of::<cuda_device::vector::F32x4>());
+    match plan.passes_for_tile(N * 4) {
+        Some(passes) => assert!(passes == 1, "whole buffer in one block-wide pass"),
+        None => panic!("N * 4 must be a whole number of block-wide accesses"),
+    }
+
+    // The same shape checked for global coalescing, which `plan` cannot see:
+    // one 16-byte access per lane laid end to end, so a warp covers 512
+    // contiguous bytes and touches the four lines that is the floor for them.
+    // A strided variant with the identical plan would waste three of four.
+    let mut lanes = [0usize; cuda_device::swizzle::WARP_LANES];
+    let mut lane = 0;
+    while lane < cuda_device::swizzle::WARP_LANES {
+        lanes[lane] = lane;
+        lane += 1;
+    }
+    let elem = core::mem::size_of::<cuda_device::vector::F32x4>();
+    assert!(
+        access::lines_touched(&lanes, elem) == 4,
+        "a warp of F32x4 spans exactly four cache lines"
+    );
+    assert!(
+        access::is_fully_coalesced(&lanes, elem),
+        "the view-kernel access pattern must not waste bandwidth"
+    );
+};
+
 fn main() {
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
     let stream = ctx.default_stream();
-    const N: usize = 256;
     let cfg = LaunchConfig::for_num_elems(N as u32);
 
     let module = ctx
@@ -136,6 +206,21 @@ fn main() {
     let module = kernels::from_module(module).expect("Failed to initialize typed module");
 
     let rows = run_all(&module, &stream, cfg, N);
+
+    // Flat-buffer path: allocate and fill as plain `f32`, take the `F32x4`
+    // view inside the kernel. One quad per thread.
+    let flat: Vec<f32> = (0..N * 4).map(|i| i as f32 * 0.25 + 1.0).collect();
+    let flat_in = DeviceBuffer::from_host(&stream, &flat).expect("flat input");
+    let mut flat_out = DeviceBuffer::<f32>::zeroed(&stream, N * 4).expect("flat output");
+    let view_module = ctx
+        .load_module_from_file("vectorization.ptx")
+        .expect("Failed to load vectorization.ptx for view kernels");
+    let view_module =
+        view_kernels::from_module(view_module).expect("Failed to initialize view module");
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { view_module.f32x4_view_copy(&stream, cfg, &flat_in, &mut flat_out) }
+        .expect("f32x4_view_copy launch");
+    let flat_round_trip = flat_out.to_host_vec(&stream).expect("flat readback") == flat;
 
     // Inspect the PTX we just launched to report/assert the codegen shape.
     let ptx = std::fs::read_to_string("vectorization.ptx")
@@ -174,6 +259,24 @@ fn main() {
         );
     }
 
+    // The in-kernel `as_vectors::<F32x4>` view over a flat `&[f32]` parameter
+    // must reach the same 128-bit transactions as the over-aligned parameter
+    // types above: this is the checked-view path the `vector` module ships.
+    let view_body = kernel_body(&ptx, "f32x4_view_copy");
+    if !flat_round_trip {
+        errors += 1;
+        println!("  !! f32x4_view_copy round-trip copy mismatch");
+    }
+    for dir in ["ld", "st"] {
+        match find_128bit_global(view_body, dir) {
+            Some(line) => println!("f32x4_view_copy: {line}"),
+            None => {
+                errors += 1;
+                println!("  !! f32x4_view_copy has no 128-bit {dir}.global vector op");
+            }
+        }
+    }
+
     if errors == 0 {
         println!(
             "\n\u{2713} SUCCESS: {} CUDA vector types -- layout, copy, and codegen all correct",
@@ -193,6 +296,20 @@ fn kernel_body<'a>(ptx: &'a str, name: &str) -> &'a str {
     let body = &ptx[start..];
     let end = body.find("\n}").map_or(body.len(), |e| e + 2);
     &body[..end]
+}
+
+/// First 128-bit vector global memory op of direction `dir` (`ld`/`st`) in a
+/// kernel body. llc's spelling of the 128-bit transaction varies by version
+/// (`ld.global.v4.f32` on older llc, `ld.global.v2.b64` on llc-21/22); every
+/// accepted form is a single 128-bit access.
+fn find_128bit_global<'a>(body: &'a str, dir: &str) -> Option<&'a str> {
+    let prefix = format!("{dir}.global.v");
+    body.lines().map(str::trim).find(|t| {
+        t.starts_with(&prefix)
+            && [".v4.f32", ".v4.b32", ".v2.f64", ".v2.b64"]
+                .iter()
+                .any(|w| t.contains(w))
+    })
 }
 
 /// First global memory op mnemonic in a kernel body (e.g. `ld.global.v2.b64`).

@@ -12,15 +12,21 @@
 //!
 //! ```bash
 //! cargo oxide run vecadd              # build + run an example
+//! cargo oxide run debug -- --fail-assert  # forward args to the example binary
 //! cargo oxide build vecadd            # build only
 //! cargo oxide pipeline vecadd         # verbose pipeline dump
 //! cargo oxide sanitize vecadd         # run under NVIDIA Compute Sanitizer
 //! cargo oxide debug vecadd --tui      # build + cuda-gdb
-//! cargo oxide new my_kernel            # scaffold a standalone project
+//! cargo oxide inspect vecadd          # build + print generated PTX
+//! cargo oxide new my_kernel           # scaffold a standalone project
 //! cargo oxide new my_kernel --async   # scaffold with async template
+//! cargo oxide list                    # list bundled examples
+//! cargo oxide list --json             # machine-readable output
 //! cargo oxide fmt                     # format all crates
 //! cargo oxide doctor                  # check environment
+//! cargo oxide clean                   # remove local build outputs
 //! cargo oxide setup                   # explicitly build/install backend
+//! cargo oxide update                  # refresh cached backend (external)
 //! ```
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
@@ -86,6 +92,25 @@ enum Commands {
         /// Also settable via CUDA_OXIDE_NO_FMA=1.
         #[arg(long)]
         no_fmad: bool,
+        /// Emit device line-number information for profilers and Compute
+        /// Sanitizer, leaving optimization intact (nvcc `-lineinfo`).
+        /// Also settable via CUDA_OXIDE_DEBUG=line.
+        #[arg(long)]
+        lineinfo: bool,
+        /// Emit full device debug information; libNVVM finalization runs
+        /// unoptimized (nvcc `-G`). Supersedes --lineinfo.
+        /// Also settable via CUDA_OXIDE_DEBUG=full.
+        #[arg(long)]
+        device_debug: bool,
+        /// Elide slice/array bounds checks in every device kernel
+        /// (out-of-bounds indexing becomes UB, like get_unchecked).
+        /// Also settable via CUDA_OXIDE_UNCHECKED_INDEXING=1.
+        #[arg(long)]
+        unchecked_indexing: bool,
+        /// Arguments forwarded to the example binary. Use after `--`,
+        /// e.g. `cargo oxide run debug -- --fail-assert`.
+        #[arg(last = true, num_args = 0.., allow_hyphen_values = true)]
+        app_args: Vec<String>,
     },
     /// Build and run an example or project under NVIDIA Compute Sanitizer
     Sanitize {
@@ -111,6 +136,21 @@ enum Commands {
         /// Also settable via CUDA_OXIDE_NO_FMA=1.
         #[arg(long)]
         no_fmad: bool,
+        /// Emit device line-number information for profilers and Compute
+        /// Sanitizer, leaving optimization intact (nvcc `-lineinfo`).
+        /// Also settable via CUDA_OXIDE_DEBUG=line.
+        #[arg(long)]
+        lineinfo: bool,
+        /// Emit full device debug information; libNVVM finalization runs
+        /// unoptimized (nvcc `-G`). Supersedes --lineinfo.
+        /// Also settable via CUDA_OXIDE_DEBUG=full.
+        #[arg(long)]
+        device_debug: bool,
+        /// Elide slice/array bounds checks in every device kernel
+        /// (out-of-bounds indexing becomes UB, like get_unchecked).
+        /// Also settable via CUDA_OXIDE_UNCHECKED_INDEXING=1.
+        #[arg(long)]
+        unchecked_indexing: bool,
         /// Additional arguments passed to compute-sanitizer before the binary.
         /// Use a second `--` inside this list to pass arguments to the target
         /// program after the binary.
@@ -137,6 +177,21 @@ enum Commands {
         /// Also settable via CUDA_OXIDE_NO_FMA=1.
         #[arg(long)]
         no_fmad: bool,
+        /// Emit device line-number information for profilers and Compute
+        /// Sanitizer, leaving optimization intact (nvcc `-lineinfo`).
+        /// Also settable via CUDA_OXIDE_DEBUG=line.
+        #[arg(long)]
+        lineinfo: bool,
+        /// Emit full device debug information; libNVVM finalization runs
+        /// unoptimized (nvcc `-G`). Supersedes --lineinfo.
+        /// Also settable via CUDA_OXIDE_DEBUG=full.
+        #[arg(long)]
+        device_debug: bool,
+        /// Elide slice/array bounds checks in every device kernel
+        /// (out-of-bounds indexing becomes UB, like get_unchecked).
+        /// Also settable via CUDA_OXIDE_UNCHECKED_INDEXING=1.
+        #[arg(long)]
+        unchecked_indexing: bool,
         /// Cargo target directory for passthrough mode
         #[arg(long)]
         cargo_target_dir: Option<PathBuf>,
@@ -167,6 +222,25 @@ enum Commands {
         /// Show verbose compilation output
         #[arg(short, long)]
         verbose: bool,
+        /// Disable FMA contraction (default: on, matching nvcc --fmad=true).
+        /// Also settable via CUDA_OXIDE_NO_FMA=1.
+        #[arg(long)]
+        no_fmad: bool,
+        /// Emit device line-number information for profilers and Compute
+        /// Sanitizer, leaving optimization intact (nvcc `-lineinfo`).
+        /// Also settable via CUDA_OXIDE_DEBUG=line.
+        #[arg(long)]
+        lineinfo: bool,
+        /// Emit full device debug information; libNVVM finalization runs
+        /// unoptimized (nvcc `-G`). Supersedes --lineinfo.
+        /// Also settable via CUDA_OXIDE_DEBUG=full.
+        #[arg(long)]
+        device_debug: bool,
+        /// Elide slice/array bounds checks in every device kernel
+        /// (out-of-bounds indexing becomes UB, like get_unchecked).
+        /// Also settable via CUDA_OXIDE_UNCHECKED_INDEXING=1.
+        #[arg(long)]
+        unchecked_indexing: bool,
         /// Cargo test arguments. Use after `--`; empty runs plain `cargo test`.
         #[arg(last = true, num_args = 0.., allow_hyphen_values = true)]
         cargo_args: Vec<String>,
@@ -197,6 +271,21 @@ enum Commands {
         /// Also settable via CUDA_OXIDE_NO_FMA=1.
         #[arg(long)]
         no_fmad: bool,
+        /// Emit device line-number information for profilers and Compute
+        /// Sanitizer, leaving optimization intact (nvcc `-lineinfo`).
+        /// Also settable via CUDA_OXIDE_DEBUG=line.
+        #[arg(long)]
+        lineinfo: bool,
+        /// Emit full device debug information; libNVVM finalization runs
+        /// unoptimized (nvcc `-G`). Supersedes --lineinfo.
+        /// Also settable via CUDA_OXIDE_DEBUG=full.
+        #[arg(long)]
+        device_debug: bool,
+        /// Elide slice/array bounds checks in every device kernel
+        /// (out-of-bounds indexing becomes UB, like get_unchecked).
+        /// Also settable via CUDA_OXIDE_UNCHECKED_INDEXING=1.
+        #[arg(long)]
+        unchecked_indexing: bool,
     },
     /// Show the full compilation pipeline (MIR -> PTX/NVVM IR) with verbose output
     Pipeline {
@@ -212,6 +301,21 @@ enum Commands {
         /// Also settable via CUDA_OXIDE_NO_FMA=1.
         #[arg(long)]
         no_fmad: bool,
+        /// Emit device line-number information for profilers and Compute
+        /// Sanitizer, leaving optimization intact (nvcc `-lineinfo`).
+        /// Also settable via CUDA_OXIDE_DEBUG=line.
+        #[arg(long)]
+        lineinfo: bool,
+        /// Emit full device debug information; libNVVM finalization runs
+        /// unoptimized (nvcc `-G`). Supersedes --lineinfo.
+        /// Also settable via CUDA_OXIDE_DEBUG=full.
+        #[arg(long)]
+        device_debug: bool,
+        /// Elide slice/array bounds checks in every device kernel
+        /// (out-of-bounds indexing becomes UB, like get_unchecked).
+        /// Also settable via CUDA_OXIDE_UNCHECKED_INDEXING=1.
+        #[arg(long)]
+        unchecked_indexing: bool,
     },
     /// Build with debug info and launch cuda-gdb
     Debug {
@@ -236,6 +340,44 @@ enum Commands {
         #[arg(long)]
         tui: bool,
     },
+    /// List the examples bundled with the cuda-oxide workspace
+    List {
+        /// Emit stable machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build an example or project and print the generated PTX
+    Inspect {
+        /// Example name (required in workspace, optional for standalone projects)
+        example: Option<String>,
+        /// Target architecture (e.g., sm_90, sm_100, sm_120)
+        #[arg(long)]
+        arch: Option<String>,
+        /// Comma-separated list of features to enable
+        #[arg(long)]
+        features: Option<String>,
+        /// Show verbose compilation output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Disable FMA contraction (default: on, matching nvcc --fmad=true).
+        /// Settable also via CUDA_OXIDE_NO_FMA=1.
+        #[arg(long)]
+        no_fmad: bool,
+        /// Emit device line-number information for profilers and Compute
+        /// Sanitizer, leaving optimization intact (nvcc `-lineinfo`).
+        /// Also settable via CUDA_OXIDE_DEBUG=line.
+        #[arg(long)]
+        lineinfo: bool,
+        /// Emit full device debug information; libNVVM finalization runs
+        /// unoptimized (nvcc `-G`). Supersedes --lineinfo.
+        /// Also settable via CUDA_OXIDE_DEBUG=full.
+        #[arg(long)]
+        device_debug: bool,
+        /// Elide slice/array bounds checks in every device kernel.
+        /// Settable also via CUDA_OXIDE_UNCHECKED_INDEXING=1.
+        #[arg(long)]
+        unchecked_indexing: bool,
+    },
     /// Format all crates (root workspace, codegen backend, examples)
     Fmt {
         /// Check formatting without modifying files
@@ -250,10 +392,19 @@ enum Commands {
         #[arg(long = "async")]
         async_mode: bool,
     },
+    /// Remove project-local build outputs and generated cuda-oxide artifacts
+    Clean,
     /// Check that your environment is set up correctly
     Doctor,
     /// Build and cache the codegen backend
     Setup,
+    /// Refresh the cached codegen backend (or run setup inside the workspace)
+    Update {
+        /// Inside the workspace, run `setup` instead of only advising it.
+        /// Outside the workspace, refresh is already the default.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -327,8 +478,16 @@ fn validate_materialization_cli(cli: &Cli) -> Result<(), String> {
         | Commands::Test { .. }
         | Commands::Pipeline { .. }
         | Commands::Debug { .. } => Ok(()),
+        Commands::Inspect { .. } => Err(
+            "--materialize-cubin cannot be used with inspect because inspect displays PTX"
+                .to_string(),
+        ),
         Commands::EmitLtoir { .. } => Err(
             "--materialize-cubin cannot be combined with emit-ltoir; one emits a final cubin and the other emits linkable LTOIR"
+                .to_string(),
+        ),
+        Commands::List { .. } => Err(
+            "--materialize-cubin cannot be used with list because list does not compile device code"
                 .to_string(),
         ),
         Commands::Fmt { .. } => Err(
@@ -339,12 +498,20 @@ fn validate_materialization_cli(cli: &Cli) -> Result<(), String> {
             "--materialize-cubin cannot be used with new because new does not compile device code"
                 .to_string(),
         ),
+        Commands::Clean => Err(
+            "--materialize-cubin cannot be used with clean because clean does not compile device code"
+                .to_string(),
+        ),
         Commands::Doctor => Err(
             "--materialize-cubin cannot be used with doctor because doctor does not compile device code"
                 .to_string(),
         ),
         Commands::Setup => Err(
             "--materialize-cubin cannot be used with setup because setup only builds the codegen backend"
+                .to_string(),
+        ),
+        Commands::Update { .. } => Err(
+            "--materialize-cubin cannot be used with update because update only refreshes the codegen backend"
                 .to_string(),
         ),
         Commands::MaterializerProvenance => Err(
@@ -388,6 +555,10 @@ fn main() {
             bin,
             verbose,
             no_fmad,
+            unchecked_indexing,
+            lineinfo,
+            device_debug,
+            app_args,
         } => {
             let ctx = commands::resolve_context();
             let example = resolve_example_name(example, &ctx, "run");
@@ -407,7 +578,10 @@ fn main() {
                 features.as_deref(),
                 bin.as_deref(),
                 no_fmad,
+                unchecked_indexing,
+                commands::DeviceDebug::from_flags(lineinfo, device_debug),
                 materialize_cubin,
+                &app_args,
             );
         }
         Commands::Sanitize {
@@ -418,6 +592,9 @@ fn main() {
             bin,
             verbose,
             no_fmad,
+            unchecked_indexing,
+            lineinfo,
+            device_debug,
             sanitizer_args,
         } => {
             let ctx = commands::resolve_context();
@@ -436,6 +613,8 @@ fn main() {
                 features.as_deref(),
                 bin.as_deref(),
                 no_fmad,
+                unchecked_indexing,
+                commands::DeviceDebug::from_flags(lineinfo, device_debug),
                 materialize_cubin,
             );
         }
@@ -446,6 +625,9 @@ fn main() {
             features,
             verbose,
             no_fmad,
+            unchecked_indexing,
+            lineinfo,
+            device_debug,
             cargo_target_dir,
             device_codegen_crate,
             device_cfgs,
@@ -476,6 +658,8 @@ fn main() {
                     arch.as_deref(),
                     features.as_deref(),
                     no_fmad,
+                    unchecked_indexing,
+                    commands::DeviceDebug::from_flags(lineinfo, device_debug),
                     materialize_cubin,
                 );
             } else {
@@ -504,7 +688,9 @@ fn main() {
                         device_codegen_crate: device_codegen_crate.as_deref(),
                         device_cfgs: &device_cfgs,
                         no_fmad,
+                        unchecked_indexing,
                         materialize_cubin,
+                        device_debug: commands::DeviceDebug::from_flags(lineinfo, device_debug),
                     },
                     &cargo_args,
                 );
@@ -516,6 +702,10 @@ fn main() {
             device_codegen_crate,
             device_cfgs,
             verbose,
+            no_fmad,
+            unchecked_indexing,
+            lineinfo,
+            device_debug,
             cargo_args,
         } => {
             let ctx = commands::resolve_context();
@@ -537,8 +727,10 @@ fn main() {
                     cargo_target_dir: cargo_target_dir.as_deref(),
                     device_codegen_crate: device_codegen_crate.as_deref(),
                     device_cfgs: &device_cfgs,
-                    no_fmad: false,
+                    no_fmad,
+                    unchecked_indexing,
                     materialize_cubin,
+                    device_debug: commands::DeviceDebug::from_flags(lineinfo, device_debug),
                 },
                 &cargo_args,
             );
@@ -550,6 +742,9 @@ fn main() {
             output,
             verbose,
             no_fmad,
+            unchecked_indexing,
+            lineinfo,
+            device_debug,
         } => {
             let ctx = commands::resolve_context();
             let example = resolve_example_name(example, &ctx, "emit-ltoir");
@@ -561,6 +756,8 @@ fn main() {
                 output.as_deref(),
                 verbose,
                 no_fmad,
+                unchecked_indexing,
+                commands::DeviceDebug::from_flags(lineinfo, device_debug),
             );
         }
         Commands::Pipeline {
@@ -568,6 +765,9 @@ fn main() {
             emit_nvvm_ir,
             arch,
             no_fmad,
+            unchecked_indexing,
+            lineinfo,
+            device_debug,
         } => {
             let ctx = commands::resolve_context();
             let example = resolve_example_name(example, &ctx, "pipeline");
@@ -584,7 +784,32 @@ fn main() {
                 emit_nvvm_ir,
                 arch.as_deref(),
                 no_fmad,
+                unchecked_indexing,
+                commands::DeviceDebug::from_flags(lineinfo, device_debug),
                 materialize_cubin,
+            );
+        }
+        Commands::Inspect {
+            example,
+            arch,
+            features,
+            verbose,
+            no_fmad,
+            unchecked_indexing,
+            lineinfo,
+            device_debug,
+        } => {
+            let ctx = commands::resolve_context();
+            let example = resolve_example_name(example, &ctx, "inspect");
+            commands::codegen_inspect_ptx(
+                &ctx,
+                &example,
+                arch.as_deref(),
+                features.as_deref(),
+                verbose,
+                no_fmad,
+                unchecked_indexing,
+                commands::DeviceDebug::from_flags(lineinfo, device_debug),
             );
         }
         Commands::Debug {
@@ -609,6 +834,10 @@ fn main() {
                 materialize_cubin,
             );
         }
+        Commands::List { json } => {
+            let ctx = commands::resolve_passive_context();
+            commands::list_examples(&ctx, json);
+        }
         Commands::Fmt { check } => {
             let ctx = commands::resolve_context();
             commands::format_all(&ctx, check);
@@ -616,15 +845,29 @@ fn main() {
         Commands::New { name, async_mode } => {
             commands::scaffold_new(&name, async_mode);
         }
+        Commands::Clean => {
+            let ctx = commands::resolve_passive_context();
+            commands::clean(&ctx);
+        }
         Commands::Doctor => {
             // Side-effect-free resolver: doctor must never build the backend
             // (or clone anything) before it can diagnose the environment.
-            let ctx = commands::resolve_doctor_context();
+            let ctx = commands::resolve_passive_context();
             commands::doctor(&ctx);
         }
         Commands::Setup => {
             let ctx = commands::resolve_context();
             commands::setup(&ctx);
+        }
+        Commands::Update { force } => {
+            // All plans resolve passively. `setup` only needs
+            // `ctx.codegen_crate`, which the passive resolver provides
+            // identically, while eager resolution would auto-fetch and build
+            // the backend before `update` runs: a double clone+build ahead of
+            // the RefreshCache arm's own clear-and-rebuild, and a wasted
+            // build ahead of the pinned-backend refusals.
+            let ctx = commands::resolve_passive_context();
+            commands::update(&ctx, force);
         }
     }
 }
@@ -694,6 +937,31 @@ mod tests {
     }
 
     #[test]
+    fn clean_parser_accepts_command_without_arguments() {
+        let cli =
+            Cli::try_parse_from(["cargo-oxide", "clean"]).expect("clean command should parse");
+
+        assert!(matches!(cli.command, Commands::Clean));
+    }
+
+    #[test]
+    fn update_parser_accepts_force_flag() {
+        let plain =
+            Cli::try_parse_from(["cargo-oxide", "update"]).expect("update command should parse");
+        let Commands::Update { force } = plain.command else {
+            panic!("expected Update");
+        };
+        assert!(!force);
+
+        let forced = Cli::try_parse_from(["cargo-oxide", "update", "--force"])
+            .expect("update --force should parse");
+        let Commands::Update { force } = forced.command else {
+            panic!("expected Update");
+        };
+        assert!(force);
+    }
+
+    #[test]
     fn build_parser_preserves_nested_cargo_and_test_separators() {
         let args = strings(&[
             "cargo-oxide",
@@ -759,6 +1027,7 @@ mod tests {
             &["cargo-oxide", "new", "demo", "--materialize-cubin"],
             &["cargo-oxide", "doctor", "--materialize-cubin"],
             &["cargo-oxide", "setup", "--materialize-cubin"],
+            &["cargo-oxide", "clean", "--materialize-cubin"],
             &[
                 "cargo-oxide",
                 "emit-ltoir",
@@ -767,6 +1036,7 @@ mod tests {
                 "sm_90",
                 "--materialize-cubin",
             ],
+            &["cargo-oxide", "inspect", "demo", "--materialize-cubin"],
         ] {
             let cli = Cli::try_parse_from(args).expect("global flag should parse first");
             let error = validate_materialization_cli(&cli)
@@ -798,10 +1068,22 @@ mod tests {
     fn empty_test_and_explicit_empty_build_passthrough_are_distinct() {
         let test_cli = Cli::try_parse_from(["cargo-oxide", "test"])
             .expect("cargo oxide test should accept no Cargo arguments");
-        let Commands::Test { cargo_args, .. } = test_cli.command else {
+        let Commands::Test {
+            cargo_args,
+            no_fmad,
+            unchecked_indexing,
+            lineinfo,
+            device_debug,
+            ..
+        } = test_cli.command
+        else {
             panic!("expected test command");
         };
         assert!(cargo_args.is_empty());
+        assert!(!no_fmad);
+        assert!(!unchecked_indexing);
+        assert!(!lineinfo, "--lineinfo must default off");
+        assert!(!device_debug, "--device-debug must default off");
 
         let build_args = strings(&["cargo-oxide", "build", "--"]);
         assert!(has_passthrough_separator(&build_args));
@@ -810,6 +1092,69 @@ mod tests {
             panic!("expected build command");
         };
         assert!(cargo_args.is_empty());
+    }
+
+    #[test]
+    fn test_parser_accepts_codegen_flags() {
+        let cli = Cli::try_parse_from([
+            "cargo-oxide",
+            "test",
+            "--no-fmad",
+            "--unchecked-indexing",
+            "--",
+            "-p",
+            "gpu-app",
+        ])
+        .expect("test codegen flags should parse");
+        let Commands::Test {
+            no_fmad,
+            unchecked_indexing,
+            lineinfo,
+            device_debug,
+            cargo_args,
+            ..
+        } = cli.command
+        else {
+            panic!("expected test command");
+        };
+        assert!(no_fmad);
+        assert!(unchecked_indexing);
+        assert!(!lineinfo, "--lineinfo must default off");
+        assert!(!device_debug, "--device-debug must default off");
+        assert_eq!(cargo_args, strings(&["-p", "gpu-app"]));
+    }
+
+    #[test]
+    fn run_parser_forwards_trailing_application_args() {
+        let cli = Cli::try_parse_from([
+            "cargo-oxide",
+            "run",
+            "debug",
+            "--",
+            "--fail-assert",
+            "positional",
+        ])
+        .expect("run command with trailing args should parse");
+
+        let Commands::Run {
+            example, app_args, ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert_eq!(example.as_deref(), Some("debug"));
+        assert_eq!(app_args, strings(&["--fail-assert", "positional"]));
+    }
+
+    #[test]
+    fn run_parser_defaults_to_no_application_args() {
+        let cli =
+            Cli::try_parse_from(["cargo-oxide", "run", "debug"]).expect("run command should parse");
+
+        let Commands::Run { app_args, .. } = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(app_args.is_empty());
     }
 
     #[test]
@@ -909,5 +1254,124 @@ mod tests {
         assert!(use_build_passthrough(false, false, true, false, false));
         assert!(use_build_passthrough(false, false, false, true, false));
         assert!(use_build_passthrough(false, false, false, false, true));
+    }
+
+    #[test]
+    fn list_parser_defaults_to_human_output() {
+        let cli = Cli::try_parse_from(["cargo-oxide", "list"]).expect("list command should parse");
+
+        let Commands::List { json } = cli.command else {
+            panic!("expected list command");
+        };
+
+        assert!(!json);
+    }
+
+    #[test]
+    fn list_parser_accepts_json_output() {
+        let cli = Cli::try_parse_from(["cargo-oxide", "list", "--json"])
+            .expect("list --json should parse");
+
+        let Commands::List { json } = cli.command else {
+            panic!("expected list command");
+        };
+
+        assert!(json);
+    }
+
+    #[test]
+    fn materialize_cubin_rejects_list() {
+        let cli = Cli::try_parse_from(["cargo-oxide", "list", "--materialize-cubin"])
+            .expect("global option should parse");
+
+        let error =
+            validate_materialization_cli(&cli).expect_err("list must reject materialization");
+
+        assert!(error.contains("--materialize-cubin"));
+        assert!(error.contains("list"));
+    }
+
+    #[test]
+    fn inspect_parser_accepts_codegen_options() {
+        let cli = Cli::try_parse_from([
+            "cargo-oxide",
+            "inspect",
+            "vecadd",
+            "--arch",
+            "sm_90",
+            "--features",
+            "foo,bar",
+            "--verbose",
+            "--no-fmad",
+            "--unchecked-indexing",
+        ])
+        .expect("inspect command should parse");
+
+        let Commands::Inspect {
+            example,
+            arch,
+            features,
+            verbose,
+            no_fmad,
+            unchecked_indexing,
+            lineinfo,
+            device_debug,
+        } = cli.command
+        else {
+            panic!("expected inspect command");
+        };
+
+        assert_eq!(example.as_deref(), Some("vecadd"));
+        assert_eq!(arch.as_deref(), Some("sm_90"));
+        assert_eq!(features.as_deref(), Some("foo,bar"));
+        assert!(verbose);
+        assert!(no_fmad);
+        assert!(unchecked_indexing);
+        assert!(!lineinfo, "--lineinfo must default off");
+        assert!(!device_debug, "--device-debug must default off");
+    }
+
+    #[test]
+    fn parser_accepts_device_debug_flags() {
+        let cli = Cli::try_parse_from(["cargo-oxide", "build", "vecadd", "--lineinfo"])
+            .expect("--lineinfo should parse");
+        let Commands::Build {
+            lineinfo,
+            device_debug,
+            ..
+        } = cli.command
+        else {
+            panic!("expected build command");
+        };
+        assert!(lineinfo);
+        assert!(!device_debug);
+
+        // #552 gave `test` the codegen flags, so the debug policy belongs there too.
+        let cli = Cli::try_parse_from(["cargo-oxide", "test", "--device-debug"])
+            .expect("--device-debug should parse on test");
+        let Commands::Test {
+            lineinfo,
+            device_debug,
+            ..
+        } = cli.command
+        else {
+            panic!("expected test command");
+        };
+        assert!(!lineinfo);
+        assert!(device_debug);
+    }
+
+    #[test]
+    fn device_debug_flags_resolve_in_nvcc_order() {
+        use commands::DeviceDebug;
+        // Absent flags stay Off so an ambient CUDA_OXIDE_DEBUG survives.
+        assert_eq!(DeviceDebug::from_flags(false, false), DeviceDebug::Off);
+        assert_eq!(
+            DeviceDebug::from_flags(true, false),
+            DeviceDebug::LineTables
+        );
+        assert_eq!(DeviceDebug::from_flags(false, true), DeviceDebug::Full);
+        // Full debug already carries line tables, so it wins over --lineinfo.
+        assert_eq!(DeviceDebug::from_flags(true, true), DeviceDebug::Full);
     }
 }

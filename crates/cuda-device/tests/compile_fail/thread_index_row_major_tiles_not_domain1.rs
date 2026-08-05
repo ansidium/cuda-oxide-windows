@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use cuda_device::{DisjointSlice, RowMajorTiles, __LaunchContractDisjointSlice};
+use cuda_device::{__LaunchContractDisjointSlice, DisjointSlice, RowMajorTiles};
 
 type TileOutput = DisjointSlice<'static, u32, RowMajorTiles<2, 4, 16>>;
 

@@ -73,11 +73,7 @@ mod kernels {
             let _ = value;
         }
 
-        pub(super) fn typecheck(
-            module: &LoadedModule,
-            stream: &CudaStream,
-            config: LaunchConfig,
-        ) {
+        pub(super) fn typecheck(module: &LoadedModule, stream: &CudaStream, config: LaunchConfig) {
             // SAFETY: this compile-pass fixture supplies the raw launch proof.
             let _ = unsafe { module.private_map(stream, config, 7u32) };
         }
@@ -138,11 +134,7 @@ fn typecheck_namespaces(
     // SAFETY: this compile-pass fixture supplies the raw launch proofs.
     unsafe {
         let _ = root.root_typed(stream, config, Params { value: 1 });
-        let _ = child.child_typed(
-            stream,
-            config,
-            kernels::child::Params { values: [2; 4] },
-        );
+        let _ = child.child_typed(stream, config, kernels::child::Params { values: [2; 4] });
     }
 
     let _ = kernels::child::LoadedModule::from_parent(root);

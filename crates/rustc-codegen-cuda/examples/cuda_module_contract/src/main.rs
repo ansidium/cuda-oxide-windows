@@ -76,6 +76,29 @@ mod kernels {
         }
     }
 
+    /// Size requirements: the generated checked launchers prove every
+    /// `requires` relation on the CPU before marshalling, so an undersized
+    /// buffer becomes a typed `LaunchContractError` instead of a device
+    /// fault. Evaluation is overflow-safe: operands widen to u64 and the
+    /// arithmetic uses checked ops. The `_unchecked` escape hatch skips
+    /// these checks just as it skips the geometry checks.
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (input.len() >= n * stride, output.len() >= n),
+    )]
+    pub fn strided_scale(n: usize, stride: usize, input: &[f32], mut output: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if i < n
+            && let Some(out) = output.get_mut(index)
+        {
+            *out = input[i * stride] * 2.0;
+        }
+    }
+
     /// Compile-time proof that a contract alignment is merged with alignment
     /// requested by the body. The body asks for 16 bytes; the contract raises
     /// the emitted extern-shared declaration to 128 bytes.
@@ -214,6 +237,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "generic prepared launch produced an unexpected value",
     );
 
+    // --- Size requirements (`requires`) ---
+    let n: usize = 256;
+    let stride: usize = 2;
+    let strided_input: Vec<f32> = (0..n * stride).map(|i| i as f32).collect();
+    let strided_input_dev = DeviceBuffer::from_host(&stream, &strided_input)?;
+    let mut strided_output_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+    let strided_launch =
+        module.prepare_strided_scale(LaunchConfig1D::new((n as u32).div_ceil(128), 128, 0))?;
+
+    // (a) Buffers satisfying every relation launch normally.
+    module.strided_scale(
+        &stream,
+        &strided_launch,
+        n,
+        stride,
+        &strided_input_dev,
+        &mut strided_output_dev,
+    )?;
+    let strided_output = strided_output_dev.to_host_vec(&stream)?;
+    assert!(
+        strided_output
+            .iter()
+            .enumerate()
+            .all(|(i, &value)| value == (i * stride) as f32 * 2.0),
+        "strided scale produced an unexpected value",
+    );
+
+    // (b) An undersized buffer fails fast on the CPU: the launcher returns a
+    // typed error carrying the violated relation's source text and both
+    // evaluated sides, and nothing reaches the GPU.
+    let undersized_dev = DeviceBuffer::from_host(&stream, &strided_input[..64])?;
+    let violation = module.strided_scale(
+        &stream,
+        &strided_launch,
+        n,
+        stride,
+        &undersized_dev,
+        &mut strided_output_dev,
+    );
+    match violation {
+        Err(
+            error @ cuda_core::LaunchContractError::SizeRequirementViolated {
+                relation,
+                lhs,
+                rhs,
+                ..
+            },
+        ) => {
+            println!("rejected undersized launch on the CPU: {error}");
+            assert_eq!(relation, "input.len() >= n * stride");
+            assert_eq!(lhs, 64);
+            assert_eq!(rhs, 512);
+        }
+        other => panic!("expected SizeRequirementViolated, got {other:?}"),
+    }
+
+    // (c) Relation arithmetic is overflow-safe: an operand product leaving
+    // the u64 range is its own typed error, not a wrapped comparison.
+    let overflow = module.strided_scale(
+        &stream,
+        &strided_launch,
+        usize::MAX,
+        stride,
+        &strided_input_dev,
+        &mut strided_output_dev,
+    );
+    match overflow {
+        Err(error @ cuda_core::LaunchContractError::SizeRequirementOverflow { relation, .. }) => {
+            println!("rejected overflowing relation on the CPU: {error}");
+            assert_eq!(relation, "input.len() >= n * stride");
+        }
+        other => panic!("expected SizeRequirementOverflow, got {other:?}"),
+    }
+
+    // The two rejected launches left the stream healthy; a valid launch
+    // still succeeds afterwards.
+    module.strided_scale(
+        &stream,
+        &strided_launch,
+        n,
+        stride,
+        &strided_input_dev,
+        &mut strided_output_dev,
+    )?;
+    stream.synchronize()?;
+
     println!("SUCCESS: mixed ABI typed launch passed");
     Ok(())
 }
@@ -253,47 +362,65 @@ fn verify_launch_contract_ptx() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    for entry in ["aligned_dynamic_shared", "mixed_abi"] {
-        let start = ptx
-            .find(&format!(".visible .entry {entry}("))
-            .ok_or_else(|| format!("missing PTX entry {entry}"))?;
-        let rest = &ptx[start..];
-        let end = rest[1..]
-            .find(".visible .entry ")
-            .map_or(rest.len(), |offset| offset + 1);
-        if !rest[..end].contains(".maxntid 256, 1, 1") {
-            return Err(format!("PTX entry {entry} lost its launch bounds").into());
-        }
-    }
-
-    for entry in [
-        "helper_contract_32",
-        "helper_contract_256",
-        "explicit_aligned_u32",
+    // A kernel declaring an exact `block` carries that shape into PTX as
+    // `.reqntid`, which the driver enforces on every axis. Every kernel in
+    // this example declares one, including the generic and the explicitly
+    // instantiated kernels whose contracts expand before `#[kernel]` and
+    // reach the entry wrapper through marker forwarding.
+    for (entry, geometry) in [
+        ("aligned_dynamic_shared", ".reqntid 256, 1, 1"),
+        ("mixed_abi", ".reqntid 256, 1, 1"),
+        ("strided_scale", ".reqntid 128, 1, 1"),
+        ("helper_contract_32", ".reqntid 32, 1, 1"),
+        ("helper_contract_256", ".reqntid 32, 1, 1"),
+        ("explicit_aligned_u32", ".reqntid 32, 1, 1"),
     ] {
-        let start = ptx
-            .find(&format!(".visible .entry {entry}("))
-            .ok_or_else(|| format!("missing PTX entry {entry}"))?;
-        let rest = &ptx[start..];
-        let end = rest[1..]
-            .find(".visible .entry ")
-            .map_or(rest.len(), |offset| offset + 1);
-        if !rest[..end].contains(".maxntid 32, 1, 1") {
-            return Err(format!("PTX entry {entry} lost its launch bounds").into());
-        }
+        verify_entry_geometry(&ptx, &format!(".visible .entry {entry}("), entry, geometry)?;
     }
 
-    let generic_start = ptx
-        .find(".visible .entry generic_aligned_TID_")
-        .ok_or("missing generic_aligned PTX specialization")?;
-    let generic_rest = &ptx[generic_start..];
-    let generic_end = generic_rest[1..]
-        .find(".visible .entry ")
-        .map_or(generic_rest.len(), |offset| offset + 1);
-    if !generic_rest[..generic_end].contains(".maxntid 64, 1, 1") {
-        return Err("generic_aligned PTX specialization lost its launch bounds".into());
-    }
+    verify_entry_geometry(
+        &ptx,
+        ".visible .entry generic_aligned_TID_",
+        "generic_aligned specialization",
+        ".reqntid 64, 1, 1",
+    )?;
 
     println!("SUCCESS: prepared-launch PTX contract verified");
+    Ok(())
+}
+
+/// Assert one entry's launch geometry, and that it declares exactly one of the
+/// two mutually exclusive directives.
+///
+/// ptxas rejects an entry carrying both `.maxntid` and `.reqntid`
+/// ("Conflicting directives: .maxntid and .reqntid cannot both be specified"),
+/// so a kernel with an exact block emits `.reqntid` in place of the thread
+/// maximum. Every kernel here declares `#[launch_bounds]`, so this is the case
+/// that would regress if the exporter stopped suppressing one of them.
+fn verify_entry_geometry(
+    ptx: &str,
+    anchor: &str,
+    entry: &str,
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = ptx
+        .find(anchor)
+        .ok_or_else(|| format!("missing PTX entry {entry}"))?;
+    let rest = &ptx[start..];
+    let end = rest[1..]
+        .find(".visible .entry ")
+        .map_or(rest.len(), |offset| offset + 1);
+    let body = &rest[..end];
+
+    if !body.contains(expected) {
+        return Err(format!("PTX entry {entry} lost its launch geometry `{expected}`").into());
+    }
+    if body.contains(".maxntid") && body.contains(".reqntid") {
+        return Err(format!(
+            "PTX entry {entry} declares both .maxntid and .reqntid, which ptxas rejects"
+        )
+        .into());
+    }
+
     Ok(())
 }

@@ -128,7 +128,9 @@ pub mod conversion_interface;
 pub mod convert;
 pub mod helpers;
 pub mod lowering;
+pub mod scalarize_block_args;
 pub mod type_conversion_interface;
+mod wgmma_deferred_accumulator;
 
 use rustc_hash::FxHashMap;
 
@@ -353,6 +355,10 @@ pub fn lower_mir_to_llvm_with_options(
     options: LoweringOptions,
 ) -> Result<()> {
     context::set_lowering_options(ctx, options);
+    // WGMMA pointer-form MMA operations are only sound when their complete
+    // fence/MMA/commit/wait<0> region can be fused into one deferred group.
+    // Run this while MIR control flow and unsigned constants are still intact.
+    wgmma_deferred_accumulator::fuse_deferred_accumulators(ctx, module_op)?;
     // Dynamic shared-memory operations may live in device helpers. Compute
     // every kernel-to-helper requirement while the complete MIR call graph is
     // still available; function conversion removes that graph incrementally.
@@ -373,6 +379,13 @@ pub fn lower_mir_to_llvm_with_options(
     // longer reach.
     let mut rewriter = IRRewriter::<Recorder>::default();
     remove_blocks_inside_op(module_op, ctx, &mut rewriter);
+    // mem2reg promotes enum/struct slots into whole-aggregate block arguments,
+    // which export as PHIs of first-class aggregates. LLVM's -O2 pipeline
+    // cannot split those (SROA only handles allocas), so e.g. an iterator
+    // loop merging `Option<(f32, f32)>` keeps a materialized discriminant and
+    // an extra branch per iteration. Split such arguments into scalar leaves
+    // so the exported IR carries scalar PHIs, as SROA would produce.
+    scalarize_block_args::scalarize_aggregate_block_args(ctx, module_op)?;
     Ok(())
 }
 

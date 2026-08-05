@@ -14,11 +14,7 @@ mod kernels {
     include!("cuda_module_include_kernel_boundary_items.rs");
 }
 
-fn undiscovered(
-    module: &kernels::LoadedModule,
-    stream: &CudaStream,
-    config: LaunchConfig,
-) {
+fn undiscovered(module: &kernels::LoadedModule, stream: &CudaStream, config: LaunchConfig) {
     let _ = module.from_include(stream, config, 1u32);
 }
 

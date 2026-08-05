@@ -13,7 +13,9 @@ pub fn collision_probe<
     const __cuda_oxide_kernel_hash: usize,
     const __cuda_oxide_kernel_ptr: usize,
     const __cuda_oxide_force_mono: usize,
->(value: u32) {
+>(
+    value: u32,
+) {
     let _ = (
         __cuda_oxide_arg_0,
         __cuda_oxide_kernel_hash,
@@ -31,7 +33,10 @@ fn low_level_launch<
     const __cuda_oxide_config: usize,
     const __cuda_oxide_cooperative: usize,
     const __cuda_oxide_error: usize,
->(module: Arc<CudaModule>, stream: Arc<CudaStream>) {
+>(
+    module: Arc<CudaModule>,
+    stream: Arc<CudaStream>,
+) {
     // SAFETY: this function is compiled to test macro hygiene and is never run.
     let _ = unsafe {
         cuda_launch! {

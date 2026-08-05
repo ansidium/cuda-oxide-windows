@@ -30,14 +30,9 @@ mod kernels {
     pub fn configured<P: Policy>() {}
 }
 
-fn needs_wide(
-    _: &cuda_core::PreparedLaunch<kernels::__configured_CudaKernel<WidePolicy>>,
-) {
-}
+fn needs_wide(_: &cuda_core::PreparedLaunch<kernels::__configured_CudaKernel<WidePolicy>>) {}
 
-fn wrong_policy(
-    small: &cuda_core::PreparedLaunch<kernels::__configured_CudaKernel<SmallPolicy>>,
-) {
+fn wrong_policy(small: &cuda_core::PreparedLaunch<kernels::__configured_CudaKernel<SmallPolicy>>) {
     needs_wide(small);
 }
 

@@ -73,9 +73,8 @@ fn prepared_methods_exist(module: &kernels::LoadedModule) {
     let _ = module.prepare_type_alias(cuda_core::LaunchConfig2D::new((1, 1), (8, 8), 0));
     let _ = module.prepare_import_alias(cuda_core::LaunchConfig2D::new((1, 1), (8, 8), 0));
     let _ = module.prepare_runtime_2d(cuda_core::LaunchConfig2D::new((1, 1), (8, 8), 0));
-    let _ = module.prepare_two_dimensional_index_on_1d_launch(
-        cuda_core::LaunchConfig1D::new(1, 64, 0),
-    );
+    let _ =
+        module.prepare_two_dimensional_index_on_1d_launch(cuda_core::LaunchConfig1D::new(1, 64, 0));
     let _ = module.prepare_lifetime_only(cuda_core::LaunchConfig1D::new(1, 64, 0));
     let _ = module.prepare_generic_fast::<7>(cuda_core::LaunchConfig1D::new(1, 64, 0));
     let _ = module.prepare_same_named_local_is_ordinary(cuda_core::LaunchConfig1D::new(1, 64, 0));

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use cuda_device::{device, DisjointSlice};
+use cuda_device::{DisjointSlice, device};
 
 #[device]
 pub fn bad_stride(mut out: DisjointSlice<u32, cuda_device::thread::Index2D<100>>) {

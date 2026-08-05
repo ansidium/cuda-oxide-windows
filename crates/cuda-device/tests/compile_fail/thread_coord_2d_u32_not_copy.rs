@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use cuda_device::thread::{LaunchContextRef, __internal};
+use cuda_device::thread::{__internal, LaunchContextRef};
 
 fn cannot_reuse_coordinate_proof<'kernel>(
     launch_context: LaunchContextRef<'kernel, __internal::Domain2, __internal::U32Coordinates>,
