@@ -85,31 +85,6 @@ pub fn check_contents(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn canonical_text_bytes_normalizes_windows_line_endings() {
-        assert_eq!(
-            canonical_text_bytes(b"first\r\nsecond\r\n").as_ref(),
-            b"first\nsecond\n"
-        );
-        assert_eq!(
-            canonical_text_bytes(b"first\nsecond\n").as_ref(),
-            b"first\nsecond\n"
-        );
-    }
-
-    #[test]
-    fn canonical_text_bytes_preserves_lone_carriage_returns() {
-        assert_eq!(
-            canonical_text_bytes(b"first\rsecond\n").as_ref(),
-            b"first\rsecond\n"
-        );
-    }
-}
-
 pub fn rustfmt_source(source: &str) -> Result<String> {
     let rustfmt = std::env::var_os("RUSTFMT").unwrap_or_else(|| "rustfmt".into());
     let mut child = Command::new(&rustfmt)
@@ -143,4 +118,29 @@ fn temporary_sibling(path: &Path) -> PathBuf {
         .to_os_string();
     name.push(".cuda-intrinsics-gen.tmp");
     path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_text_bytes_normalizes_windows_line_endings() {
+        assert_eq!(
+            canonical_text_bytes(b"first\r\nsecond\r\n").as_ref(),
+            b"first\nsecond\n"
+        );
+        assert_eq!(
+            canonical_text_bytes(b"first\nsecond\n").as_ref(),
+            b"first\nsecond\n"
+        );
+    }
+
+    #[test]
+    fn canonical_text_bytes_preserves_lone_carriage_returns() {
+        assert_eq!(
+            canonical_text_bytes(b"first\rsecond\n").as_ref(),
+            b"first\rsecond\n"
+        );
+    }
 }
