@@ -253,7 +253,7 @@ workspace member.
 ```text
 cuda-oxide/
 ├── Cargo.toml              # Workspace root
-├── rust-toolchain.toml     # Pinned nightly + components
+├── rust-toolchain.toml     # Stable channel + required components
 ├── crates/
 │   ├── cuda-device/          # Device intrinsics (#![no_std])
 │   ├── cuda-host/            # Host launch APIs

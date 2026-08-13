@@ -559,11 +559,7 @@ pub fn is_fully_monomorphized<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>)
 /// case a build ever takes the `std` route too. Only `std::`-prefixed names
 /// belong here; `core`-based shims are already allowed.
 fn is_intrinsic_lowered_cmath_shim(fn_path: &str) -> bool {
-    fn_path.starts_with("std::sys::cmath::")
-        && mir_importer::translator::terminator::intrinsics::float_math::RustFloatMathIntrinsic::from_core_path(
-            fn_path,
-        )
-        .is_some()
+    fn_path.starts_with("std::sys::cmath::") && mir_importer::is_float_math_intrinsic_path(fn_path)
 }
 
 /// Returns true for hidden `cuda_device::ptx_asm!` marker functions.

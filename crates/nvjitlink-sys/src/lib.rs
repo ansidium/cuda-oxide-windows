@@ -73,6 +73,8 @@ struct NvJitLinkResult(c_int);
 
 impl NvJitLinkResult {
     const SUCCESS: Self = Self(0);
+    /// `NVJITLINK_ERROR_UNRECOGNIZED_OPTION` from `nvJitLink.h`.
+    const UNRECOGNIZED_OPTION: Self = Self(1);
 }
 
 /// nvJitLink input kinds (`nvJitLinkInputType`). Mirrors `nvJitLink.h`.
@@ -161,6 +163,21 @@ pub enum NvJitLinkError {
         /// nvJitLink error log, if available.
         log: Option<String>,
     },
+}
+
+impl NvJitLinkError {
+    /// Whether nvJitLink rejected an option string with
+    /// `NVJITLINK_ERROR_UNRECOGNIZED_OPTION`.
+    ///
+    /// Callers that pass optional, non-semantic options (for example
+    /// diagnostic reporting flags) can use this to detect an older nvJitLink
+    /// that predates the option and retry without it.
+    pub fn is_unrecognized_option(&self) -> bool {
+        matches!(
+            self,
+            Self::Call { code, .. } if *code == NvJitLinkResult::UNRECOGNIZED_OPTION.0
+        )
+    }
 }
 
 // ============================================================================
@@ -340,6 +357,18 @@ impl LibNvJitLink {
 // Linker (RAII)
 // ============================================================================
 
+/// Linked image plus nvJitLink's best-effort informational log.
+///
+/// The log is populated when the selected nvJitLink options request
+/// informational output, for example `-verbose` or `-Xptxas=-v`.
+#[derive(Debug)]
+pub struct LinkOutput {
+    /// Complete cubin or PTX bytes returned by nvJitLink.
+    pub image: Vec<u8>,
+    /// Informational messages emitted by nvJitLink and its compiler stages.
+    pub info_log: Option<String>,
+}
+
 /// RAII wrapper around an `nvJitLinkHandle`.
 ///
 /// Typical usage:
@@ -436,6 +465,15 @@ impl<'a> Linker<'a> {
     /// If `CUDA_OXIDE_VERBOSE` is set in the environment, the nvJitLink
     /// info log (timings, sm_XY chosen, etc.) is forwarded to `stderr`.
     pub fn finish(self) -> Result<Vec<u8>, NvJitLinkError> {
+        Ok(self.finish_with_info_log()?.image)
+    }
+
+    /// Drive the link and return the cubin together with the nvJitLink info log.
+    ///
+    /// Unlike [`Self::finish`], this preserves informational compiler output for
+    /// callers that need structured post-link diagnostics. The raw log remains
+    /// best-effort: nvJitLink is allowed to produce no informational messages.
+    pub fn finish_with_info_log(self) -> Result<LinkOutput, NvJitLinkError> {
         let r = unsafe { (self.nvj.complete)(self.handle) };
         check(self.nvj, &self, r, "nvJitLinkComplete")?;
 
@@ -443,19 +481,19 @@ impl<'a> Linker<'a> {
         let r = unsafe { (self.nvj.get_linked_cubin_size)(self.handle, &mut size) };
         check(self.nvj, &self, r, "nvJitLinkGetLinkedCubinSize")?;
 
-        let mut buf = vec![0u8; size];
+        let mut image = vec![0u8; size];
         let r =
-            unsafe { (self.nvj.get_linked_cubin)(self.handle, buf.as_mut_ptr() as *mut c_void) };
+            unsafe { (self.nvj.get_linked_cubin)(self.handle, image.as_mut_ptr() as *mut c_void) };
         check(self.nvj, &self, r, "nvJitLinkGetLinkedCubin")?;
 
-        // Forward the info log if anyone is listening (helpful with `-verbose`).
-        if let Some(info) = self.try_info_log()
+        let info_log = self.try_info_log();
+        if let Some(info) = info_log.as_deref()
             && std::env::var_os("CUDA_OXIDE_VERBOSE").is_some()
         {
             eprintln!("--- nvJitLink info log ---\n{info}");
         }
 
-        Ok(buf)
+        Ok(LinkOutput { image, info_log })
     }
 
     /// Drive the link and return linked PTX text.
@@ -468,6 +506,11 @@ impl<'a> Linker<'a> {
     /// The PTX functions are optional so older nvJitLink versions can still
     /// produce cubins.
     pub fn finish_ptx(self) -> Result<Vec<u8>, NvJitLinkError> {
+        Ok(self.finish_ptx_with_info_log()?.image)
+    }
+
+    /// Drive the link and return linked PTX together with the nvJitLink info log.
+    pub fn finish_ptx_with_info_log(self) -> Result<LinkOutput, NvJitLinkError> {
         let get_size = self
             .nvj
             .get_linked_ptx_size
@@ -484,17 +527,18 @@ impl<'a> Linker<'a> {
         let r = unsafe { get_size(self.handle, &mut size) };
         check(self.nvj, &self, r, "nvJitLinkGetLinkedPtxSize")?;
 
-        let mut buf = vec![0u8; size];
-        let r = unsafe { get(self.handle, buf.as_mut_ptr() as *mut c_char) };
+        let mut image = vec![0u8; size];
+        let r = unsafe { get(self.handle, image.as_mut_ptr() as *mut c_char) };
         check(self.nvj, &self, r, "nvJitLinkGetLinkedPtx")?;
 
-        if let Some(info) = self.try_info_log()
+        let info_log = self.try_info_log();
+        if let Some(info) = info_log.as_deref()
             && std::env::var_os("CUDA_OXIDE_VERBOSE").is_some()
         {
             eprintln!("--- nvJitLink info log ---\n{info}");
         }
 
-        Ok(buf)
+        Ok(LinkOutput { image, info_log })
     }
 
     /// Best-effort retrieval of the error log.
@@ -532,13 +576,19 @@ impl Drop for Linker<'_> {
 // Helpers
 // ============================================================================
 
-fn normalize_input<'data>(
-    kind: InputType,
-    data: &'data [u8],
-    name: &str,
-) -> Result<Cow<'data, [u8]>, NvJitLinkError> {
-    if kind == InputType::Ptx
-        && let Some(offset) = data.iter().position(|byte| *byte == 0)
+/// Strip PTX's single optional trailing NUL terminator, rejecting any other
+/// NUL byte.
+///
+/// nvJitLink reads PTX as a C string even though `nvJitLinkAddData` receives
+/// an explicit byte count, so a non-trailing NUL would silently truncate the
+/// module. This function is the single owner of that C-string rule: exactly
+/// one trailing NUL is tolerated (and stripped), while a NUL anywhere else,
+/// including a second trailing NUL, is rejected as
+/// [`NvJitLinkError::InteriorNulPtx`]. The returned slice holds the logical
+/// PTX text, the canonical form for hashing or comparing PTX inputs;
+/// [`Linker::add`] re-appends the terminator when it builds the FFI backing.
+pub fn logical_ptx<'data>(data: &'data [u8], name: &str) -> Result<&'data [u8], NvJitLinkError> {
+    if let Some(offset) = data.iter().position(|byte| *byte == 0)
         && offset + 1 != data.len()
     {
         return Err(NvJitLinkError::InteriorNulPtx {
@@ -546,7 +596,20 @@ fn normalize_input<'data>(
             offset,
         });
     }
-    if kind != InputType::Ptx || data.last() == Some(&0) {
+    Ok(data.strip_suffix(&[0]).unwrap_or(data))
+}
+
+fn normalize_input<'data>(
+    kind: InputType,
+    data: &'data [u8],
+    name: &str,
+) -> Result<Cow<'data, [u8]>, NvJitLinkError> {
+    if kind != InputType::Ptx {
+        return Ok(Cow::Borrowed(data));
+    }
+    let logical = logical_ptx(data, name)?;
+    if logical.len() != data.len() {
+        // Exactly one trailing NUL is already present; pass through as-is.
         return Ok(Cow::Borrowed(data));
     }
 
@@ -1139,6 +1202,24 @@ mod tests {
     }
 
     #[test]
+    fn unrecognized_option_is_detected_only_for_its_result_code() {
+        let unrecognized = NvJitLinkError::Call {
+            operation: "nvJitLinkCreate",
+            code: NvJitLinkResult::UNRECOGNIZED_OPTION.0,
+            log: None,
+        };
+        assert!(unrecognized.is_unrecognized_option());
+
+        let other_call = NvJitLinkError::Call {
+            operation: "nvJitLinkComplete",
+            code: 6,
+            log: None,
+        };
+        assert!(!other_call.is_unrecognized_option());
+        assert!(!NvJitLinkError::PtxOutputUnavailable.is_unrecognized_option());
+    }
+
+    #[test]
     fn ptx_input_has_exactly_one_terminal_nul_in_ffi_backing() {
         let poisoned_storage = b".version 7.1\nX";
         let ptx = &poisoned_storage[..poisoned_storage.len() - 1];
@@ -1157,6 +1238,32 @@ mod tests {
         let already_terminated = normalize_input(InputType::Ptx, b"ptx\0", "kernel.ptx").unwrap();
         assert!(matches!(&already_terminated, Cow::Borrowed(_)));
         assert_eq!(already_terminated.as_ref(), b"ptx\0");
+    }
+
+    #[test]
+    fn logical_ptx_strips_exactly_one_trailing_terminator() {
+        assert_eq!(logical_ptx(b"ptx", "kernel.ptx").unwrap(), b"ptx");
+        assert_eq!(logical_ptx(b"ptx\0", "kernel.ptx").unwrap(), b"ptx");
+        assert_eq!(logical_ptx(b"", "empty.ptx").unwrap(), b"");
+        assert_eq!(logical_ptx(b"\0", "empty.ptx").unwrap(), b"");
+    }
+
+    #[test]
+    fn logical_ptx_rejects_every_non_trailing_nul() {
+        for (ptx, expected_offset) in [
+            (&b"ptx\0ignored"[..], 3),
+            (&b"ptx\0\0"[..], 3),
+            (&b"\0ptx"[..], 0),
+        ] {
+            let error = logical_ptx(ptx, "kernel.ptx").unwrap_err();
+            assert!(matches!(
+                error,
+                NvJitLinkError::InteriorNulPtx {
+                    ref name,
+                    offset
+                } if name == "kernel.ptx" && offset == expected_offset
+            ));
+        }
     }
 
     #[test]
@@ -1197,6 +1304,20 @@ mod tests {
         let prepared = normalize_input(InputType::Any, auto_detected, "auto").unwrap();
         assert!(matches!(&prepared, Cow::Borrowed(_)));
         assert_eq!(prepared.as_ref(), auto_detected);
+    }
+
+    #[test]
+    #[ignore = "requires an installed CUDA Toolkit with nvJitLink"]
+    fn installed_toolkit_rejects_unknown_options_with_unrecognized_option() {
+        let library = LibNvJitLink::load().expect("load nvJitLink");
+        let Err(error) = Linker::new(&library, &["-arch=sm_86", "-cuda-oxide-unknown-option"])
+        else {
+            panic!("nvJitLink accepts only documented options");
+        };
+        assert!(
+            error.is_unrecognized_option(),
+            "expected NVJITLINK_ERROR_UNRECOGNIZED_OPTION, got: {error}"
+        );
     }
 
     #[test]

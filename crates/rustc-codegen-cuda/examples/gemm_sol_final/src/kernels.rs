@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Size-specialized device kernels for the canonical gemm_sol_final example.
 // include!d into main.rs so the #[cuda_module] macro sees an inline module
 // (it rejects file modules). Host validation and benchmarking remain in main.rs.

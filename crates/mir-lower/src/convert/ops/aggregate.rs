@@ -40,11 +40,12 @@ use crate::convert::enum_payload_storage::{coerce_enum_payload_value, enum_paylo
 use crate::convert::types::{
     EnumSlotMap, StructLayoutInfo, StructSlotMap, build_enum_slot_map, build_struct_slot_map,
     build_union_storage_type, convert_type, is_zero_sized_type, llvm_byte_faithful_twin,
-    llvm_type_contains_i1, make_slice_struct, mir_type_abi_align,
+    llvm_type_contains_i1, llvm_type_size_align, make_slice_struct, mir_element_stride,
+    mir_type_abi_align,
 };
 use dialect_mir::ops::{
-    MirConstructEnumOp, MirEnumPayloadOp, MirExtractFieldOp, MirFieldAddrOp, MirInsertFieldOp,
-    MirSetDiscriminantOp,
+    MirConstantOp, MirConstructEnumOp, MirEnumPayloadOp, MirExtractFieldOp, MirFieldAddrOp,
+    MirInsertFieldOp, MirSetDiscriminantOp,
 };
 use dialect_mir::types::{
     EnumCarrierKind, EnumLayoutKind, MirArrayType, MirDisjointSliceType, MirEnumType, MirPtrType,
@@ -450,6 +451,21 @@ pub(crate) fn convert_construct_struct(
 
     let map = build_struct_slot_map(ctx, &layout).map_err(anyhow_to_pliron)?;
 
+    // An SSA value of the natural LLVM struct type places fields at natural
+    // offsets, but field addresses for this struct use rustc's tighter
+    // (repr(packed)) offsets. Mixing the two silently reads and writes the
+    // wrong bytes, so refuse the by-value form instead. By-value packed
+    // aggregates need packed LLVM struct types (a pliron-llvm addition)
+    // before this can be lowered faithfully.
+    if map.layout_diverges {
+        return pliron::input_err_noloc!(
+            "constructing a struct whose rustc layout diverges from the natural \
+             LLVM layout (repr(packed)) by value is not supported; keep the value \
+             behind a pointer and access fields with addr_of! plus \
+             read_unaligned/write_unaligned"
+        );
+    }
+
     let undef_op = llvm::UndefOp::new(ctx, map.llvm_struct_ty);
     rewriter.insert_operation(ctx, undef_op.get_operation());
     let mut current_struct = undef_op.get_operation().deref(ctx).get_result(0);
@@ -580,6 +596,69 @@ pub(crate) fn convert_construct_slice(
     rewriter.insert_operation(ctx, insert_len.get_operation());
 
     rewriter.replace_operation(ctx, op, insert_len.get_operation());
+
+    Ok(())
+}
+
+/// Convert `mir.construct_disjoint_slice` to a chain of `llvm.insertvalue`
+/// operations.
+///
+/// The same shape as [`convert_construct_slice`], one insert longer per
+/// runtime layout word the index space carries. The struct type comes from
+/// [`make_disjoint_slice_struct`], the same constructor the type converter
+/// uses, so the field order here cannot drift from the lowered layout that
+/// [`resolve_aggregate_slots`] indexes identically.
+pub(crate) fn convert_construct_disjoint_slice(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let (result_ty, operands) = {
+        let mir_op = op.deref(ctx);
+        let operands: Vec<_> = mir_op.operands().collect();
+        (mir_op.get_result(0).get_type(ctx), operands)
+    };
+
+    let space_tys = {
+        let ty_ref = result_ty.deref(ctx);
+        match ty_ref.downcast_ref::<MirDisjointSliceType>() {
+            Some(slice_ty) => slice_ty.space_types().to_vec(),
+            None => {
+                return pliron::input_err_noloc!(
+                    "MirConstructDisjointSliceOp result type must be MirDisjointSliceType"
+                );
+            }
+        }
+    };
+
+    // The verifier already pins the operand count to the result type. Check
+    // it here too: this pass runs on operations the verifier accepted, and a
+    // short operand list would otherwise index past the end below.
+    let expected_operands = 2 + space_tys.len();
+    if operands.len() != expected_operands {
+        return pliron::input_err_noloc!(
+            "MirConstructDisjointSliceOp expects {expected_operands} operands, got {}",
+            operands.len()
+        );
+    }
+
+    let slice_struct_ty = crate::convert::types::make_disjoint_slice_struct(ctx, &space_tys)
+        .map_err(anyhow_to_pliron)?;
+
+    let undef_op = llvm::UndefOp::new(ctx, slice_struct_ty);
+    rewriter.insert_operation(ctx, undef_op.get_operation());
+    let mut current = undef_op.get_operation().deref(ctx).get_result(0);
+    let mut last_insert = undef_op.get_operation();
+
+    for (slot, operand) in operands.into_iter().enumerate() {
+        let insert = llvm::InsertValueOp::new(ctx, current, operand, vec![slot as u32]);
+        rewriter.insert_operation(ctx, insert.get_operation());
+        current = insert.get_operation().deref(ctx).get_result(0);
+        last_insert = insert.get_operation();
+    }
+
+    rewriter.replace_operation(ctx, op, last_insert);
 
     Ok(())
 }
@@ -834,9 +913,12 @@ fn spill_enum_value(
     slot_ptr
 }
 
-/// Pointer to `base + offset` bytes, for reaching a payload field inside
-/// a spilled enum (`getelementptr i8, ptr base, offset`).
-fn enum_byte_gep(
+/// Pointer to `base + offset` bytes (`getelementptr i8, ptr base, offset`).
+///
+/// Used whenever rustc's physical byte offset cannot be represented faithfully
+/// by a typed LLVM aggregate GEP, as with overlapping enum payloads or packed
+/// struct fields.
+fn byte_offset_gep(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     base: Value,
@@ -1158,7 +1240,7 @@ pub(crate) fn convert_construct_enum(
     let abi_align = enum_ty.abi_align();
     let slot_ptr = spill_enum_value(ctx, rewriter, current_struct, llvm_struct_ty, abi_align);
     for (flat, operand) in deferred {
-        let field_ptr = enum_byte_gep(ctx, rewriter, slot_ptr, slot_map.field_offsets[flat]);
+        let field_ptr = byte_offset_gep(ctx, rewriter, slot_ptr, slot_map.field_offsets[flat]);
         // `bool` is an LLVM i1 as a value but occupies one full byte in
         // Rust memory. Enum storage claims the byte-faithful twin of every
         // bool-bearing payload (scalar i8 byte, or an aggregate with each
@@ -1264,7 +1346,7 @@ pub(crate) fn convert_set_discriminant(
         pliron::input_error_noloc!("MirSetDiscriminantOp physical write has no carrier type")
     })?;
     let carrier = emit_carrier_constant(ctx, rewriter, &enum_ty, carrier_ty, bits)?;
-    let carrier_ptr = enum_byte_gep(ctx, rewriter, enum_ptr, tag_offset);
+    let carrier_ptr = byte_offset_gep(ctx, rewriter, enum_ptr, tag_offset);
     let store_op = llvm::StoreOp::new(ctx, carrier, carrier_ptr);
     rewriter.insert_operation(ctx, store_op.get_operation());
 
@@ -1508,7 +1590,7 @@ pub(crate) fn convert_enum_payload(
         None => {
             let slot_ptr =
                 spill_enum_value(ctx, rewriter, enum_val, slot_map.llvm_struct_ty, abi_align);
-            let field_ptr = enum_byte_gep(ctx, rewriter, slot_ptr, slot_map.field_offsets[flat]);
+            let field_ptr = byte_offset_gep(ctx, rewriter, slot_ptr, slot_map.field_offsets[flat]);
             let semantic_ty = slot_map.field_llvm_types[flat];
             let storage_ty =
                 enum_payload_storage_type(ctx, semantic_ty).map_err(anyhow_to_pliron)?;
@@ -1633,7 +1715,7 @@ pub(crate) fn convert_field_addr(
         let storage_ty = enum_payload_storage_type(ctx, semantic_ty).map_err(anyhow_to_pliron)?;
         if storage_ty != semantic_ty {
             return pliron::input_err_noloc!(
-                "field_addr: cannot hand out the in-place address of payload field {} of enum `{}`: its bytes use canonical storage type {} while its semantic type is {}, and loads or stores made through an escaped payload address are typed with the semantic type, which the canonical bytes cannot honor; shared reads of such payloads are compiled through a value copy automatically, and in-place mutation of bool or shared-pointer enum payloads is not supported",
+                "field_addr: cannot hand out the in-place address of payload field {} of enum `{}`: its bytes use canonical storage type {} while its semantic type is {}, and loads or stores made through an escaped payload address are typed with the semantic type, which the canonical bytes cannot honor; shared reads of such payloads are compiled through a value copy automatically, and a write that stays inside its function is compiled by rebuilding the enum around the new payload; a borrow that escapes into a call keeps no such rewrite and is refused here",
                 field_index,
                 enum_name,
                 storage_ty.deref(ctx).disp(ctx),
@@ -1679,16 +1761,22 @@ pub(crate) fn convert_field_addr(
         return Ok(());
     }
 
+    // Carried alongside the layout so the field address can record what it
+    // proves about its own alignment; see `stamp_field_address_alignment`.
+    let aggregate_abi_align;
     let layout = {
         let pointee_ref = mir_ptr_pointee.deref(ctx);
-        match pointee_ref.downcast_ref::<MirStructType>() {
-            Some(struct_ty) => StructLayoutInfo::of_struct(struct_ty),
-            None => {
-                return pliron::input_err_noloc!(
-                    "MirFieldAddrOp pointer must point to a struct, union or enum type, got {}",
-                    mir_ptr_pointee.deref(ctx).disp(ctx)
-                );
-            }
+        if let Some(struct_ty) = pointee_ref.downcast_ref::<MirStructType>() {
+            aggregate_abi_align = struct_ty.abi_align;
+            StructLayoutInfo::of_struct(struct_ty)
+        } else if let Some(tuple_ty) = pointee_ref.downcast_ref::<MirTupleType>() {
+            aggregate_abi_align = tuple_ty.abi_align();
+            StructLayoutInfo::of_tuple(tuple_ty)
+        } else {
+            return pliron::input_err_noloc!(
+                "MirFieldAddrOp pointer must point to a struct, tuple, union or enum type, got {}",
+                mir_ptr_pointee.deref(ctx).disp(ctx)
+            );
         }
     };
 
@@ -1725,14 +1813,102 @@ pub(crate) fn convert_field_addr(
         }
     };
 
+    let rustc_offset = layout.field_offsets.get(field_index).copied();
+
+    // A typed LLVM struct GEP is sound only when LLVM places the selected slot
+    // at the same byte offset rustc recorded. `build_struct_slot_map` inserts
+    // explicit gaps, but its final LLVM struct is naturally aligned, so LLVM
+    // can still insert implicit padding before an under-aligned field. Packed
+    // layouts are the canonical example. Address such fields from the original
+    // aggregate pointer in byte units instead.
+    if let Some(expected_offset) = rustc_offset {
+        let actual_offset = map
+            .natural_slot_offsets
+            .as_ref()
+            .and_then(|offsets| offsets.get(slot as usize).copied())
+            .ok_or_else(|| {
+                pliron::input_error_noloc!(
+                    "field_addr: cannot determine LLVM byte offset of slot {} for field {}",
+                    slot,
+                    field_index
+                )
+            })?;
+        if actual_offset != expected_offset {
+            let field_ptr = byte_offset_gep(ctx, rewriter, ptr_operand, expected_offset);
+            let gep = field_ptr
+                .defining_op()
+                .expect("byte_offset_gep always returns a GEP result");
+            stamp_field_address_alignment(ctx, gep, aggregate_abi_align, Some(expected_offset));
+            rewriter.replace_operation(ctx, op, gep);
+            return Ok(());
+        }
+    }
+
     use llvm_export::ops::GepIndex;
     let gep_indices = vec![GepIndex::Constant(0), GepIndex::Constant(slot)];
 
     let gep_op = llvm::GetElementPtrOp::new(ctx, ptr_operand, gep_indices, map.llvm_struct_ty);
     rewriter.insert_operation(ctx, gep_op.get_operation());
+    stamp_field_address_alignment(
+        ctx,
+        gep_op.get_operation(),
+        aggregate_abi_align,
+        rustc_offset,
+    );
     rewriter.replace_operation(ctx, op, gep_op.get_operation());
 
     Ok(())
+}
+
+/// Record on a field address what its alignment provably is.
+///
+/// A load reads its alignment from its own result type, and a scalar records
+/// none -- so `p.x` on an `#[repr(C, align(8))]` struct would export with LLVM's
+/// default `align 4`, dropping the guarantee rustc gave the aggregate. That is
+/// what stops LoadStoreVectorizer from fusing two adjacent field reads into one
+/// wide access; a whole-element copy of the same struct already vectorizes,
+/// because there the load's result type *is* the aggregate.
+///
+/// The aggregate is aligned to `abi_align`, so its field at byte `offset` is
+/// aligned to `gcd(abi_align, offset)`, and to `abi_align` itself at offset
+/// zero. Both numbers are rustc's own layout, so this claims nothing the source
+/// did not already guarantee.
+///
+/// Stamps nothing when the aggregate records no alignment (`abi_align == 0`,
+/// which also stands for "layout unknown") or the field has no recorded offset.
+/// A wrong alignment here is a miscompile, so every uncertain case declines and
+/// leaves the previous, weaker-but-sound behaviour.
+fn stamp_field_address_alignment(
+    ctx: &mut Context,
+    gep: Ptr<Operation>,
+    abi_align: u64,
+    field_offset: Option<u64>,
+) {
+    const fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+
+    if abi_align == 0 {
+        return;
+    }
+    let Some(offset) = field_offset else {
+        return;
+    };
+    let provable = if offset == 0 {
+        abi_align
+    } else {
+        gcd(abi_align, offset)
+    };
+    // Every rustc layout has a power-of-two `abi_align`, but dialect-mir only
+    // verifier-enforces that for unions and enums; a malformed hand-built
+    // struct or tuple layout could reach here with e.g. 12, and a
+    // non-power-of-two `align N` is invalid LLVM IR that llc rejects.
+    if !provable.is_power_of_two() {
+        return;
+    }
+    if let Ok(align) = u32::try_from(provable) {
+        llvm_export::ops::set_address_alignment(ctx, gep, align);
+    }
 }
 
 // ============================================================================
@@ -1774,14 +1950,139 @@ pub(crate) fn convert_array_element_addr(
 
     let llvm_array_ty = convert_type(ctx, pointee_ty).map_err(anyhow_to_pliron)?;
 
+    // The typed GEP below strides by the natural size of the converted
+    // element type. rustc strides by the element's stored size, and the two
+    // differ for repr(packed) elements (a 5-byte packed struct converts to a
+    // natural 8-byte LLVM struct), so every element past index 0 would be
+    // addressed at the wrong byte. Refuse rather than miscompile; rustc-
+    // stride byte addressing is the follow-up, alongside by-value packed
+    // support.
+    {
+        let element_ty = {
+            let pointee_ref = pointee_ty.deref(ctx);
+            pointee_ref
+                .downcast_ref::<MirArrayType>()
+                .expect("checked to be an array above")
+                .element_type()
+        };
+        let rustc_stride = mir_element_stride(ctx, element_ty);
+        let llvm_element_ty = convert_type(ctx, element_ty).map_err(anyhow_to_pliron)?;
+        let natural_size = llvm_type_size_align(ctx, llvm_element_ty).map(|(size, _)| size);
+        if let (Some(stride), Some(natural)) = (rustc_stride, natural_size)
+            && stride != natural
+        {
+            return pliron::input_err_noloc!(
+                "addressing elements of an array whose element layout diverges from \
+                 the natural LLVM layout (repr(packed)) is not supported: rustc \
+                 strides by {} bytes but the LLVM element type occupies {}",
+                stride,
+                natural
+            );
+        }
+    }
+
     use llvm_export::ops::GepIndex;
     let gep_indices = vec![GepIndex::Constant(0), GepIndex::Value(index)];
 
+    let element_align = element_address_provable_alignment(ctx, arr_ptr, pointee_ty, index);
+
     let gep_op = llvm::GetElementPtrOp::new(ctx, arr_ptr, gep_indices, llvm_array_ty);
     rewriter.insert_operation(ctx, gep_op.get_operation());
+    if let Some(align) = element_align {
+        llvm_export::ops::set_address_alignment(ctx, gep_op.get_operation(), align);
+    }
     rewriter.replace_operation(ctx, op, gep_op.get_operation());
 
     Ok(())
+}
+
+/// Alignment an array-element address provably has, in bytes.
+///
+/// The field path records this already ([`stamp_field_address_alignment`]), but
+/// an element address recorded nothing, so `lanes[0] + lanes[1]` on an
+/// `#[repr(C, align(8))]` `[f32; 2]` still exported two `align 4` loads and
+/// LoadStoreVectorizer refused to fuse them. Reading the same element into a
+/// local first happens to work, because SROA then loads the whole aggregate and
+/// the alignment comes from its type — so the cost depended on whether the
+/// source copied the element or read through it.
+///
+/// Two facts combine. The array's own alignment is `abi_align`, and whatever the
+/// *base pointer* already proved is stronger when the array is itself a field of
+/// an over-aligned aggregate: `&table[i].lanes` carries the outer struct's
+/// alignment, which the array type alone does not know. Element `i` then sits at
+/// byte `i * stride`, so it is aligned to `gcd(base, i * stride)` — and to `base`
+/// itself at index zero. A runtime index can land on any element, so it gets
+/// `gcd(base, stride)`, which every element satisfies.
+///
+/// Answers `None` — leaving the previous behaviour — when neither the base nor
+/// the array type records an alignment, or the stride is unknown. As on the
+/// field path, a wrong answer here is a miscompile, so every uncertain case
+/// declines rather than guesses. That is why the stride comes from
+/// [`mir_element_stride`], which is exact or `None`: an LLVM-level size
+/// approximation would guess 8 for a MIR aggregate element it does not
+/// model, and e.g. `[[f32; 3]; 4]` under an align-8 base would then claim
+/// align 8 on element addresses that are only 4-aligned.
+fn element_address_provable_alignment(
+    ctx: &Context,
+    arr_ptr: Value,
+    array_ty: TypeHandle,
+    index: Value,
+) -> Option<u32> {
+    const fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+
+    // What the base address already proved, else what the array type states.
+    let base_align = arr_ptr
+        .defining_op()
+        .and_then(|def| llvm_export::ops::address_alignment(ctx, def))
+        .map(u64::from)
+        .or_else(|| mir_type_abi_align(ctx, array_ty))?;
+    if base_align == 0 {
+        return None;
+    }
+
+    let element_ty = {
+        let array_ref = array_ty.deref(ctx);
+        array_ref.downcast_ref::<MirArrayType>()?.element_type()
+    };
+    let stride = mir_element_stride(ctx, element_ty)?;
+    if stride == 0 {
+        return None;
+    }
+
+    let provable = match constant_index_value(ctx, index) {
+        Some(0) => base_align,
+        Some(i) => gcd(base_align, i.checked_mul(stride)?),
+        // Any element is reachable, so claim only what every stride preserves.
+        None => gcd(base_align, stride),
+    };
+
+    // Same guard as the field path: dialect-mir does not verifier-enforce a
+    // power-of-two `abi_align` for every aggregate, and a non-power-of-two
+    // `align N` is invalid LLVM IR that llc rejects.
+    if !provable.is_power_of_two() {
+        return None;
+    }
+    u32::try_from(provable).ok()
+}
+
+/// The constant an index operand holds, if it is one.
+///
+/// `APInt::to_u64` truncates wider values, so a >64-bit constant could be
+/// misread as a small offset multiplier. Fail closed on such widths, as
+/// `integer_constant_u64` in the extract-element fast path does.
+fn constant_index_value(ctx: &Context, index: Value) -> Option<u64> {
+    let defining_op = index.defining_op()?;
+    if let Some(constant) = Operation::get_op::<MirConstantOp>(defining_op, ctx) {
+        let value = constant.get_attr_value(ctx)?.value();
+        return (value.bw() <= 64).then(|| value.to_u64());
+    }
+    let constant = Operation::get_op::<llvm::ConstantOp>(defining_op, ctx)?;
+    let attribute = constant.get_value(ctx);
+    let integer = attribute.downcast_ref::<pliron::builtin::attributes::IntegerAttr>()?;
+    let value = integer.value();
+    (value.bw() <= 64).then(|| value.to_u64())
 }
 
 #[cfg(test)]
@@ -1791,7 +2092,8 @@ mod tests {
     use dialect_mir::attributes::{FieldIndexAttr, MirCastKindAttr, VariantIndexAttr};
     use dialect_mir::ops as mir;
     use dialect_mir::types::{
-        EnumEncoding, EnumVariant, MirPtrType, MirSliceType, MirStructType, MirTupleType,
+        EnumEncoding, EnumVariant, MirArrayType, MirPtrType, MirSliceType, MirStructType,
+        MirTupleType,
     };
     use llvm_export::types as llvm_types;
     use pliron::builtin::attributes::IntegerAttr;
@@ -1839,6 +2141,49 @@ mod tests {
         );
         op.insert_at_back(block, ctx);
         op.deref(ctx).get_result(0)
+    }
+
+    fn byte_gep_constant_offset(ctx: &Context, gep: &llvm::GetElementPtrOp) -> Option<u64> {
+        use llvm_export::ops::GepIndex;
+
+        let indices = gep.indices(ctx);
+        let [GepIndex::Value(offset)] = indices.as_slice() else {
+            return None;
+        };
+        let defining_op = offset.defining_op()?;
+        let constant = Operation::get_op::<llvm::ConstantOp>(defining_op, ctx)?;
+        let attribute = constant.get_value(ctx);
+        attribute
+            .downcast_ref::<IntegerAttr>()
+            .map(|integer| integer.value().to_u64())
+    }
+
+    fn assert_byte_addressed_field(
+        ctx: &Context,
+        module: Ptr<Operation>,
+        expected_offset: u64,
+        expected_alignment: u32,
+    ) {
+        let body = kernel_blocks(ctx, module);
+        let geps = find_all::<llvm::GetElementPtrOp>(ctx, &body);
+        assert_eq!(geps.len(), 1, "one field_addr must lower to one GEP");
+
+        let gep = &geps[0];
+        assert_eq!(
+            gep.src_elem_type(ctx),
+            IntegerType::get(ctx, 8, Signedness::Signless).into(),
+            "a layout-mismatched field must be addressed in byte units"
+        );
+        assert_eq!(
+            byte_gep_constant_offset(ctx, gep),
+            Some(expected_offset),
+            "the byte GEP must use rustc's exact field offset"
+        );
+        assert_eq!(
+            llvm_export::ops::address_alignment(ctx, gep.get_operation()),
+            Some(expected_alignment),
+            "the byte GEP must retain the alignment proved by rustc's aggregate layout"
+        );
     }
 
     /// `mir.construct_slice` lowers to the canonical fat-pointer value:
@@ -1902,6 +2247,109 @@ mod tests {
             count_ops::<llvm::UndefOp>(&ctx, &body),
             1,
             "slice construction should start from one undef aggregate"
+        );
+    }
+
+    /// `mir.construct_disjoint_slice` lowers to the same insert chain as the
+    /// fat pointer for an index space with no runtime layout.
+    #[test]
+    fn construct_disjoint_slice_lowers_to_ptr_len_insert_values() {
+        let mut ctx = make_ctx();
+
+        let f32_ty: TypeHandle = pliron::builtin::types::FP32Type::get(&ctx).into();
+        let usize_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, f32_ty, true).into();
+        let slice_ty: TypeHandle = MirDisjointSliceType::get(&mut ctx, f32_ty).into();
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![ptr_ty, usize_ty], vec![]);
+        let data_ptr = block.deref(&ctx).get_argument(0);
+        let len = block.deref(&ctx).get_argument(1);
+
+        let op = Operation::new(
+            &mut ctx,
+            mir::MirConstructDisjointSliceOp::get_concrete_op_info(),
+            vec![slice_ty],
+            vec![data_ptr, len],
+            vec![],
+            0,
+        );
+        op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let inserts = find_all::<llvm::InsertValueOp>(&ctx, &body);
+        assert_eq!(
+            insert_indices(&ctx, &inserts),
+            vec![vec![0], vec![1]],
+            "a space-free disjoint slice must insert pointer at slot 0 and length at slot 1"
+        );
+        assert_eq!(
+            inserts[0].get_operation().deref(&ctx).get_operand(1),
+            data_ptr,
+            "slot 0 must receive the original data pointer"
+        );
+        assert_eq!(
+            inserts[1].get_operation().deref(&ctx).get_operand(1),
+            len,
+            "slot 1 must receive the original length"
+        );
+        assert_eq!(
+            count_ops::<llvm::UndefOp>(&ctx, &body),
+            1,
+            "construction should start from one undef aggregate"
+        );
+    }
+
+    /// The runtime row width is the third operand and must land in slot 2.
+    /// Writing it into the length slot, or dropping it, gives a slice whose
+    /// row width reads back as something else at every access site.
+    #[test]
+    fn construct_disjoint_slice_places_the_row_width_after_ptr_and_len() {
+        let mut ctx = make_ctx();
+
+        let f32_ty: TypeHandle = pliron::builtin::types::FP32Type::get(&ctx).into();
+        let usize_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let width_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, f32_ty, true).into();
+        let slice_ty: TypeHandle =
+            MirDisjointSliceType::get_with_space(&mut ctx, f32_ty, vec![width_ty]).into();
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![ptr_ty, usize_ty, width_ty], vec![]);
+        let data_ptr = block.deref(&ctx).get_argument(0);
+        let len = block.deref(&ctx).get_argument(1);
+        let width = block.deref(&ctx).get_argument(2);
+
+        let op = Operation::new(
+            &mut ctx,
+            mir::MirConstructDisjointSliceOp::get_concrete_op_info(),
+            vec![slice_ty],
+            vec![data_ptr, len, width],
+            vec![],
+            0,
+        );
+        op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let inserts = find_all::<llvm::InsertValueOp>(&ctx, &body);
+        assert_eq!(
+            insert_indices(&ctx, &inserts),
+            vec![vec![0], vec![1], vec![2]],
+            "the row width must occupy slot 2, after the pointer and the length"
+        );
+        assert_eq!(
+            inserts[2].get_operation().deref(&ctx).get_operand(1),
+            width,
+            "slot 2 must receive the row width operand, not the length"
+        );
+        assert_eq!(
+            inserts[1].get_operation().deref(&ctx).get_operand(1),
+            len,
+            "slot 1 must still receive the length"
         );
     }
 
@@ -2151,6 +2599,329 @@ mod tests {
         );
     }
 
+    /// `mir.field_addr` on a TUPLE pointee (the `#693` shape: `let (a, b) =
+    /// TABLE[i];`) must resolve the GEP index through the tuple's memory-order
+    /// layout, exactly like the struct path above, not through the
+    /// declaration index directly.
+    ///
+    /// `(u8, u32)` is rustc's own layout for this pair: the `u32` field is
+    /// placed FIRST in memory for alignment, so declaration field 0 (`u8`,
+    /// `.0`) lives at memory slot 1 and declaration field 1 (`u32`, `.1`)
+    /// lives at memory slot 0. A GEP index equal to the declaration index
+    /// would silently address the WRONG field's bytes.
+    #[test]
+    fn field_addr_tuple_pointee_resolves_memory_order_gep_index() {
+        use llvm_export::ops::GepIndex;
+
+        let mut ctx = make_ctx();
+
+        let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+
+        // decl order [u8, u32]; memory order [u32, u8] (mem_to_decl = [1, 0]).
+        let tuple_ty: TypeHandle = MirTupleType::get_with_layout(
+            &mut ctx,
+            vec![u8_ty, u32_ty],
+            vec![1, 0],
+            vec![4, 0],
+            8,
+            4,
+        )
+        .into();
+
+        let tuple_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, tuple_ty, false).into();
+        let u8_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let u32_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, u32_ty, false).into();
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![tuple_ptr_ty], vec![]);
+        let base = block.deref(&ctx).get_argument(0);
+
+        // Declaration field 0 (`.0`, u8) first, then declaration field 1
+        // (`.1`, u32) -- source order, not memory order.
+        for (field_index, result_ty) in [(0u32, u8_ptr_ty), (1, u32_ptr_ty)] {
+            let op = Operation::new(
+                &mut ctx,
+                MirFieldAddrOp::get_concrete_op_info(),
+                vec![result_ty],
+                vec![base],
+                vec![],
+                0,
+            );
+            MirFieldAddrOp::new(op).set_attr_field_index(&ctx, FieldIndexAttr(field_index));
+            op.insert_at_back(block, &ctx);
+        }
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let geps = find_all::<llvm::GetElementPtrOp>(&ctx, &body);
+        assert_eq!(geps.len(), 2, "each field_addr must lower to its own GEP");
+        assert!(
+            geps.iter().all(|gep| gep.verify(&ctx).is_ok()),
+            "every field-address GEP must satisfy LLVM dialect verification"
+        );
+
+        // `.0` (u8, declared first) must land at MEMORY slot 1.
+        let field0_geps: Vec<_> = geps
+            .iter()
+            .filter(|gep| {
+                matches!(
+                    gep.indices(&ctx).as_slice(),
+                    [GepIndex::Constant(0), GepIndex::Constant(1)]
+                )
+            })
+            .collect();
+        assert_eq!(
+            field0_geps.len(),
+            1,
+            "declaration field 0 (u8) must resolve to its memory slot 1, not slot 0"
+        );
+
+        // `.1` (u32, declared second) must land at MEMORY slot 0.
+        let field1_geps: Vec<_> = geps
+            .iter()
+            .filter(|gep| {
+                matches!(
+                    gep.indices(&ctx).as_slice(),
+                    [GepIndex::Constant(0), GepIndex::Constant(0)]
+                )
+            })
+            .collect();
+        assert_eq!(
+            field1_geps.len(),
+            1,
+            "declaration field 1 (u32) must resolve to its memory slot 0, not slot 1"
+        );
+    }
+
+    /// A `#[repr(C, packed)]`-style layout can place a naturally aligned
+    /// scalar at an offset LLVM's ordinary struct layout cannot express. The
+    /// field address must therefore use rustc's byte offset rather than a
+    /// typed struct GEP that would silently land at byte 4.
+    #[test]
+    fn packed_field_addr_uses_rustc_byte_offset_and_alignment_one() {
+        let mut ctx = make_ctx();
+
+        let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let packed_ty: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Packed".into(),
+            vec!["tag".into(), "value".into()],
+            vec![u8_ty, u32_ty],
+            vec![0, 1],
+            vec![0, 1],
+            5,
+            1,
+        )
+        .into();
+
+        let base_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, packed_ty, false).into();
+        let field_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, u32_ty, false).into();
+        let (module, block) = build_kernel(&mut ctx, vec![base_ptr_ty], vec![]);
+        let base = block.deref(&ctx).get_argument(0);
+
+        let field_addr = Operation::new(
+            &mut ctx,
+            MirFieldAddrOp::get_concrete_op_info(),
+            vec![field_ptr_ty],
+            vec![base],
+            vec![],
+            0,
+        );
+        MirFieldAddrOp::new(field_addr).set_attr_field_index(&ctx, FieldIndexAttr(1));
+        field_addr.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module).expect("lowering failed");
+        assert_byte_addressed_field(&ctx, module, 1, 1);
+    }
+
+    /// `repr(packed(2))` is not equivalent to byte alignment: the same u32
+    /// field is allowed to sit at byte 2 and the address still proves align 2.
+    #[test]
+    fn packed_two_field_addr_uses_rustc_byte_offset_and_alignment_two() {
+        let mut ctx = make_ctx();
+
+        let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let packed_ty: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Packed2".into(),
+            vec!["tag".into(), "value".into()],
+            vec![u8_ty, u32_ty],
+            vec![0, 1],
+            vec![0, 2],
+            6,
+            2,
+        )
+        .into();
+
+        let base_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, packed_ty, false).into();
+        let field_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, u32_ty, false).into();
+        let (module, block) = build_kernel(&mut ctx, vec![base_ptr_ty], vec![]);
+        let base = block.deref(&ctx).get_argument(0);
+
+        let field_addr = Operation::new(
+            &mut ctx,
+            MirFieldAddrOp::get_concrete_op_info(),
+            vec![field_ptr_ty],
+            vec![base],
+            vec![],
+            0,
+        );
+        MirFieldAddrOp::new(field_addr).set_attr_field_index(&ctx, FieldIndexAttr(1));
+        field_addr.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module).expect("lowering failed");
+        assert_byte_addressed_field(&ctx, module, 2, 2);
+    }
+
+    /// The decision must compare physical offsets, not merely the selected
+    /// field's own alignment. In `{ u8, u32, u8 }` the final u8 is naturally
+    /// byte-aligned, but LLVM has already shifted it because the packed u32
+    /// before it was placed at byte 4 instead of byte 1.
+    #[test]
+    fn packed_trailing_byte_field_uses_accumulated_rustc_offset() {
+        let mut ctx = make_ctx();
+
+        let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let packed_ty: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedTrailing".into(),
+            vec!["head".into(), "value".into(), "tail".into()],
+            vec![u8_ty, u32_ty, u8_ty],
+            vec![0, 1, 2],
+            vec![0, 1, 5],
+            6,
+            1,
+        )
+        .into();
+
+        let base_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, packed_ty, false).into();
+        let field_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let (module, block) = build_kernel(&mut ctx, vec![base_ptr_ty], vec![]);
+        let base = block.deref(&ctx).get_argument(0);
+
+        let field_addr = Operation::new(
+            &mut ctx,
+            MirFieldAddrOp::get_concrete_op_info(),
+            vec![field_ptr_ty],
+            vec![base],
+            vec![],
+            0,
+        );
+        MirFieldAddrOp::new(field_addr).set_attr_field_index(&ctx, FieldIndexAttr(2));
+        field_addr.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module).expect("lowering failed");
+        assert_byte_addressed_field(&ctx, module, 5, 1);
+    }
+
+    /// A by-value packed struct cannot be an SSA value of the natural LLVM
+    /// struct type: construction would place `value` at natural byte 4 while
+    /// every field address for the same struct uses rustc's byte 1, and the
+    /// mix silently reads and writes the wrong bytes. Construction fails
+    /// closed instead.
+    #[test]
+    fn packed_struct_construction_by_value_fails_closed() {
+        use dialect_mir::ops::MirConstructStructOp;
+
+        let mut ctx = make_ctx();
+
+        let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let packed_ty: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Packed".into(),
+            vec!["tag".into(), "value".into()],
+            vec![u8_ty, u32_ty],
+            vec![0, 1],
+            vec![0, 1],
+            5,
+            1,
+        )
+        .into();
+
+        let (module, block) = build_kernel(&mut ctx, vec![u8_ty, u32_ty], vec![]);
+        let tag = block.deref(&ctx).get_argument(0);
+        let value = block.deref(&ctx).get_argument(1);
+
+        let construct = Operation::new(
+            &mut ctx,
+            MirConstructStructOp::get_concrete_op_info(),
+            vec![packed_ty],
+            vec![tag, value],
+            vec![],
+            0,
+        );
+        construct.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        let err = crate::lower_mir_to_llvm(&mut ctx, module)
+            .expect_err("constructing a packed struct by value must fail to lower");
+        assert!(
+            format!("{err:?}").contains("diverges from the natural LLVM layout"),
+            "the refusal must name the layout divergence: {err:?}"
+        );
+    }
+
+    /// Element addressing strides by the natural size of the converted
+    /// element type (8 for this packed struct), while rustc strides by the
+    /// stored size (5), so every element past index 0 would land at the wrong
+    /// byte. Until rustc-stride byte addressing lands, `[Packed; N]` element
+    /// addressing fails closed.
+    #[test]
+    fn packed_array_element_addressing_fails_closed() {
+        use dialect_mir::ops::MirArrayElementAddrOp;
+
+        let mut ctx = make_ctx();
+
+        let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let u64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let packed_ty: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Packed".into(),
+            vec!["tag".into(), "value".into()],
+            vec![u8_ty, u32_ty],
+            vec![0, 1],
+            vec![0, 1],
+            5,
+            1,
+        )
+        .into();
+        let array_ty: TypeHandle = MirArrayType::get(&mut ctx, packed_ty, 4).into();
+        let base_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, array_ty, false).into();
+        let elem_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, packed_ty, false).into();
+
+        let (module, block) = build_kernel(&mut ctx, vec![base_ptr_ty, u64_ty], vec![]);
+        let base = block.deref(&ctx).get_argument(0);
+        let index = block.deref(&ctx).get_argument(1);
+
+        let elem_addr = Operation::new(
+            &mut ctx,
+            MirArrayElementAddrOp::get_concrete_op_info(),
+            vec![elem_ptr_ty],
+            vec![base, index],
+            vec![],
+            0,
+        );
+        elem_addr.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        let err = crate::lower_mir_to_llvm(&mut ctx, module)
+            .expect_err("element addressing over packed elements must fail to lower");
+        assert!(
+            format!("{err:?}").contains("element layout diverges"),
+            "the refusal must name the stride divergence: {err:?}"
+        );
+    }
+
     /// Enum construction must store the declared discriminant value, not the
     /// variant index. This locks the `Ordering::Less = -1` style case as the
     /// i8 bit-pattern `255`.
@@ -2331,27 +3102,68 @@ mod tests {
             2,
             "construction should reload the enum and extraction should load the tuple payload"
         );
-        assert_eq!(
-            find_all::<llvm::StoreOp>(&ctx, &body)
-                .iter()
-                .filter(|store| store.get_operand_value(&ctx).get_type(&ctx) == lowered_tuple)
-                .count(),
-            1,
-            "the complete {{i64, ptr}} payload must be written into the enum storage"
+        // What this test is about is that the payload moves as one unit, never
+        // field by field. Assert that property directly instead of counting
+        // whole-aggregate accesses.
+        //
+        // Counting was the fragile form. The enum's physical storage here is
+        // `{i64, ptr}` -- the *same interned type* as the lowered payload tuple,
+        // since the niche carrier claims the pointer at byte 8 and the 8 bytes
+        // below it become one `i64` filler. So a count of `lowered_tuple`-typed
+        // accesses cannot separate the payload write from the enum spill, and
+        // the expected numbers move whenever that coincidence appears or
+        // disappears -- which has nothing to do with the property under test.
+        //
+        // A lowering that decomposed the payload is recognisable by what it
+        // emits instead: traffic in the tuple's *field* types. Look for that,
+        // and the assertion holds whatever the enum storage type happens to be.
+        let field_tys: Vec<TypeHandle> = lowered_tuple
+            .deref(&ctx)
+            .downcast_ref::<llvm_types::StructType>()
+            .expect("the lowered tuple is an LLVM struct")
+            .fields()
+            .collect();
+
+        let store_tys: Vec<TypeHandle> = find_all::<llvm::StoreOp>(&ctx, &body)
+            .iter()
+            .map(|store| store.get_operand_value(&ctx).get_type(&ctx))
+            .collect();
+        let load_tys: Vec<TypeHandle> = find_all::<llvm::LoadOp>(&ctx, &body)
+            .iter()
+            .map(|load| {
+                load.get_operation()
+                    .deref(&ctx)
+                    .get_result(0)
+                    .get_type(&ctx)
+            })
+            .collect();
+
+        let describe = |tys: &[TypeHandle]| -> Vec<String> {
+            tys.iter()
+                .filter(|ty| field_tys.contains(ty))
+                .map(|ty| ty.deref(&ctx).disp(&ctx).to_string())
+                .collect()
+        };
+        assert!(
+            describe(&store_tys).is_empty(),
+            "the payload must be stored whole, but these field-typed stores appear: {:?}",
+            describe(&store_tys)
         );
-        assert_eq!(
-            find_all::<llvm::LoadOp>(&ctx, &body)
-                .iter()
-                .filter(|load| {
-                    load.get_operation()
-                        .deref(&ctx)
-                        .get_result(0)
-                        .get_type(&ctx)
-                        == lowered_tuple
-                })
-                .count(),
-            1,
-            "payload extraction must read the complete {{i64, ptr}} tuple back"
+        assert!(
+            describe(&load_tys).is_empty(),
+            "the payload must be read whole, but these field-typed loads appear: {:?}",
+            describe(&load_tys)
+        );
+
+        // And it must actually be moved: without this the checks above would
+        // also pass a lowering that emitted no payload traffic at all.
+        assert!(
+            store_tys.contains(&lowered_tuple),
+            "at least one store must move the complete {{i64, ptr}} payload"
+        );
+        assert!(
+            load_tys.contains(&lowered_tuple),
+            "at least one load must read the complete {{i64, ptr}} payload"
         );
     }
 
@@ -2929,6 +3741,96 @@ mod tests {
             count_ops::<llvm::AddrSpaceCastOp>(&ctx, &body),
             2,
             "construction and extraction must cast the nested shared pointer leaf"
+        );
+        assert_eq!(count_ops::<MirConstructEnumOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<MirEnumPayloadOp>(&ctx, &body), 0);
+    }
+
+    #[test]
+    fn bounded_shared_pointer_array_niche_payload_round_trips_through_recursive_storage() {
+        let mut ctx = make_ctx();
+        let logical: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Signed).into();
+        let pointee: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let shared: TypeHandle = MirPtrType::get_shared(&mut ctx, pointee, true).into();
+        let pointers: TypeHandle = MirArrayType::get(&mut ctx, shared, 2).into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "OptionSharedPointerArray".into(),
+            logical,
+            vec![0, 1],
+            vec![
+                EnumVariant::unit("None".into()),
+                EnumVariant::new_with_layout("Some".into(), vec![pointers], vec![0], vec![16]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 16,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Niche,
+                carrier_kind: EnumCarrierKind::Pointer,
+                carrier_width: 64,
+                carrier_address_space: llvm_types::address_space::GENERIC,
+                niche_start: 0,
+                niche_variant_start: 0,
+                niche_variant_end: 0,
+                untagged_variant: 1,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let (module, block) = build_kernel(&mut ctx, vec![pointers], vec![pointers]);
+        let array = block.deref(&ctx).get_argument(0);
+        let construct = Operation::new(
+            &mut ctx,
+            MirConstructEnumOp::get_concrete_op_info(),
+            vec![enum_ty],
+            vec![array],
+            vec![],
+            0,
+        );
+        MirConstructEnumOp::new(construct)
+            .set_attr_construct_enum_variant_index(&ctx, VariantIndexAttr(1));
+        construct.insert_at_back(block, &ctx);
+        let option = construct.deref(&ctx).get_result(0);
+
+        let discriminant = Operation::new(
+            &mut ctx,
+            mir::MirGetDiscriminantOp::get_concrete_op_info(),
+            vec![logical],
+            vec![option],
+            vec![],
+            0,
+        );
+        discriminant.insert_at_back(block, &ctx);
+
+        let payload = Operation::new(
+            &mut ctx,
+            MirEnumPayloadOp::get_concrete_op_info(),
+            vec![pointers],
+            vec![option],
+            vec![],
+            0,
+        );
+        let payload_op = MirEnumPayloadOp::new(payload);
+        payload_op.set_attr_payload_variant_index(&ctx, VariantIndexAttr(1));
+        payload_op.set_attr_payload_field_index(&ctx, FieldIndexAttr(0));
+        payload.insert_at_back(block, &ctx);
+        let result = payload.deref(&ctx).get_result(0);
+        append_mir_return(&mut ctx, block, vec![result]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module).expect("lowering failed");
+        let body = kernel_blocks(&ctx, module);
+        assert_eq!(
+            count_ops::<llvm::AddrSpaceCastOp>(&ctx, &body),
+            4,
+            "construction and extraction must cast both shared-pointer array elements"
+        );
+        assert_eq!(
+            count_ops::<llvm::PtrToIntOp>(&ctx, &body),
+            1,
+            "niche discrimination must inspect the generic first-pointer carrier"
         );
         assert_eq!(count_ops::<MirConstructEnumOp>(&ctx, &body), 0);
         assert_eq!(count_ops::<MirEnumPayloadOp>(&ctx, &body), 0);

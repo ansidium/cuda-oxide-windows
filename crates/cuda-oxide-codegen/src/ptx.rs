@@ -459,6 +459,29 @@ fn generate_ptx_impl(
         optimized
     };
     let llc_input: &Path = optimized.as_deref().unwrap_or(post_link_input);
+
+    // Diagnose Rust locals only from the successful post-O2 input that will
+    // actually reach llc. Looking earlier would report slots that LLVM SROA
+    // still removes, while full-debug and no-opt builds intentionally retain
+    // stack storage and therefore are not meaningful promotion diagnostics.
+    if opts.verbose && optimized.is_some() && !debug_kind.variables_enabled() {
+        match crate::local_memory_diagnostic::diagnose_file(llc_input) {
+            Ok(local_memory_diagnostics) => {
+                for diagnostic in local_memory_diagnostics {
+                    record_diagnostic(&mut diagnostics, diagnostic_sink, diagnostic);
+                }
+            }
+            Err(error) => record_diagnostic(
+                &mut diagnostics,
+                diagnostic_sink,
+                format!(
+                    "warning: could not inspect optimized LLVM IR for local-memory promotion diagnostics ({}): {error}",
+                    llc_input.display()
+                ),
+            ),
+        }
+    }
+
     let llc_requirements = detect_module_requirements_in_llvm_file(llc_input)?;
     let requirements = merge_module_requirements(requirements, llc_requirements);
     let requirements =
@@ -678,15 +701,31 @@ mod tests {
             .push(message.to_string());
     }
 
+    /// Locates a POSIX utility the tests drive as a stand-in for a real tool.
+    ///
+    /// The location is not portable: Linux ships `true` and `false` in `/bin`,
+    /// while macOS ships them only in `/usr/bin`. Hardcoding either directory
+    /// makes a `#[cfg(unix)]` test fail on a platform that predicate covers, so
+    /// resolve the path instead of assuming one.
+    #[cfg(unix)]
+    fn posix_utility(name: &str) -> String {
+        ["/bin", "/usr/bin"]
+            .iter()
+            .map(|directory| format!("{directory}/{name}"))
+            .find(|path| Path::new(path).exists())
+            .unwrap_or_else(|| panic!("no `{name}` utility in /bin or /usr/bin"))
+    }
+
     #[test]
     #[cfg(unix)]
     fn legacy_opt_failure_warns_but_experimental_mode_fails() {
+        let opt_path = posix_utility("false");
         let toolchain = LlvmToolchain {
-            llc_path: "/bin/true".to_string(),
+            llc_path: posix_utility("true"),
             llc_major: Some(21),
             llc_from_env: false,
             opt: Some(crate::llvm_tools::OptTool {
-                path: "/bin/false".to_string(),
+                path: opt_path.clone(),
                 major: Some(21),
             }),
             llvm_link: None,
@@ -701,7 +740,11 @@ mod tests {
 
         let error = optimize_ll(input, &[], &toolchain, &opts, true).unwrap_err();
         assert!(matches!(&error, PipelineError::Optimization(_)));
-        assert!(error.to_string().contains("opt (/bin/false) failed"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("opt ({opt_path}) failed"))
+        );
     }
 
     #[test]

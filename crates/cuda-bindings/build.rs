@@ -6,6 +6,32 @@
 use cuda_toolkit_discovery::{cuda_driver_lib_candidates, include_candidates_for_target};
 use std::{env, error::Error, path::Path, path::PathBuf, process::exit};
 
+/// Environment variables consulted (in order) to locate the CUDA toolkit root.
+/// `CUDA_HOME` is the conventional name used by nvcc wrappers and CI images.
+const TOOLKIT_ENV_VARS: [&str; 2] = ["CUDA_TOOLKIT_PATH", "CUDA_HOME"];
+
+/// Toolkit root fallback when none of [`TOOLKIT_ENV_VARS`] is set.
+const DEFAULT_TOOLKIT_DIR: &str = "/usr/local/cuda";
+
+/// Environment variable naming the CUDA `targets/<dir>` tree to use,
+/// overriding the arch+OS table in `toolkit_target.rs`. The value is a
+/// directory name under `{toolkit}/targets/` (e.g. `aarch64-linux`), the
+/// same shape nvcc's `-target-dir` flag takes; CMake exposes the equivalent
+/// selection as `CUDAToolkit_TARGET_DIR`. The named directory is still
+/// probed for `cuda.h`, so a wrong value fails with the clear discovery
+/// error instead of silently falling back to the table.
+const TOOLKIT_TARGET_DIR_ENV: &str = "CUDA_TOOLKIT_TARGET_DIR";
+
+/// Returns the CUDA toolkit install root: the first set variable among
+/// [`TOOLKIT_ENV_VARS`], otherwise [`DEFAULT_TOOLKIT_DIR`]. Used for include
+/// paths, library search paths, and bindgen’s Clang configuration.
+fn cuda_toolkit_dir() -> String {
+    TOOLKIT_ENV_VARS
+        .iter()
+        .find_map(|var| env::var(var).ok())
+        .unwrap_or_else(|| DEFAULT_TOOLKIT_DIR.to_string())
+}
+
 /// Runs [`run`]; on error, prints the message and exits with status 1.
 fn main() {
     if let Err(error) = run() {
@@ -20,24 +46,44 @@ fn main() {
 /// directory, writing `bindings.rs` into `OUT_DIR`.
 fn run() -> Result<(), Box<dyn Error>> {
     let target = env::var("TARGET").unwrap_or_default();
-    if target.ends_with("windows-gnu") {
+    if target.contains("windows") && target != "x86_64-pc-windows-msvc" {
         return Err(std::io::Error::other(
-            "cuda-oxide Windows support currently targets x86_64-pc-windows-msvc. Use the MSVC toolchain.",
+            "cuda-oxide Windows support requires the x86_64-pc-windows-msvc target.",
         )
         .into());
     }
 
     println!("cargo:rerun-if-changed=wrapper.h");
-    println!("cargo:rerun-if-env-changed=CUDA_TOOLKIT_PATH");
-    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    // Emitting any rerun-if-changed disables cargo's default "rerun on any
+    // package change", so the `include!`d selection table needs naming.
+    println!("cargo:rerun-if-changed=toolkit_target.rs");
+    for var in TOOLKIT_ENV_VARS {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
-    println!("cargo:rerun-if-env-changed=CUDA_PATH_V13_3");
+    for (name, _) in env::vars_os() {
+        if let Some(name) = name.to_str().filter(|name| name.starts_with("CUDA_PATH_V")) {
+            println!("cargo:rerun-if-env-changed={name}");
+        }
+    }
+    println!("cargo:rerun-if-env-changed={TOOLKIT_TARGET_DIR_ENV}");
     println!("cargo::rustc-check-cfg=cfg(cuda_has_cuEventElapsedTime_v2)");
 
-    let include_dir = find_cuda_include_dir(&target)?;
+    let (include_dir, lib_paths) = if target == "x86_64-pc-windows-msvc" {
+        (
+            find_windows_cuda_include_dir(&target)?,
+            cuda_driver_lib_candidates(&target),
+        )
+    } else {
+        let toolkit = cuda_toolkit_dir();
+        (
+            find_cuda_include_dir(&toolkit)?,
+            collect_lib_paths(&toolkit),
+        )
+    };
     probe_event_elapsed_time_v2(&include_dir.join("cuda.h"));
 
-    for path in cuda_driver_lib_candidates(&target) {
+    for path in lib_paths {
         println!("cargo:rustc-link-search=native={}", path.display());
     }
     println!("cargo:rustc-link-lib=dylib=cuda");
@@ -60,13 +106,42 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Returns the include directory containing `cuda.h`.
+// The `targets/<dir>` selection table, shared verbatim with
+// `tests/toolkit_target.rs` so it can be unit tested.
+include!("toolkit_target.rs");
+
+/// The `targets/<dir>` candidates for the target cargo is building for: the
+/// [`TOOLKIT_TARGET_DIR_ENV`] override when set, otherwise
+/// [`toolkit_target_dirs`] for `CARGO_CFG_TARGET_ARCH` /
+/// `CARGO_CFG_TARGET_OS`. Empty when the override is absent and either cfg
+/// is unset, which keeps discovery on the plain `{toolkit}/include` layout
+/// rather than guessing.
+fn build_target_dirs() -> Vec<String> {
+    let override_dir = env::var(TOOLKIT_TARGET_DIR_ENV).ok();
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    resolve_toolkit_target_dirs(override_dir.as_deref(), &arch, &os)
+}
+
+/// Returns the include directory containing `cuda.h`: `{toolkit}/include`
+/// for standard installs, or `{toolkit}/targets/<dir>/include` for
+/// redistributable layouts that have no top-level `include/`.
+///
+/// Only the `targets/` directories [`build_target_dirs`] yields (the
+/// [`TOOLKIT_TARGET_DIR_ENV`] override, or the [`toolkit_target_dirs`] table
+/// for the build target's own architecture) are probed, in order. Globbing
+/// all of `targets/*` would let another architecture's headers and stubs
+/// shadow the right ones on multi-target installs (`sbsa-linux` sorts before
+/// `x86_64-linux`).
 ///
 /// A missing `cuda.h` is a hard error here: bindgen cannot run without it,
-/// and failing now produces one clean message instead of raw clang diagnostics.
-fn find_cuda_include_dir(target: &str) -> Result<PathBuf, String> {
-    let candidates = include_candidates_for_target(target);
-    if let Some(dir) = candidates.iter().find(|dir| dir.join("cuda.h").is_file()) {
+/// and failing now produces one clean message instead of raw clang
+/// diagnostics.
+fn find_cuda_include_dir(toolkit: &str) -> Result<PathBuf, String> {
+    let base = Path::new(toolkit);
+    let candidates = toolkit_include_candidates(base, &build_target_dirs());
+
+    if let Some(dir) = select_include_dir(&candidates) {
         return Ok(dir.clone());
     }
 
@@ -75,12 +150,33 @@ fn find_cuda_include_dir(target: &str) -> Result<PathBuf, String> {
         .map(|dir| format!("  {}", dir.join("cuda.h").display()))
         .collect();
     Err(format!(
-        "cuda-bindings: could not find cuda.h in the CUDA toolkit.\n\
+        "cuda-bindings: could not find cuda.h in the CUDA toolkit at `{toolkit}`.\n\
          Probed:\n\
          {}\n\
-         Set CUDA_TOOLKIT_PATH, CUDA_HOME, CUDA_PATH, or CUDA_PATH_V* \
-         to a CUDA Toolkit install root.",
+         Set CUDA_TOOLKIT_PATH or CUDA_HOME to a CUDA Toolkit install root; \
+         when neither is set, {DEFAULT_TOOLKIT_DIR} is used.",
         probed.join("\n")
+    ))
+}
+
+/// Returns the Windows include directory containing `cuda.h`.
+fn find_windows_cuda_include_dir(target: &str) -> Result<PathBuf, String> {
+    let candidates = include_candidates_for_target(target);
+    if let Some(dir) = candidates.iter().find(|dir| dir.join("cuda.h").is_file()) {
+        return Ok(dir.clone());
+    }
+
+    let probed = candidates
+        .iter()
+        .map(|dir| format!("  {}", dir.join("cuda.h").display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(format!(
+        "cuda-bindings: could not find cuda.h in the CUDA toolkit.\n\
+         Probed:\n\
+         {probed}\n\
+         Set CUDA_TOOLKIT_PATH, CUDA_HOME, CUDA_PATH, or CUDA_PATH_V* \
+         to a CUDA Toolkit install root."
     ))
 }
 
@@ -111,4 +207,32 @@ fn probe_event_elapsed_time_v2(cuda_h: &Path) {
             );
         }
     }
+}
+
+/// Candidate directories for `rustc-link-search=native` when linking against the driver library.
+///
+/// Adds `{toolkit}/lib64` and `{toolkit}/lib64/stubs` when `lib64` exists. For each
+/// `targets/<dir>` candidate whose `include/cuda.h` exists (redistributable / cross-layout
+/// install), also adds that target's `lib` and `lib/stubs`. Only the candidates
+/// [`build_target_dirs`] yields for the build target (override or table) are considered,
+/// never all of `targets/*`. Order is preserved; duplicates are not filtered.
+fn collect_lib_paths(toolkit: &str) -> Vec<PathBuf> {
+    let base = PathBuf::from(toolkit);
+    let mut paths = vec![];
+
+    let lib64 = base.join("lib64");
+    if lib64.is_dir() {
+        paths.push(lib64.clone());
+        paths.push(lib64.join("stubs"));
+    }
+
+    for target_dir in build_target_dirs() {
+        let target_root = base.join("targets").join(target_dir);
+        if target_root.join("include/cuda.h").is_file() {
+            paths.push(target_root.join("lib"));
+            paths.push(target_root.join("lib/stubs"));
+        }
+    }
+
+    paths
 }

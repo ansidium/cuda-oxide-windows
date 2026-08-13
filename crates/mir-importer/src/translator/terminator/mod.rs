@@ -970,7 +970,7 @@ fn translate_call(
     let target_usize = target.map(|t| t);
 
     // Extract function info
-    let (pattern_name, call_name, substs_str) = extract_func_info(func, &loc)?;
+    let (pattern_name, call_name, substs_str, type_substs) = extract_func_info(func, &loc)?;
 
     // Helper to check if substitutions contain a type
     let substs_contains =
@@ -1269,6 +1269,7 @@ fn translate_call(
             block_map,
             loc.clone(),
             &substs_contains,
+            &type_substs,
         )?
     {
         return Ok(result);
@@ -1482,16 +1483,21 @@ fn translate_function_item_call(
         return Ok(emit_unreachable_after(ctx, block_ptr, Some(call_op), loc));
     }
 
+    // The result is typed from the projected destination above, so it must
+    // also be stored through the projection: a bare-local store would aim a
+    // field-typed value at the aggregate's slot (or a pointee-typed value at
+    // the pointer's).
     let result_value = call_op.deref(ctx).get_result(0);
-    let last_inserted = value_map
-        .store_local(
-            ctx,
-            destination.local,
-            result_value,
-            block_ptr,
-            Some(call_op),
-        )
-        .unwrap_or(call_op);
+    let last_inserted = helpers::store_result_to_place(
+        ctx,
+        body,
+        destination,
+        result_value,
+        value_map,
+        block_ptr,
+        call_op,
+        loc.clone(),
+    )?;
 
     if let Some(target_idx) = target {
         Ok(helpers::emit_goto(
@@ -1715,17 +1721,20 @@ fn translate_closure_call(
         return Ok(emit_unreachable_after(ctx, block_ptr, Some(call_op), loc));
     }
 
-    // Store the call result into the destination local's slot.
+    // Store the call result into the destination place. The result is typed
+    // from the projected destination above, so it must also be stored
+    // through the projection, not the bare local's slot.
     let result_value = call_op.deref(ctx).get_result(0);
-    let last_inserted = value_map
-        .store_local(
-            ctx,
-            destination.local,
-            result_value,
-            block_ptr,
-            Some(call_op),
-        )
-        .unwrap_or(call_op);
+    let last_inserted = helpers::store_result_to_place(
+        ctx,
+        body,
+        destination,
+        result_value,
+        value_map,
+        block_ptr,
+        call_op,
+        loc.clone(),
+    )?;
 
     // Emit goto to target
     if let Some(target_idx) = target {
@@ -2117,7 +2126,12 @@ fn is_cuda_device_const_marker(func: &mir::Operand, expected_name: &str) -> bool
 fn extract_func_info(
     func: &mir::Operand,
     loc: &Location,
-) -> TranslationResult<(Option<String>, Option<String>, Option<String>)> {
+) -> TranslationResult<(
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Vec<rustc_public::ty::Ty>,
+)> {
     Ok(match func {
         mir::Operand::Constant(const_op) => match const_op.const_.kind() {
             ConstantKind::ZeroSized => {
@@ -2152,14 +2166,27 @@ fn extract_func_info(
                         };
 
                         let substs_debug = format!("{:?}", substs);
-                        (Some(pattern_name), Some(call_name), Some(substs_debug))
+                        let type_substs = substs
+                            .0
+                            .iter()
+                            .filter_map(|arg| match arg {
+                                rustc_public::ty::GenericArgKind::Type(ty) => Some(*ty),
+                                _ => None,
+                            })
+                            .collect();
+                        (
+                            Some(pattern_name),
+                            Some(call_name),
+                            Some(substs_debug),
+                            type_substs,
+                        )
                     }
-                    _ => (None, None, None),
+                    _ => (None, None, None, vec![]),
                 }
             }
-            _ => (None, None, None),
+            _ => (None, None, None, vec![]),
         },
-        _ => (None, None, None),
+        _ => (None, None, None, vec![]),
     })
 }
 
@@ -2426,6 +2453,7 @@ fn emit_typed_swap(
 /// | TMA               | `cp_async_bulk_tensor_*_g2s/s2g`, `wait_group`    |
 /// | Tcgen05 (Blackwell)| `tcgen05_alloc`, `tcgen05_mma_*`, `tcgen05_ld_*` |
 /// | Memory            | `SharedArray::index`, `stmatrix_*`, `cvt_*`       |
+/// | Layout            | `size_of_val`, `align_of_val`                     |
 /// | DisjointSlice     | `get_thread_local`, `len`                         |
 #[allow(clippy::too_many_arguments)]
 fn try_dispatch_intrinsic(
@@ -2442,8 +2470,26 @@ fn try_dispatch_intrinsic(
     block_map: &[Ptr<BasicBlock>],
     loc: Location,
     substs_contains: &impl Fn(&str) -> bool,
+    type_substs: &[rustc_public::ty::Ty],
 ) -> TranslationResult<Option<Ptr<Operation>>> {
     intrinsics::wgmma::reject_unsupported(name, loc.clone())?;
+
+    if let Some(operation) = intrinsics::iket::try_dispatch(
+        ctx,
+        body,
+        name,
+        args,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc.clone(),
+        type_substs,
+    )? {
+        return Ok(Some(operation));
+    }
 
     if let Some(operation) = intrinsics::generated::try_dispatch_generated_intrinsic(
         ctx,
@@ -2491,6 +2537,23 @@ fn try_dispatch_intrinsic(
             value_map,
             block_map,
             loc,
+        )?));
+    }
+
+    if let Some(intrinsic) = intrinsics::layout::RustLayoutIntrinsic::from_core_path(name) {
+        return Ok(Some(intrinsics::layout::emit_rust_layout_intrinsic(
+            ctx,
+            body,
+            intrinsic,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+            type_substs,
         )?));
     }
 
@@ -2631,7 +2694,7 @@ fn try_dispatch_intrinsic(
             // Emit a placeholder call carrying the three operands; mir-lower
             // turns it into an LLVM `select`. `bool` lowers to `i1`, exactly
             // what the select condition needs.
-            let return_type = types::translate_type(ctx, &body.locals()[destination.local].ty)?;
+            let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
             Ok(Some(helpers::emit_function_call(
                 ctx,
                 body,

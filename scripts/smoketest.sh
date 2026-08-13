@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # scripts/smoketest.sh -- run every cuda-oxide example and report pass/fail
 # per GPU-aware gating rules.
@@ -17,6 +19,12 @@
 #                   sufficient.
 #   wgmma        -- Hopper only (sm_90a). On Hopper require execution;
 #                   elsewhere PTX compilation is sufficient.
+#   blackwell-mma -- Blackwell-consumer-only MMA (kind::mxf8f6f4 exists on
+#                   sm_120/sm_121 alone), always compiled with
+#                   `--arch=sm_120a` because the generated target gating
+#                   rejects every other architecture at compile time. On an
+#                   sm_120/121 host require full execution; elsewhere the
+#                   example verifies the generated PTX and exits 0.
 #   ltoir        -- runs with `--emit-nvvm-ir --arch=<host>`; the host
 #                   compute capability is detected via `nvidia-smi` so the
 #                   resulting cubin actually loads. Execution must succeed
@@ -33,6 +41,12 @@
 #   auto-nvvm    -- runs without NVVM or architecture flags to check automatic
 #                   libdevice and target selection. Compile-only CI supplies a
 #                   target because no GPU is available.
+#   iket         -- IKET-annotated kernels; the placeholder ABI needs sm_90+.
+#                   On a host with CC >= 9.0, run with an explicit --arch
+#                   matching the host and require the SUCCESS marker. On
+#                   GPU-less or pre-9.0 hosts (and in --compile-only mode),
+#                   build with the pinned sm_90 floor and require the device
+#                   artifact.
 #   blackwell-compile -- compile-only coverage pinned to exact sm_120a. These
 #                   kernels are never launched.
 #   NVVM_VERIFY_EXAMPLES are compiled through the real libNVVM verifier and
@@ -50,15 +64,26 @@ set -uo pipefail
 
 TCGEN05_EXAMPLES=(gemm_sol gemm_sol_final tcgen05 tcgen05_matmul)
 WGMMA_EXAMPLES=(wgmma)
+BLACKWELL_MMA_EXAMPLES=(mma_mxf8f6f4)
 LTOIR_EXAMPLES=(addressof_sharedarray cpp_consumes_rust_device device_ffi_test legacy_atomic_fadd legacy_nvvm_pointer_shapes manual_launch_libdevice mathdx_ffi_test primitive_stress)
 LTOIR_MODERN_EXAMPLES=(small_type_ffi_test)
 AUTO_NVVM_EXAMPLES=(libdevice_math)
+IKET_EXAMPLES=(iket_trace)
 BLACKWELL_COMPILE_EXAMPLES=(generated_intrinsics_blackwell)
-NVVM_VERIFY_EXAMPLES=(cp_async_small device_global enum_constant_provenance generated_intrinsics generated_intrinsics_blackwell generated_ldmatrix legacy_atomic_fadd libdevice_math legacy_nvvm_pointer_shapes packed_atomic_add primitive_stress shuffle_64 tcgen05 tuple_constant_provenance wgmma_mma_bf16)
-ERROR_EXAMPLES=(error error_set_discriminant_uninhabited error_enum_bool_payload_addr error_enum_pointer_overlap error_enum_shared_pointer_layout error_heap_alloc error_missing_device_attr error_generated_intrinsic_abi error_generated_intrinsic_unknown_id error_generated_intrinsic_fn_pointer error_generated_intrinsic_callable)
+NVVM_VERIFY_EXAMPLES=(cp_async_small device_global enum_constant_provenance generated_intrinsics generated_intrinsics_blackwell generated_ldmatrix legacy_atomic_fadd libdevice_math legacy_nvvm_pointer_shapes packed_atomic_add primitive_stress scoped_atomic_load_store shuffle_64 tcgen05 tuple_constant_provenance wgmma_mma_bf16)
+ERROR_EXAMPLES=(error error_set_discriminant_uninhabited error_enum_bool_payload_addr error_enum_pointer_overlap error_enum_shared_pointer_layout error_heap_alloc error_kernel_shared_param error_missing_device_attr error_generated_intrinsic_abi error_generated_intrinsic_unknown_id error_generated_intrinsic_fn_pointer error_generated_intrinsic_callable)
 
 # Examples that pin RUSTFLAGS=-Zinline-mir=no (verdict rules are unaffected)
 NOINLINE_MIR_EXAMPLES=(disjoint_slice_len)
+
+# Examples whose `main` deliberately never launches a kernel: they exist to
+# prove the device code compiles, and say so in their module docs
+# ("compilation and PTX generation only. Do not launch this kernel."). They
+# still belong to the `standard` category because the build and the host
+# binary must both succeed, but reporting a bare `PASS` would make them
+# indistinguishable in the summary from an example that launched kernels and
+# verified results.
+NO_LAUNCH_EXAMPLES=(wgmma_mma_bf16)
 
 # Examples whose verify-code-shape.sh asserts on `#[inline(never)]` marker
 # symbols. Those markers are private, so once the middle end inlines them into
@@ -72,9 +97,11 @@ classify() {
     local ex="$1" cat
     for cat in "${TCGEN05_EXAMPLES[@]}";     do [[ "$ex" == "$cat" ]] && { echo tcgen05;     return; }; done
     for cat in "${WGMMA_EXAMPLES[@]}";       do [[ "$ex" == "$cat" ]] && { echo wgmma;       return; }; done
+    for cat in "${BLACKWELL_MMA_EXAMPLES[@]}"; do [[ "$ex" == "$cat" ]] && { echo blackwell-mma; return; }; done
     for cat in "${LTOIR_EXAMPLES[@]}";       do [[ "$ex" == "$cat" ]] && { echo ltoir;       return; }; done
     for cat in "${LTOIR_MODERN_EXAMPLES[@]}"; do [[ "$ex" == "$cat" ]] && { echo ltoir-modern; return; }; done
     for cat in "${AUTO_NVVM_EXAMPLES[@]}";   do [[ "$ex" == "$cat" ]] && { echo auto-nvvm;   return; }; done
+    for cat in "${IKET_EXAMPLES[@]}";        do [[ "$ex" == "$cat" ]] && { echo iket;        return; }; done
     for cat in "${BLACKWELL_COMPILE_EXAMPLES[@]}"; do [[ "$ex" == "$cat" ]] && { echo blackwell-compile; return; }; done
     for cat in "${ERROR_EXAMPLES[@]}";       do [[ "$ex" == "$cat" ]] && { echo error;       return; }; done
     echo standard
@@ -83,6 +110,14 @@ classify() {
 verify_nvvm_in_compile_only() {
     local ex="$1" candidate
     for candidate in "${NVVM_VERIFY_EXAMPLES[@]}"; do
+        [[ "$ex" == "$candidate" ]] && return 0
+    done
+    return 1
+}
+
+example_never_launches() {
+    local ex="$1" candidate
+    for candidate in "${NO_LAUNCH_EXAMPLES[@]}"; do
         [[ "$ex" == "$candidate" ]] && return 0
     done
     return 1
@@ -268,6 +303,16 @@ else
     LTOIR_MODERN_ARCH="sm_100"
 fi
 
+# iket examples need the sm_90+ placeholder ABI. On a CC >= 9.0 host, target
+# the host arch explicitly and require full execution; on GPU-less or pre-9.0
+# hosts, compile for the pinned sm_90 floor and require only the artifact.
+IKET_EXEC=0
+IKET_ARCH="sm_90"
+if [[ "${host_cc}" =~ ^([0-9]+)\.[0-9]+$ ]] && [[ $((10#${BASH_REMATCH[1]})) -ge 9 ]]; then
+    IKET_ARCH="${LTOIR_ARCH}"
+    IKET_EXEC=1
+fi
+
 printf "%scuda-oxide smoketest%s @ %s%s%s (%s)\n" "${C_BOLD}" "${C_RESET}" "${C_BOLD}" "${git_head}" "${C_RESET}" "${git_branch}"
 printf "GPU: %s\n" "${gpu_info}"
 printf "LTOIR arch: %s (modern: %s)\n" "${LTOIR_ARCH}" "${LTOIR_MODERN_ARCH}"
@@ -280,7 +325,12 @@ echo ""
 
 # ---- Example selection ---------------------------------------------------
 
-mapfile -t ALL_EXAMPLES < <(
+# Read loop rather than `mapfile`: that builtin arrived in bash 4, and macOS
+# still ships bash 3.2 as /bin/bash, where this line ended the run outright.
+ALL_EXAMPLES=()
+while IFS= read -r example_name; do
+    ALL_EXAMPLES+=("${example_name}")
+done < <(
     cd crates/rustc-codegen-cuda/examples
     for manifest in */Cargo.toml; do
         [[ -e "${manifest}" ]] || continue
@@ -319,7 +369,7 @@ fi
 # They never run cargo themselves; that is the caller's job.
 
 verdict_standard() {
-    local log="$1" ec="$2"
+    local log="$1" ec="$2" ex="${3:-}"
     if [[ ${ec} -gt 128 ]]; then echo "FAIL (crashed, signal $((ec - 128)))"; return 1; fi
     if [[ ${ec} -ne 0 ]]; then   echo "FAIL (exit=${ec})";                    return 1; fi
     if grep_failure_markers "${log}"; then
@@ -330,11 +380,28 @@ verdict_standard() {
     # pre-Hopper, mathdx_ffi_test with no MathDx SDK). Accept it as PASS so
     # standard-category examples can gate themselves on hardware/SDK presence
     # without having to fake a success marker.
-    if grep -qE '^[[:space:]]*skipping:' "${log}"; then
+    #
+    # This has to recognise the declaration in every spelling the examples
+    # use, because the success-marker check below matches `SUCCESS|PASS|
+    # Complete` anywhere in the log and skip messages routinely contain those
+    # words. Missing a skip here therefore does not merely lose the
+    # "(skipped)" annotation: it promotes the example to a full execution
+    # PASS, indistinguishable from one that launched kernels and checked
+    # results. That is how `Skipping: ... -- PASS (skipped)` used to report a
+    # clean PASS, and `generated_ldmatrix` still prints the
+    # `PASS (skipped): ...` form below sm_75.
+    if grep -qiE '^[[:space:]]*(skipping:|pass \(skipped\))' "${log}"; then
         echo "PASS (skipped)"
         return 0
     fi
-    if grep -qE 'SUCCESS|PASS|Complete' "${log}"; then echo "PASS"; return 0; fi
+    if grep -qE 'SUCCESS|PASS|Complete' "${log}"; then
+        if example_never_launches "${ex}"; then
+            echo "PASS (compiled, no launch)"
+        else
+            echo "PASS"
+        fi
+        return 0
+    fi
     echo "FAIL (no success marker)"
     return 1
 }
@@ -366,7 +433,7 @@ verdict_error() {
     case "${ex}" in
         error_enum_bool_payload_addr)
             if ! grep -Fq 'canonical storage type' "${log}" \
-                || ! grep -Fq 'in-place mutation of bool or shared-pointer enum payloads is not supported' "${log}"; then
+                || ! grep -Fq 'a borrow that escapes into a call keeps no such rewrite and is refused here' "${log}"; then
                 echo "FAIL (missing canonical-storage payload-address diagnostic)"
                 return 1
             fi
@@ -380,6 +447,12 @@ verdict_error() {
         error_enum_shared_pointer_layout)
             if ! grep -Fq 'arrays containing shared-memory pointers are not supported' "${log}"; then
                 echo "FAIL (missing shared-pointer array layout diagnostic)"
+                return 1
+            fi
+            ;;
+        error_kernel_shared_param)
+            if ! grep -Fq 'is a pointer into shared memory' "${log}"; then
+                echo "FAIL (missing shared-memory kernel-parameter diagnostic)"
                 return 1
             fi
             ;;
@@ -497,6 +570,29 @@ verdict_wgmma() {
     return 1
 }
 
+verdict_blackwell_mma() {
+    local log="$1" ec="$2"
+    if [[ ${ec} -gt 128 ]]; then echo "FAIL (crashed, signal $((ec - 128)))"; return 1; fi
+    # Non-sm_120/121 host: the example declares the skip and must still
+    # prove the sm_120a PTX was generated with the block-scaled instruction.
+    if grep -qE 'mxf8f6f4 block-scale MMA requires sm_120' "${log}"; then
+        if [[ ${ec} -eq 0 ]] && grep -qE 'PTX was generated successfully' "${log}"; then
+            echo "PASS (blackwell-mma, PTX compiled)"
+            return 0
+        fi
+        echo "FAIL (blackwell-mma, PTX not generated)"
+        return 1
+    fi
+    if [[ ${ec} -ne 0 ]]; then echo "FAIL (blackwell-mma, exit=${ec})"; return 1; fi
+    if grep_failure_markers "${log}"; then
+        echo "FAIL (blackwell-mma, failure marker in output)"
+        return 1
+    fi
+    if grep -qE 'SUCCESS|PASS|Complete' "${log}"; then echo "PASS (blackwell-mma, executed)"; return 0; fi
+    echo "FAIL (blackwell-mma, no success marker)"
+    return 1
+}
+
 verdict_ltoir() {
     local ex="$1" log="$2" ec="$3"
     # Hyphens in example names become underscores in the crate-named
@@ -555,6 +651,36 @@ verdict_ltoir_modern() {
         return 0
     fi
     echo "FAIL (LTOIR modern, no NVVM IR for the ${LTOIR_MODERN_ARCH} floor)"
+    return 1
+}
+
+verdict_iket() {
+    local ex="$1" log="$2" ec="$3"
+    local ex_dir="crates/rustc-codegen-cuda/examples/${ex}"
+    local artifact="${ex//-/_}"
+    if [[ ${ec} -gt 128 ]]; then echo "FAIL (crashed, signal $((ec - 128)))"; return 1; fi
+    if [[ ${IKET_EXEC} -eq 1 ]]; then
+        # CC >= 9.0 host: the kernel targeted the host arch and must execute.
+        if [[ ${ec} -ne 0 ]]; then echo "FAIL (iket, exit=${ec})"; return 1; fi
+        if grep_failure_markers "${log}"; then
+            echo "FAIL (iket, failure marker in output)"
+            return 1
+        fi
+        if grep -qE 'SUCCESS|PASS|Complete' "${log}"; then
+            echo "PASS (iket, executed on ${IKET_ARCH})"
+            return 0
+        fi
+        echo "FAIL (iket, no success marker)"
+        return 1
+    fi
+    # GPU-less or pre-9.0 host: run_cargo built for the sm_90 floor instead;
+    # the bar is a clean build plus a fresh device artifact.
+    if [[ ${ec} -ne 0 ]]; then echo "FAIL (iket, exit=${ec})"; return 1; fi
+    if [[ -s "${ex_dir}/${artifact}.ptx" || -s "${ex_dir}/${artifact}.ll" ]]; then
+        echo "PASS (iket, compiled for ${IKET_ARCH})"
+        return 0
+    fi
+    echo "FAIL (iket, no device artifact for the ${IKET_ARCH} floor)"
     return 1
 }
 
@@ -633,7 +759,11 @@ verdict_compile() {
 EXTRA_RUSTFLAGS=""
 invoke_cargo_oxide() {
     if [[ -n "${EXTRA_RUSTFLAGS}" ]]; then
-        if [[ -v CARGO_ENCODED_RUSTFLAGS ]]; then
+        # `${var+x}` rather than `[[ -v var ]]`, which needs bash 4.2 and is a
+        # *parse* error on the bash 3.2 that macOS ships. Both mean "set, even
+        # if empty" -- not "non-empty", which matters because the branch below
+        # decides on that basis whether to prepend the 0x1f separator.
+        if [[ -n "${CARGO_ENCODED_RUSTFLAGS+x}" ]]; then
             local encoded_flags="${CARGO_ENCODED_RUSTFLAGS}"
             if [[ -n "${encoded_flags}" ]]; then
                 encoded_flags+=$'\x1f'
@@ -1028,7 +1158,10 @@ run_cargo() {
         nvvm_control_cg1="$(awk '/^define .*@compile_tcgen05_control_cg1\(/,/^}/' "${nvvm_ll}" 2>/dev/null)"
         nvvm_control_cg2="$(awk '/^define .*@compile_tcgen05_control_cg2\(/,/^}/' "${nvvm_ll}" 2>/dev/null)"
         local -a nvvm_control_attrs=()
-        mapfile -t nvvm_control_attrs < <(
+        local nvvm_control_attr_line
+        while IFS= read -r nvvm_control_attr_line; do
+            nvvm_control_attrs+=("${nvvm_control_attr_line}")
+        done < <(
             sed -nE '/call void asm sideeffect "tcgen05\.(commit|shift)\.cta_group::[12]/s/.* (#[0-9]+)$/\1/p' \
                 <<<"${nvvm_control_cg1}"$'\n'"${nvvm_control_cg2}"
         )
@@ -1070,7 +1203,10 @@ run_cargo() {
         nvvm_mma_inline_count="$(grep -cE 'call void asm sideeffect ".*tcgen05\.mma' <<<"${nvvm_mma_base}"$'\n'"${nvvm_mma_ws}")"
         nvvm_mma_memory_count="$(grep -E 'call void asm sideeffect ".*tcgen05\.mma' <<<"${nvvm_mma_base}"$'\n'"${nvvm_mma_ws}" | grep -cF '~{memory}')"
         local -a nvvm_mma_attrs=()
-        mapfile -t nvvm_mma_attrs < <(
+        local nvvm_mma_attr_line
+        while IFS= read -r nvvm_mma_attr_line; do
+            nvvm_mma_attrs+=("${nvvm_mma_attr_line}")
+        done < <(
             sed -nE '/call void asm sideeffect ".*tcgen05\.mma/s/.* (#[0-9]+)$/\1/p' \
                 <<<"${nvvm_mma_base}"$'\n'"${nvvm_mma_ws}"
         )
@@ -1331,8 +1467,34 @@ run_cargo() {
     local verb="run"
     if [[ ${COMPILE_ONLY} -eq 1 ]]; then verb="build"; fi
     local -a args=("${verb}" "${ex}")
-    if [[ ${COMPILE_ONLY} -eq 1 && "${ex}" == "cluster" ]]; then
+    if [[ ${COMPILE_ONLY} -eq 1 ]]; then
+        case "${ex}" in
+            cluster) args+=("--arch=sm_90") ;;
+        esac
+    fi
+    if [[ "${cat}" == "iket" ]]; then
+        if [[ ${COMPILE_ONLY} -eq 1 ]]; then
+            # CI lane: pinned floor, artifact-only bar (verdict_compile).
+            args+=("--arch=sm_90")
+        elif [[ ${IKET_EXEC} -eq 1 ]]; then
+            args+=("--arch=${IKET_ARCH}")
+        else
+            # No capable GPU: fall back to a floor-pinned compile-only build.
+            args=("build" "${ex}" "--arch=${IKET_ARCH}")
+        fi
+    fi
+    if [[ ${COMPILE_ONLY} -eq 1 && "${ex}" == "interop_cubin_identity" ]]; then
+        # Cubin-kind interop artifacts require a deliberate target, and a
+        # GPU-less compile-only run has no detected device to satisfy it.
+        # Any concrete arch works: the finalizer (libNVVM + nvJitLink) runs
+        # here too, so this lane exercises the full native-artifact path.
         args+=("--arch=sm_90")
+    fi
+    # kind::mxf8f6f4 admits only sm_120/sm_121 in the generated target
+    # gating, so the device build must always pin sm_120a; the example
+    # itself decides at runtime whether the host GPU can execute it.
+    if [[ "${cat}" == "blackwell-mma" ]]; then
+        args+=("--arch=sm_120a")
     fi
     if [[ "${cat}" == "ltoir" || ( "${cat}" == "auto-nvvm" && ${COMPILE_ONLY} -eq 1 ) ]]; then
         args+=("--emit-nvvm-ir" "--arch=${LTOIR_ARCH}")
@@ -1523,10 +1685,12 @@ for ex in "${selected[@]}"; do
             error)       verdict="$(verdict_error       "${log}" "${ec}" "${ex}")" && status=0 || status=$? ;;
             tcgen05)     verdict="$(verdict_tcgen05     "${log}" "${ec}")"        && status=0 || status=$? ;;
             wgmma)       verdict="$(verdict_wgmma       "${log}" "${ec}")"        && status=0 || status=$? ;;
+            blackwell-mma) verdict="$(verdict_blackwell_mma "${log}" "${ec}")"    && status=0 || status=$? ;;
             ltoir)       verdict="$(verdict_ltoir       "${ex}" "${log}" "${ec}")" && status=0 || status=$? ;;
             ltoir-modern) verdict="$(verdict_ltoir_modern "${ex}" "${log}" "${ec}")" && status=0 || status=$? ;;
             auto-nvvm)   verdict="$(verdict_ltoir       "${ex}" "${log}" "${ec}")" && status=0 || status=$? ;;
-            standard)    verdict="$(verdict_standard    "${log}" "${ec}")"        && status=0 || status=$? ;;
+            iket)        verdict="$(verdict_iket        "${ex}" "${log}" "${ec}")" && status=0 || status=$? ;;
+            standard)    verdict="$(verdict_standard    "${log}" "${ec}" "${ex}")" && status=0 || status=$? ;;
             *)           verdict="FAIL (unknown category: ${cat})"; status=1 ;;
         esac
     fi

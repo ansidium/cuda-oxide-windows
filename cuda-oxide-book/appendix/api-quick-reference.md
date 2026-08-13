@@ -41,10 +41,13 @@ fn helper(x: f32) -> f32 { x * x }
 
 | Attribute                                   | Purpose                                                             |
 |:--------------------------------------------|:--------------------------------------------------------------------|
+| `#[cuda_module]`                            | Collect a module's kernels into a typed host module with a `load` and launchers |
 | `#[kernel]`                                 | Mark a function as a GPU kernel entry point (`.entry` in PTX)       |
 | `#[device]`                                 | Mark a helper function or `extern "C"` block for device compilation |
 | `#[unroll]` / `#[unroll(N)]`               | Request full unrolling, or unrolling by a factor `N >= 2`            |
 | `#[launch_bounds(max_threads, min_blocks)]` | Occupancy hints for register allocation                             |
+| `#[constant]`                               | Place a `ConstantMemory<T>` static in constant memory, with a host `set_<name>` |
+| `#[launch_contract(...)]`                   | Declare the launch shape a kernel requires, unlocking a safe (non-`unsafe`) launch |
 | `#[cluster_launch(x, y, z)]`                | Set compile-time cluster dimensions (Hopper+)                       |
 | `#[cooperative_launch]`                     | Launch cooperatively via `#[cuda_module]` (enables `grid::sync()`)  |
 | `#[convergent]`                             | Mark as convergent (barrier semantics)                              |
@@ -358,24 +361,29 @@ let from_above = warp::shuffle_down_f32(val, delta);
 let from_below = warp::shuffle_up_f32(val, delta);
 let from_lane  = warp::shuffle_f32(val, src_lane);
 
-// i32 variants
-let partner_i = warp::shuffle_xor_i32(val, mask);
+// u32 is the unsuffixed form
+let partner_u = warp::shuffle_xor(val_u32, mask);
 
 // Vote
 let all_true = warp::all(predicate);
 let any_true = warp::any(predicate);
 let mask     = warp::ballot(predicate);
-let count    = warp::popc(mask);
+let count    = warp::popc(predicate); // == ballot(predicate).count_ones()
 ```
 
 ### Shuffle Operations
 
-| Function                              | Description                       |
-|:--------------------------------------|:----------------------------------|
-| `shuffle_xor_{f32,i32}(val, mask)`    | Exchange with lane `id ^ mask`    |
-| `shuffle_down_{f32,i32}(val, delta)`  | Read from lane `id + delta`       |
-| `shuffle_up_{f32,i32}(val, delta)`    | Read from lane `id - delta`       |
-| `shuffle_{f32,i32}(val, src)`         | Read from specific lane           |
+The unsuffixed name takes `u32`; `_f32`, `_f64` and `_u64` are the other
+widths. Each also has a `_sync` form taking an explicit member mask. There is
+no `_i32` variant — reinterpret an `i32` and use the `u32` form, since a
+shuffle moves bits and does not interpret them.
+
+| Function                                    | Description                       |
+|:--------------------------------------------|:----------------------------------|
+| `shuffle_xor(val, mask)` + `_f32/_f64/_u64` | Exchange with lane `id ^ mask`    |
+| `shuffle_down(val, delta)` + `_f32/_f64/_u64` | Read from lane `id + delta`     |
+| `shuffle_up(val, delta)` + `_f32/_f64/_u64` | Read from lane `id - delta`       |
+| `shuffle(val, src)` + `_f32/_f64/_u64`      | Read from specific lane           |
 
 ### Vote Operations
 
@@ -384,7 +392,7 @@ let count    = warp::popc(mask);
 | `all(pred)`    | `bool`   | True if predicate holds for all lanes        |
 | `any(pred)`    | `bool`   | True if predicate holds for any lane         |
 | `ballot(pred)` | `u32`    | Bitmask of lanes where predicate is true     |
-| `popc(mask)`   | `u32`    | Population count of set bits                 |
+| `popc(pred)`   | `u32`    | Count of lanes where predicate is true       |
 
 ---
 
@@ -602,7 +610,7 @@ use cuda_device::debug;
 let t = debug::clock64();       // Cycle counter
 debug::trap();                  // Abort kernel
 debug::breakpoint();            // cuda-gdb breakpoint
-cuda_device::barrier::nanosleep(1000); // Sleep ~1μs
+unsafe { cuda_device::barrier::nanosleep(1000) }; // Sleep ~1μs
 debug::prof_trigger::<7>();     // Nsight profiler trigger
 ```
 
