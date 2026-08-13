@@ -463,6 +463,8 @@ impl CudaContext {
         if prev == 0 && self.event_tracking.load(Ordering::Relaxed) {
             self.synchronize()?;
         }
+        // Bindgen emits CUDA flag enums as signed on MSVC and unsigned on Linux.
+        #[allow(clippy::unnecessary_cast)]
         let flags = cuda_bindings::CUstream_flags_enum_CU_STREAM_NON_BLOCKING as u32;
         let mut cu_stream = MaybeUninit::uninit();
         let cu_stream = unsafe {
@@ -720,8 +722,12 @@ impl CudaContext {
             )
             .result()?;
             let current = current.assume_init();
+            // Bindgen emits CUDA flag enums as signed on MSVC and unsigned on Linux.
+            #[allow(clippy::unnecessary_cast)]
             let sched_mask = cuda_bindings::CUctx_flags_enum_CU_CTX_SCHED_MASK as u32;
-            let new_flags = (current & !sched_mask) | policy.to_raw() as u32;
+            #[allow(clippy::unnecessary_cast)]
+            let policy = policy.to_raw() as u32;
+            let new_flags = (current & !sched_mask) | policy;
             cuda_bindings::cuDevicePrimaryCtxSetFlags_v2(self.cu_device, new_flags).result()
         }
     }

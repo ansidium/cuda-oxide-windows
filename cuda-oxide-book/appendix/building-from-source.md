@@ -21,14 +21,14 @@ from a fresh checkout. If you just want to run an example, the
 The native Windows path is experimental in this fork and does not change the
 Linux build instructions below. It targets `x86_64-pc-windows-msvc`. See the
 [Windows setup doc](../getting-started/windows.md) for the Windows setup
-checklist and [FORK.md](../../FORK.md) for fork policy.
+checklist and [FORK.md](https://github.com/ansidium/cuda-oxide-windows/blob/main/FORK.md)
+for fork policy.
 ```
 
 ## Clone the repository
 
 ```bash
 git clone https://github.com/ansidium/cuda-oxide-windows.git
-git -C cuda-oxide-windows checkout --detach 9c9fd03c8d393b63be4f138329b7c1702a09f62e
 cd cuda-oxide-windows
 ```
 

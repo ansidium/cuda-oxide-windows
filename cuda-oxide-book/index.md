@@ -114,6 +114,7 @@ Schedule across stream pools. Await results with `.await`.
 :caption: Getting Started
 
 getting-started/installation
+getting-started/windows
 getting-started/hello-gpu
 ```
 
