@@ -50,7 +50,7 @@ use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::TypeHandle;
 use pliron::value::Value;
-use rustc_public::mir;
+use rustc_public::{CrateDefType, mir};
 use rustc_public_bridge::IndexedVal;
 
 use crate::error::{TranslationErr, TranslationResult};

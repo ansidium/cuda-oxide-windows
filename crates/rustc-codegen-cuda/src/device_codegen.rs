@@ -99,7 +99,7 @@ use llvm_export::ops::{
     DebugSourceScopeMap,
 };
 use rustc_middle::ty::layout::{LayoutCx, LayoutOf};
-use rustc_middle::ty::{EarlyBinder, InstanceKind, TypingEnv};
+use rustc_middle::ty::{EarlyBinder, InstanceKind, ShimKind, TypingEnv};
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 use rustc_session::config::DebugInfo;
 use rustc_span::{Span, hygiene};
@@ -386,7 +386,7 @@ fn build_debug_source_scope_map<'tcx>(
                 let callee = tcx.instantiate_and_normalize_erasing_regions(
                     func.instance.args,
                     TypingEnv::fully_monomorphized(),
-                    EarlyBinder::bind(callee),
+                    EarlyBinder::bind(tcx, callee),
                 );
                 let callsite = hygiene::walk_chain_collapsed(callsite, mir.span);
                 DebugInlinedScope {
@@ -760,8 +760,10 @@ pub fn generate_device_code<'tcx>(
                     // call, so the function body is dead. Translating it would
                     // fail on IntoIter and similar stdlib shims whose MIR
                     // contains constructs the device pipeline does not support.
-                    if matches!(func.instance.def, InstanceKind::DropGlue(..))
-                        && mir_importer::drop_instance_is_noop(&stable_instance)
+                    if matches!(
+                        func.instance.def,
+                        InstanceKind::Shim(ShimKind::DropGlue(..))
+                    ) && mir_importer::drop_instance_is_noop(&stable_instance)
                     {
                         return None;
                     }

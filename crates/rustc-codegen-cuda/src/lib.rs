@@ -332,9 +332,8 @@ mod materialize;
 
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_codegen_ssa::{CompiledModule, CompiledModules, CrateInfo, ModuleKind};
-use rustc_data_structures::fx::FxIndexMap;
 use rustc_metadata::EncodedMetadata;
-use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
+use rustc_middle::dep_graph::WorkProductMap;
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_session::Session;
@@ -795,7 +794,7 @@ impl CodegenBackend for CudaCodegenBackend {
         sess: &Session,
         outputs: &OutputFilenames,
         crate_info: &CrateInfo,
-    ) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
+    ) -> (CompiledModules, WorkProductMap) {
         let ongoing = *ongoing_codegen
             .downcast::<CudaOngoingCodegen>()
             .expect("rustc_codegen_cuda received unexpected ongoing codegen state");
@@ -807,6 +806,7 @@ impl CodegenBackend for CudaCodegenBackend {
                 name: format!("oxide_artifact_embed_{index}"),
                 kind: ModuleKind::Regular,
                 object: Some(object),
+                global_asm_object: None,
                 dwarf_object: None,
                 bytecode: None,
                 assembly: None,

@@ -56,10 +56,10 @@ use pliron::r#type::{TypeHandle, Typed};
 use pliron::utils::apint::APInt;
 use pliron::value::Value;
 use pliron::{input_err, input_err_noloc, input_error, input_error_noloc};
-use rustc_public::CrateDef;
 use rustc_public::mir;
 use rustc_public::mir::ProjectionElem;
 use rustc_public::ty::{AdtKind, ConstantKind};
+use rustc_public::{CrateDef, CrateDefType};
 use rustc_public_bridge::IndexedVal;
 use std::num::NonZeroUsize;
 

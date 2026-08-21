@@ -132,7 +132,9 @@ use rustc_middle::mir::{
     BasicBlock, ConstOperand, ConstValue, Location, START_BLOCK, TerminatorKind,
 };
 use rustc_middle::mono::{CodegenUnit, MonoItem};
-use rustc_middle::ty::{Instance, InstanceKind, Ty, TyCtxt, TyKind, TypeVisitableExt, TypingEnv};
+use rustc_middle::ty::{
+    Instance, InstanceKind, ShimKind, Ty, TyCtxt, TyKind, TypeVisitableExt, TypingEnv,
+};
 use rustc_span::Span;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -1042,11 +1044,14 @@ impl<'tcx> DeviceCollector<'tcx> {
                 });
 
             // Get MIR body if available. For drop glue shims
-            // (InstanceKind::DropGlue), `is_mir_available` may return false
+            // (ShimKind::DropGlue), `is_mir_available` may return false
             // because the shim is compiler-generated, but `instance_mir`
             // still provides the body.
             let has_mir = self.tcx.is_mir_available(def_id)
-                || matches!(func.instance.def, InstanceKind::DropGlue(..));
+                || matches!(
+                    func.instance.def,
+                    InstanceKind::Shim(ShimKind::DropGlue(..))
+                );
             if has_mir {
                 // Use instance_mir for monomorphized MIR.
                 // This returns OPTIMIZED MIR (post -C opt-level passes).
@@ -1079,7 +1084,10 @@ impl<'tcx> DeviceCollector<'tcx> {
                 // paths (e.g. for assertion failures) that are unreachable
                 // in practice; the mir-importer handles these via its
                 // existing unreachable-block patching.
-                if !matches!(func.instance.def, InstanceKind::DropGlue(..)) {
+                if !matches!(
+                    func.instance.def,
+                    InstanceKind::Shim(ShimKind::DropGlue(..))
+                ) {
                     self.check_panic_machinery(mir, &func, &ctx, &reachable);
                 }
 
@@ -1201,7 +1209,7 @@ impl<'tcx> DeviceCollector<'tcx> {
     /// `Drop` terminators (for fields). These are discovered transitively
     /// when the shim's body is walked by `collect()` on subsequent iterations.
     ///
-    /// Drop glue instances resolve to `InstanceKind::DropGlue`, not
+    /// Drop glue instances resolve to `ShimKind::DropGlue`, not
     /// `InstanceKind::Item`, so the regular `process_call_operand` path
     /// would skip them. This dedicated handler resolves the drop instance
     /// directly and enqueues it.
@@ -1220,17 +1228,17 @@ impl<'tcx> DeviceCollector<'tcx> {
         let place_ty = self.tcx.instantiate_and_normalize_erasing_regions(
             caller.instance.args,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(place_ty),
+            EarlyBinder::bind(self.tcx, place_ty),
         );
 
         // Resolve drop_in_place::<T>. This returns the drop glue shim
-        // (InstanceKind::DropGlue) which wraps the actual Drop::drop call.
+        // (ShimKind::DropGlue) which wraps the actual Drop::drop call.
         let drop_instance = Instance::resolve_drop_glue(self.tcx, place_ty);
 
         // DropGlue(_, None) is an empty shim for types that need no
         // destructor. The mir-importer's no-op analysis will lower these
         // as plain branches, so there's nothing to collect.
-        if let InstanceKind::DropGlue(_, None) = drop_instance.def {
+        if let InstanceKind::Shim(ShimKind::DropGlue(_, None)) = drop_instance.def {
             return;
         }
 
@@ -1374,7 +1382,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         let args = self.tcx.instantiate_and_normalize_erasing_regions(
             caller.instance.args,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(*args),
+            EarlyBinder::bind(self.tcx, *args),
         );
 
         // Check if function is from a crate we should compile
@@ -1502,7 +1510,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         // bodies (e.g. for array/slice element drops) are collected.
         if !matches!(
             resolved.def,
-            InstanceKind::Item(_) | InstanceKind::DropGlue(..)
+            InstanceKind::Item(_) | InstanceKind::Shim(ShimKind::DropGlue(..))
         ) {
             return;
         }
@@ -1510,7 +1518,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         // For DropGlue instances discovered via Call terminators (rather
         // than Drop terminators), route them through the same collection
         // logic as process_drop_place to avoid duplicating the enqueue path.
-        if let InstanceKind::DropGlue(_, Some(_)) = resolved.def {
+        if let InstanceKind::Shim(ShimKind::DropGlue(_, Some(_))) = resolved.def {
             let mangled = self.tcx.symbol_name(resolved).name.to_string();
             if self.seen.contains(&mangled) {
                 return;
@@ -1551,7 +1559,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         }
 
         // Empty drop glue (DropGlue with None type) has no body to collect.
-        if let InstanceKind::DropGlue(_, None) = resolved.def {
+        if let InstanceKind::Shim(ShimKind::DropGlue(_, None)) = resolved.def {
             return;
         }
 

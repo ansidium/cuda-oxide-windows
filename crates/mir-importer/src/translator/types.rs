@@ -39,7 +39,7 @@ use crate::error::{TranslationErr, TranslationResult};
 use pliron::context::Context;
 use pliron::r#type::TypeHandle;
 use pliron::{input_err_noloc, input_error_noloc};
-use rustc_public::CrateDef;
+use rustc_public::{CrateDef, CrateDefType};
 use rustc_public_bridge::IndexedVal;
 
 // Re-export types from dialect_mir for convenience

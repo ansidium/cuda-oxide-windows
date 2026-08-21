@@ -38,8 +38,8 @@ use pliron::r#type::Typed;
 use pliron::utils::apint::APInt;
 use pliron::value::Value;
 use pliron::{input_err, input_error};
-use rustc_public::mir;
 use rustc_public::ty::{RigidTy, Ty, TyKind};
+use rustc_public::{CrateDefType, mir};
 use std::num::NonZeroUsize;
 
 /// `core::intrinsics::{size_of_val, align_of_val}`.

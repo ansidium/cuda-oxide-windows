@@ -43,10 +43,10 @@ use pliron::operation::Operation;
 
 // Re-export rustc_public types for convenience
 use rustc_hash::FxHashMap;
-use rustc_public::CrateDef;
 use rustc_public::mir;
 use rustc_public::mir::mono;
 use rustc_public::ty::{ConstantKind, FloatTy, IntTy, RigidTy, Ty, TyKind, UintTy};
+use rustc_public::{CrateDef, CrateDefType};
 use rustc_public_bridge::IndexedVal;
 
 /// Cluster dimensions extracted from `#[cluster(x,y,z)]` attribute.
