@@ -249,11 +249,14 @@ rustup update stable
 rustup component add rust-src rustc-dev rust-analyzer rustfmt clippy llvm-tools --toolchain stable
 ```
 
-These components are required by the codegen backend and doctor:
+Three of these components are what the codegen backend and doctor need:
 
 - `rust-src` -- source of the Rust standard library, needed for cross-compiling to the NVPTX target.
 - `rustc-dev` -- compiler internals that the backend links against.
 - `llvm-tools` -- toolchain-bundled `llc` used to lower LLVM IR to PTX (doctor's floor check).
+
+The other three are not needed to build: `rust-analyzer` powers IDE support,
+`clippy` is the lint gate CI runs, and `rustfmt` backs `cargo oxide fmt`.
 
 :::{note}
 On Windows MSVC, install the same stable toolchain and components, then confirm
@@ -317,6 +320,7 @@ The full set, as `cargo oxide --help` reports it:
 | `run` | Build and run an example or project |
 | `sanitize` | Build and run an example or project under NVIDIA Compute Sanitizer |
 | `build` | Build an example or project (compile only, don't run) |
+| `fuzz-schedule` | Find schedule-sensitive failures by perturbing an example's generated PTX |
 | `test` | Run Cargo tests through the cuda-oxide backend |
 | `emit-ltoir` | Compile a crate's device code to a binary LTOIR artifact in one step |
 | `pipeline` | Show the full compilation pipeline (MIR -> PTX/NVVM IR) with verbose output |
@@ -338,8 +342,10 @@ cannot:
 # Arguments after `--` go to cargo; with none it is a plain `cargo test`.
 cargo oxide test -- --lib
 
-# Format the root workspace, the codegen backend, and every example. Each has
-# its own [workspace], so a single `cargo fmt` at the root misses most of them.
+# Format every scope the fmt CI gate checks: the root workspace, the codegen
+# backend, the cuda-macros device-only fixture, and every manifest under
+# examples/ including nested ones. Each is its own [workspace], so a single
+# `cargo fmt` at the root misses most of them.
 cargo oxide fmt
 cargo oxide fmt --check
 

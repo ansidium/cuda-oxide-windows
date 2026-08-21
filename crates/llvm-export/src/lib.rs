@@ -505,6 +505,19 @@ pub mod ops {
             size_bits: u64,
             members: Vec<DebugTypeMember>,
         },
+        /// A Rust enum represented with DWARF variant-part metadata.
+        ///
+        /// The top-level enum is a `DW_TAG_structure_type` containing one
+        /// `DW_TAG_variant_part`. Each source variant is described by an
+        /// artificial struct containing its payload fields. `discriminant` is
+        /// absent for single/empty layouts and is the physical tag or niche
+        /// carrier for multi-variant layouts.
+        Enum {
+            name: String,
+            size_bits: u64,
+            discriminant: Option<DebugEnumDiscriminant>,
+            variants: Vec<DebugEnumVariant>,
+        },
         /// A fixed-length array `DICompositeType` (`DW_TAG_array_type`).
         Array {
             name: String,
@@ -523,6 +536,29 @@ pub mod ops {
         pub ty: DebugLocalTypeKind,
     }
 
+    /// Physical enum tag/niche carrier used by `DW_TAG_variant_part`.
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    pub struct DebugEnumDiscriminant {
+        /// Bit offset of the physical carrier within the enum storage.
+        pub offset_bits: u64,
+        /// The physical carrier type. Niche pointer carriers are intentionally
+        /// represented as an unsigned integer of the same width, matching
+        /// rustc's native DWARF strategy.
+        pub ty: Box<DebugLocalTypeKind>,
+    }
+
+    /// One Rust enum source variant.
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    pub struct DebugEnumVariant {
+        pub name: String,
+        /// Physical discriminant value selecting this variant. `None` is used
+        /// for single/empty layouts and for the untagged niche variant.
+        pub discriminant: Option<u64>,
+        /// Payload members at their rustc-reported offsets within the complete
+        /// enum object.
+        pub members: Vec<DebugTypeMember>,
+    }
+
     impl DebugLocalTypeKind {
         /// Size of this type in bits, used to fill `DIDerivedType`/member sizes.
         pub fn size_bits(&self) -> u64 {
@@ -530,6 +566,7 @@ pub mod ops {
                 DebugLocalTypeKind::Basic { size_bits, .. }
                 | DebugLocalTypeKind::Pointer { size_bits, .. }
                 | DebugLocalTypeKind::Struct { size_bits, .. }
+                | DebugLocalTypeKind::Enum { size_bits, .. }
                 | DebugLocalTypeKind::Array { size_bits, .. } => *size_bits,
             }
         }
@@ -590,6 +627,41 @@ pub mod ops {
                     put_str(out, &member.name);
                     put_u64(out, member.offset_bits);
                     serialize_debug_type(&member.ty, out);
+                }
+            }
+            DebugLocalTypeKind::Enum {
+                name,
+                size_bits,
+                discriminant,
+                variants,
+            } => {
+                out.push('e');
+                put_u64(out, *size_bits);
+                put_str(out, name);
+                match discriminant {
+                    Some(discriminant) => {
+                        put_u64(out, 1);
+                        put_u64(out, discriminant.offset_bits);
+                        serialize_debug_type(&discriminant.ty, out);
+                    }
+                    None => put_u64(out, 0),
+                }
+                put_u64(out, variants.len() as u64);
+                for variant in variants {
+                    put_str(out, &variant.name);
+                    match variant.discriminant {
+                        Some(value) => {
+                            put_u64(out, 1);
+                            put_u64(out, value);
+                        }
+                        None => put_u64(out, 0),
+                    }
+                    put_u64(out, variant.members.len() as u64);
+                    for member in &variant.members {
+                        put_str(out, &member.name);
+                        put_u64(out, member.offset_bits);
+                        serialize_debug_type(&member.ty, out);
+                    }
                 }
             }
             DebugLocalTypeKind::Array {
@@ -671,6 +743,52 @@ pub mod ops {
                     members,
                 })
             }
+            b'e' => {
+                let size_bits = take_u64(bytes, pos)?;
+                let name = take_str(bytes, pos)?;
+                let discriminant = match take_u64(bytes, pos)? {
+                    0 => None,
+                    1 => {
+                        let offset_bits = take_u64(bytes, pos)?;
+                        let ty = Box::new(deserialize_debug_type(bytes, pos)?);
+                        Some(DebugEnumDiscriminant { offset_bits, ty })
+                    }
+                    _ => return None,
+                };
+                let variant_count = take_u64(bytes, pos)? as usize;
+                let mut variants = Vec::with_capacity(variant_count);
+                for _ in 0..variant_count {
+                    let variant_name = take_str(bytes, pos)?;
+                    let discriminant_value = match take_u64(bytes, pos)? {
+                        0 => None,
+                        1 => Some(take_u64(bytes, pos)?),
+                        _ => return None,
+                    };
+                    let member_count = take_u64(bytes, pos)? as usize;
+                    let mut members = Vec::with_capacity(member_count);
+                    for _ in 0..member_count {
+                        let member_name = take_str(bytes, pos)?;
+                        let offset_bits = take_u64(bytes, pos)?;
+                        let ty = deserialize_debug_type(bytes, pos)?;
+                        members.push(DebugTypeMember {
+                            name: member_name,
+                            offset_bits,
+                            ty,
+                        });
+                    }
+                    variants.push(DebugEnumVariant {
+                        name: variant_name,
+                        discriminant: discriminant_value,
+                        members,
+                    });
+                }
+                Some(DebugLocalTypeKind::Enum {
+                    name,
+                    size_bits,
+                    discriminant,
+                    variants,
+                })
+            }
             b'a' => {
                 let size_bits = take_u64(bytes, pos)?;
                 let name = take_str(bytes, pos)?;
@@ -693,6 +811,70 @@ pub mod ops {
         pub name: String,
         pub argument_index: Option<u16>,
         pub ty: DebugLocalTypeKind,
+    }
+
+    /// One scalarized fragment of a source variable.
+    ///
+    /// `offset_bits` and `size_bits` use LLVM's `DW_OP_LLVM_fragment` units and
+    /// describe where this storage/value belongs inside the complete source
+    /// variable. Fragments with zero size are rejected when decoded.
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub struct DebugFragment {
+        pub offset_bits: u64,
+        pub size_bits: u64,
+    }
+
+    /// A source variable reconstructed from one scalarized MIR storage/value.
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    pub struct DebugFragmentVariableInfo {
+        pub variable: DebugLocalVariableInfo,
+        pub fragment: DebugFragment,
+        pub source_scope: Option<u32>,
+        pub declaration: Option<DebugSourcePosition>,
+    }
+
+    /// One operation in a multi-value LLVM debug expression.
+    ///
+    /// `Arg(N)` selects the Nth operand from the `DIArgList`. The remaining
+    /// operations are the small DWARF subset needed to combine addresses and
+    /// runtime scalar state without exposing raw expression strings to callers.
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    pub enum DebugValueExpressionOp {
+        Arg(u32),
+        ConstU(u64),
+        Plus,
+        PlusUConst(u64),
+        Mul,
+        Deref,
+        StackValue,
+    }
+
+    /// Ordered operations for a multi-value `llvm.dbg.value` location recipe.
+    #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+    pub struct DebugValueExpression {
+        pub operations: Vec<DebugValueExpressionOp>,
+    }
+
+    impl DebugValueExpression {
+        pub fn new(operations: Vec<DebugValueExpressionOp>) -> Self {
+            Self { operations }
+        }
+    }
+
+    /// A source variable whose storage is a supported projection of a MIR local.
+    ///
+    /// `offset_bytes` is measured from the current address after an optional
+    /// leading thin-pointer/reference dereference. The textual LLVM exporter emits
+    /// `DW_OP_deref` when `dereference_base` is set, then `DW_OP_plus_uconst` for a
+    /// non-zero offset. Dynamic indices, repeated dereferences, slices/fat pointers,
+    /// and enum downcasts are intentionally not represented.
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    pub struct DebugProjectedVariableInfo {
+        pub variable: DebugLocalVariableInfo,
+        pub dereference_base: bool,
+        pub offset_bytes: u64,
+        pub source_scope: Option<u32>,
+        pub declaration: Option<DebugSourcePosition>,
     }
 
     /// A source position small enough to carry through cuda-oxide attrs.
@@ -746,6 +928,9 @@ pub mod ops {
     const DEBUG_LOCAL_DECL_LINE_KEY: &str = "cuda_oxide_debug_local_decl_line";
     const DEBUG_LOCAL_DECL_COLUMN_KEY: &str = "cuda_oxide_debug_local_decl_column";
     const DEBUG_LOCAL_SCOPE_KEY: &str = "cuda_oxide_debug_local_scope";
+    const DEBUG_PROJECTED_COUNT_KEY: &str = "cuda_oxide_debug_projected_count";
+    const DEBUG_FRAGMENT_COUNT_KEY: &str = "cuda_oxide_debug_fragment_count";
+    const DEBUG_VALUE_EXPRESSION_KEY: &str = "cuda_oxide_debug_value_expression";
     const DEBUG_SOURCE_SCOPE_COUNT_KEY: &str = "cuda_oxide_debug_scope_count";
     const DEBUG_SOURCE_SCOPE_LOCATION_COUNT_KEY: &str = "cuda_oxide_debug_scope_location_count";
     /// Op-attribute key for ordinary volatile `load` / `store` operations.
@@ -845,6 +1030,283 @@ pub mod ops {
         })
     }
 
+    /// Attach every source variable described by a static projection of this slot.
+    pub fn set_debug_projected_variables(
+        ctx: &mut Context,
+        op: Ptr<Operation>,
+        projected: &[DebugProjectedVariableInfo],
+    ) {
+        set_string_attr(
+            ctx,
+            op,
+            DEBUG_PROJECTED_COUNT_KEY,
+            projected.len().to_string(),
+        );
+
+        for (index, info) in projected.iter().enumerate() {
+            set_string_attr(
+                ctx,
+                op,
+                &debug_projected_key(index, "name"),
+                info.variable.name.clone(),
+            );
+            if let Some(argument_index) = info.variable.argument_index {
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_projected_key(index, "arg"),
+                    argument_index.to_string(),
+                );
+            }
+
+            let mut encoded = String::new();
+            serialize_debug_type(&info.variable.ty, &mut encoded);
+            set_string_attr(ctx, op, &debug_projected_key(index, "type"), encoded);
+            set_string_attr(
+                ctx,
+                op,
+                &debug_projected_key(index, "deref"),
+                u8::from(info.dereference_base).to_string(),
+            );
+            set_string_attr(
+                ctx,
+                op,
+                &debug_projected_key(index, "offset"),
+                info.offset_bytes.to_string(),
+            );
+            if let Some(source_scope) = info.source_scope {
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_projected_key(index, "scope"),
+                    source_scope.to_string(),
+                );
+            }
+            if let Some(declaration) = &info.declaration {
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_projected_key(index, "file"),
+                    declaration.file.to_string_lossy().into_owned(),
+                );
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_projected_key(index, "line"),
+                    declaration.line.to_string(),
+                );
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_projected_key(index, "column"),
+                    declaration.column.to_string(),
+                );
+            }
+        }
+    }
+
+    /// Read the static-projection source variables attached to a local slot.
+    ///
+    /// Malformed entries are skipped individually. The count is capped so a bad
+    /// internal attribute cannot turn export into an unbounded scan.
+    pub fn debug_projected_variables(
+        ctx: &Context,
+        op: Ptr<Operation>,
+    ) -> Vec<DebugProjectedVariableInfo> {
+        let count = get_string_attr(ctx, op, DEBUG_PROJECTED_COUNT_KEY)
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or(0);
+        if count > 1024 {
+            return Vec::new();
+        }
+
+        let mut projected = Vec::with_capacity(count);
+        for index in 0..count {
+            let Some(name) = get_string_attr(ctx, op, &debug_projected_key(index, "name")) else {
+                continue;
+            };
+            let argument_index = get_string_attr(ctx, op, &debug_projected_key(index, "arg"))
+                .and_then(|arg| arg.parse::<u16>().ok());
+            let Some(encoded) = get_string_attr(ctx, op, &debug_projected_key(index, "type"))
+            else {
+                continue;
+            };
+            let mut pos = 0;
+            let Some(ty) = deserialize_debug_type(encoded.as_bytes(), &mut pos) else {
+                continue;
+            };
+            if pos != encoded.len() {
+                continue;
+            }
+            let dereference_base = get_string_attr(ctx, op, &debug_projected_key(index, "deref"))
+                .is_some_and(|value| value == "1");
+            let Some(offset_bytes) =
+                get_string_attr(ctx, op, &debug_projected_key(index, "offset"))
+                    .and_then(|offset| offset.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let source_scope = get_string_attr(ctx, op, &debug_projected_key(index, "scope"))
+                .and_then(|scope| scope.parse::<u32>().ok());
+            let declaration = debug_projected_declaration(ctx, op, index);
+
+            projected.push(DebugProjectedVariableInfo {
+                variable: DebugLocalVariableInfo {
+                    name,
+                    argument_index,
+                    ty,
+                },
+                dereference_base,
+                offset_bytes,
+                source_scope,
+                declaration,
+            });
+        }
+        projected
+    }
+
+    /// Attach every scalarized source-variable fragment backed by this slot/value.
+    pub fn set_debug_fragment_variables(
+        ctx: &mut Context,
+        op: Ptr<Operation>,
+        fragments: &[DebugFragmentVariableInfo],
+    ) {
+        set_string_attr(
+            ctx,
+            op,
+            DEBUG_FRAGMENT_COUNT_KEY,
+            fragments.len().to_string(),
+        );
+
+        for (index, info) in fragments.iter().enumerate() {
+            set_string_attr(
+                ctx,
+                op,
+                &debug_fragment_key(index, "name"),
+                info.variable.name.clone(),
+            );
+            if let Some(argument_index) = info.variable.argument_index {
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_fragment_key(index, "arg"),
+                    argument_index.to_string(),
+                );
+            }
+
+            let mut encoded = String::new();
+            serialize_debug_type(&info.variable.ty, &mut encoded);
+            set_string_attr(ctx, op, &debug_fragment_key(index, "type"), encoded);
+            set_string_attr(
+                ctx,
+                op,
+                &debug_fragment_key(index, "offset_bits"),
+                info.fragment.offset_bits.to_string(),
+            );
+            set_string_attr(
+                ctx,
+                op,
+                &debug_fragment_key(index, "size_bits"),
+                info.fragment.size_bits.to_string(),
+            );
+            if let Some(source_scope) = info.source_scope {
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_fragment_key(index, "scope"),
+                    source_scope.to_string(),
+                );
+            }
+            if let Some(declaration) = &info.declaration {
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_fragment_key(index, "file"),
+                    declaration.file.to_string_lossy().into_owned(),
+                );
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_fragment_key(index, "line"),
+                    declaration.line.to_string(),
+                );
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_fragment_key(index, "column"),
+                    declaration.column.to_string(),
+                );
+            }
+        }
+    }
+
+    /// Read scalarized source-variable fragments attached to a slot/value.
+    pub fn debug_fragment_variables(
+        ctx: &Context,
+        op: Ptr<Operation>,
+    ) -> Vec<DebugFragmentVariableInfo> {
+        let count = get_string_attr(ctx, op, DEBUG_FRAGMENT_COUNT_KEY)
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or(0);
+        if count > 1024 {
+            return Vec::new();
+        }
+
+        let mut fragments = Vec::with_capacity(count);
+        for index in 0..count {
+            let Some(name) = get_string_attr(ctx, op, &debug_fragment_key(index, "name")) else {
+                continue;
+            };
+            let argument_index = get_string_attr(ctx, op, &debug_fragment_key(index, "arg"))
+                .and_then(|arg| arg.parse::<u16>().ok());
+            let Some(encoded) = get_string_attr(ctx, op, &debug_fragment_key(index, "type")) else {
+                continue;
+            };
+            let mut pos = 0;
+            let Some(ty) = deserialize_debug_type(encoded.as_bytes(), &mut pos) else {
+                continue;
+            };
+            if pos != encoded.len() {
+                continue;
+            }
+            let Some(offset_bits) =
+                get_string_attr(ctx, op, &debug_fragment_key(index, "offset_bits"))
+                    .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let Some(size_bits) = get_string_attr(ctx, op, &debug_fragment_key(index, "size_bits"))
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let Some(end_bits) = offset_bits.checked_add(size_bits) else {
+                continue;
+            };
+            if size_bits == 0 || end_bits > ty.size_bits() {
+                continue;
+            }
+            let source_scope = get_string_attr(ctx, op, &debug_fragment_key(index, "scope"))
+                .and_then(|scope| scope.parse::<u32>().ok());
+            let declaration = debug_fragment_declaration(ctx, op, index);
+
+            fragments.push(DebugFragmentVariableInfo {
+                variable: DebugLocalVariableInfo {
+                    name,
+                    argument_index,
+                    ty,
+                },
+                fragment: DebugFragment {
+                    offset_bits,
+                    size_bits,
+                },
+                source_scope,
+                declaration,
+            });
+        }
+        fragments
+    }
+
     /// Rust-local provenance for the post-optimization local-memory diagnostic.
     ///
     /// `mir-importer` attaches this to the `mir.alloca` of every named Rust
@@ -903,6 +1365,85 @@ pub mod ops {
     /// Read the MIR source-scope id that owns this source local.
     pub fn debug_local_source_scope(ctx: &Context, op: Ptr<Operation>) -> Option<u32> {
         get_string_attr(ctx, op, DEBUG_LOCAL_SCOPE_KEY).and_then(|scope| scope.parse().ok())
+    }
+
+    /// Attach a typed multi-value location expression to a debug marker.
+    pub fn set_debug_value_expression(
+        ctx: &mut Context,
+        op: Ptr<Operation>,
+        expression: &DebugValueExpression,
+    ) {
+        set_string_attr(
+            ctx,
+            op,
+            DEBUG_VALUE_EXPRESSION_KEY,
+            encode_debug_value_expression(expression),
+        );
+    }
+
+    /// Read a typed multi-value location expression from a debug marker.
+    pub fn debug_value_expression(
+        ctx: &Context,
+        op: Ptr<Operation>,
+    ) -> Option<DebugValueExpression> {
+        let encoded = get_string_attr(ctx, op, DEBUG_VALUE_EXPRESSION_KEY)?;
+        decode_debug_value_expression(&encoded)
+    }
+
+    fn encode_debug_value_expression(expression: &DebugValueExpression) -> String {
+        let mut encoded = String::from("v1");
+        for operation in &expression.operations {
+            encoded.push(' ');
+            match operation {
+                DebugValueExpressionOp::Arg(index) => {
+                    encoded.push_str("arg:");
+                    encoded.push_str(&index.to_string());
+                }
+                DebugValueExpressionOp::ConstU(value) => {
+                    encoded.push_str("constu:");
+                    encoded.push_str(&value.to_string());
+                }
+                DebugValueExpressionOp::Plus => encoded.push_str("plus"),
+                DebugValueExpressionOp::PlusUConst(value) => {
+                    encoded.push_str("plus_uconst:");
+                    encoded.push_str(&value.to_string());
+                }
+                DebugValueExpressionOp::Mul => encoded.push_str("mul"),
+                DebugValueExpressionOp::Deref => encoded.push_str("deref"),
+                DebugValueExpressionOp::StackValue => encoded.push_str("stack_value"),
+            }
+        }
+        encoded
+    }
+
+    fn decode_debug_value_expression(encoded: &str) -> Option<DebugValueExpression> {
+        let mut tokens = encoded.split_ascii_whitespace();
+        if tokens.next()? != "v1" {
+            return None;
+        }
+
+        let mut operations = Vec::new();
+        for token in tokens {
+            let operation = if let Some(index) = token.strip_prefix("arg:") {
+                DebugValueExpressionOp::Arg(index.parse::<u32>().ok()?)
+            } else if let Some(value) = token.strip_prefix("constu:") {
+                DebugValueExpressionOp::ConstU(value.parse::<u64>().ok()?)
+            } else if token == "plus" {
+                DebugValueExpressionOp::Plus
+            } else if let Some(value) = token.strip_prefix("plus_uconst:") {
+                DebugValueExpressionOp::PlusUConst(value.parse::<u64>().ok()?)
+            } else if token == "mul" {
+                DebugValueExpressionOp::Mul
+            } else if token == "deref" {
+                DebugValueExpressionOp::Deref
+            } else if token == "stack_value" {
+                DebugValueExpressionOp::StackValue
+            } else {
+                return None;
+            };
+            operations.push(operation);
+        }
+        Some(DebugValueExpression { operations })
     }
 
     /// Attach a function's MIR source-scope table.
@@ -1169,6 +1710,58 @@ pub mod ops {
         Some(DebugSourcePosition { file, line, column })
     }
 
+    fn debug_projected_key(index: usize, field: &str) -> String {
+        format!("cuda_oxide_debug_projected_{index}_{field}")
+    }
+
+    fn debug_fragment_key(index: usize, field: &str) -> String {
+        format!("cuda_oxide_debug_fragment_{index}_{field}")
+    }
+
+    fn debug_projected_declaration(
+        ctx: &Context,
+        op: Ptr<Operation>,
+        index: usize,
+    ) -> Option<DebugSourcePosition> {
+        let file = PathBuf::from(get_string_attr(
+            ctx,
+            op,
+            &debug_projected_key(index, "file"),
+        )?);
+        let line = get_string_attr(ctx, op, &debug_projected_key(index, "line"))?
+            .parse()
+            .ok()?;
+        let column = get_string_attr(ctx, op, &debug_projected_key(index, "column"))?
+            .parse()
+            .ok()?;
+        if line <= 0 || column <= 0 {
+            return None;
+        }
+        Some(DebugSourcePosition { file, line, column })
+    }
+
+    fn debug_fragment_declaration(
+        ctx: &Context,
+        op: Ptr<Operation>,
+        index: usize,
+    ) -> Option<DebugSourcePosition> {
+        let file = PathBuf::from(get_string_attr(
+            ctx,
+            op,
+            &debug_fragment_key(index, "file"),
+        )?);
+        let line = get_string_attr(ctx, op, &debug_fragment_key(index, "line"))?
+            .parse()
+            .ok()?;
+        let column = get_string_attr(ctx, op, &debug_fragment_key(index, "column"))?
+            .parse()
+            .ok()?;
+        if line <= 0 || column <= 0 {
+            return None;
+        }
+        Some(DebugSourcePosition { file, line, column })
+    }
+
     fn debug_scope_key(scope: u32, field: &str) -> String {
         format!("cuda_oxide_debug_scope_{scope}_{field}")
     }
@@ -1223,6 +1816,34 @@ pub mod ops {
     }
 
     impl Verify for DebugValueOp {
+        fn verify(&self, _ctx: &Context) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// LLVM multi-value debug marker used by the textual exporter.
+    ///
+    /// The operands form the ordered `DIArgList`; a `DebugValueExpression`
+    /// attached to the op selects and combines them with `DW_OP_LLVM_arg`.
+    #[pliron_op(
+        name = "llvm.dbg_value_list",
+        format,
+        interfaces = [NResultsInterface<0>]
+    )]
+    pub struct DebugValueListOp;
+
+    impl DebugValueListOp {
+        pub fn new(ctx: &mut Context, values: Vec<Value>) -> Self {
+            let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], values, vec![], 0);
+            DebugValueListOp { op }
+        }
+
+        pub fn values(&self, ctx: &Context) -> Vec<Value> {
+            self.get_operation().deref(ctx).operands().collect()
+        }
+    }
+
+    impl Verify for DebugValueListOp {
         fn verify(&self, _ctx: &Context) -> Result<(), Error> {
             Ok(())
         }
@@ -1437,9 +2058,9 @@ pub mod ops {
     #[cfg(test)]
     mod tests {
         use super::{
-            DebugLocalTypeKind, DebugTypeMember, GlobalInitializerRelocation,
-            decode_global_initializer_relocations, deserialize_debug_type,
-            encode_global_initializer_relocations, serialize_debug_type,
+            DebugEnumDiscriminant, DebugEnumVariant, DebugLocalTypeKind, DebugTypeMember,
+            GlobalInitializerRelocation, decode_global_initializer_relocations,
+            deserialize_debug_type, encode_global_initializer_relocations, serialize_debug_type,
         };
 
         fn round_trip(ty: &DebugLocalTypeKind) -> DebugLocalTypeKind {
@@ -1493,6 +2114,43 @@ pub mod ops {
                     },
                 ],
             };
+            assert_eq!(round_trip(&ty), ty);
+        }
+
+        #[test]
+        fn round_trips_enum_variant_metadata() {
+            let ty = DebugLocalTypeKind::Enum {
+                name: "Option<&u32>".to_string(),
+                size_bits: 64,
+                discriminant: Some(DebugEnumDiscriminant {
+                    offset_bits: 0,
+                    ty: Box::new(DebugLocalTypeKind::Basic {
+                        name: "usize".to_string(),
+                        size_bits: 64,
+                        encoding: "DW_ATE_unsigned",
+                    }),
+                }),
+                variants: vec![
+                    DebugEnumVariant {
+                        name: "None".to_string(),
+                        discriminant: Some(0),
+                        members: vec![],
+                    },
+                    DebugEnumVariant {
+                        name: "Some".to_string(),
+                        discriminant: None,
+                        members: vec![DebugTypeMember {
+                            name: "0".to_string(),
+                            offset_bits: 0,
+                            ty: DebugLocalTypeKind::Pointer {
+                                name: "&u32".to_string(),
+                                size_bits: 64,
+                            },
+                        }],
+                    },
+                ],
+            };
+
             assert_eq!(round_trip(&ty), ty);
         }
 

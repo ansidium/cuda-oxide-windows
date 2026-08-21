@@ -113,6 +113,7 @@ use pliron::r#type::{TypeHandle, type_cast};
 use super::enum_payload_storage::{
     MAX_ENUM_PAYLOAD_ARRAY_REWRITE_LEAVES, enum_payload_storage_type,
 };
+use super::target_stable_storage::{StorageRewriteOptions, target_stable_storage_type};
 use crate::type_conversion_interface::MirTypeConversion;
 
 // =============================================================================
@@ -219,16 +220,17 @@ pub fn convert_type(ctx: &mut Context, ty: TypeHandle) -> Result<TypeHandle, any
     ))
 }
 
-/// Return the single non-ZST field of a rustc-proven transparent scalar struct.
+/// Return the declaration index and type of the single non-ZST field of a
+/// rustc-proven transparent scalar struct.
 ///
 /// The importer marks the outer ABI from rustc rather than inferring it from
 /// source field count. We still validate the MIR shape here so malformed or
 /// hand-written dialect input cannot turn an arbitrary aggregate into a scalar
-/// kernel parameter.
-pub(crate) fn transparent_scalar_field(
+/// ABI value.
+fn transparent_scalar_field_with_index(
     ctx: &mut Context,
     struct_ty: TypeHandle,
-) -> Result<TypeHandle, anyhow::Error> {
+) -> Result<(usize, TypeHandle), anyhow::Error> {
     let (name, field_types, mem_to_decl, is_transparent_scalar) = {
         let ty_ref = struct_ty.deref(ctx);
         let s = ty_ref
@@ -256,7 +258,7 @@ pub(crate) fn transparent_scalar_field(
         if is_zero_sized_type(ctx, converted) {
             continue;
         }
-        if scalar_field.replace(field_ty).is_some() {
+        if scalar_field.replace((decl_idx, field_ty)).is_some() {
             return Err(anyhow::anyhow!(
                 "transparent scalar struct `{}` has more than one non-ZST field",
                 name
@@ -268,7 +270,90 @@ pub(crate) fn transparent_scalar_field(
         .ok_or_else(|| anyhow::anyhow!("transparent scalar struct `{}` has no non-ZST field", name))
 }
 
-/// LLVM parameter type for a rustc-proven transparent scalar struct.
+/// Return the single non-ZST field of a rustc-proven transparent scalar struct.
+pub(crate) fn transparent_scalar_field(
+    ctx: &mut Context,
+    struct_ty: TypeHandle,
+) -> Result<TypeHandle, anyhow::Error> {
+    Ok(transparent_scalar_field_with_index(ctx, struct_ty)?.1)
+}
+
+/// One aggregate layer traversed when a transparent scalar wrapper crosses an
+/// ABI boundary. `field_slot` is the LLVM struct slot containing the next
+/// nested wrapper or the final scalar.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TransparentScalarLayer {
+    pub llvm_struct_ty: TypeHandle,
+    pub field_slot: u32,
+}
+
+/// Complete ABI projection for a rustc-proven transparent scalar wrapper.
+///
+/// `layers` are ordered outermost to innermost. A return lowers by extracting
+/// those slots in order; a call result is rebuilt by inserting the scalar into
+/// the same layers in reverse order.
+#[derive(Clone, Debug)]
+pub(crate) struct TransparentScalarAbiInfo {
+    pub scalar_ty: TypeHandle,
+    pub layers: Vec<TransparentScalarLayer>,
+}
+
+/// Build the scalar ABI projection, including the exact LLVM slot used at every
+/// wrapper layer.
+///
+/// Slot indices come from [`build_struct_slot_map`], so ZST markers, explicit
+/// padding, and rustc memory order cannot make the return/call paths disagree
+/// with ordinary aggregate conversion.
+pub(crate) fn transparent_scalar_abi_info(
+    ctx: &mut Context,
+    struct_ty: TypeHandle,
+) -> Result<TransparentScalarAbiInfo, anyhow::Error> {
+    let mut current = struct_ty;
+    let mut layers = Vec::new();
+
+    loop {
+        let (decl_idx, field_ty) = transparent_scalar_field_with_index(ctx, current)?;
+        let layout = {
+            let ty_ref = current.deref(ctx);
+            let s = ty_ref.downcast_ref::<MirStructType>().ok_or_else(|| {
+                anyhow::anyhow!("transparent scalar ABI requires a MirStructType")
+            })?;
+            StructLayoutInfo::of_struct(s)
+        };
+        let map = build_struct_slot_map(ctx, &layout)?;
+        let field_slot = map.decl_to_llvm[decl_idx].ok_or_else(|| {
+            anyhow::anyhow!(
+                "transparent scalar field {} unexpectedly lowered as a ZST",
+                decl_idx
+            )
+        })?;
+        layers.push(TransparentScalarLayer {
+            llvm_struct_ty: map.llvm_struct_ty,
+            field_slot,
+        });
+
+        let nested_transparent = {
+            let field_ref = field_ty.deref(ctx);
+            field_ref
+                .downcast_ref::<MirStructType>()
+                .is_some_and(MirStructType::is_transparent_scalar)
+        };
+        if nested_transparent {
+            current = field_ty;
+            continue;
+        }
+
+        let scalar_ty = convert_type(ctx, field_ty)?;
+        if is_zero_sized_type(ctx, scalar_ty) {
+            return Err(anyhow::anyhow!(
+                "transparent scalar ABI resolved to a zero-sized field"
+            ));
+        }
+        return Ok(TransparentScalarAbiInfo { scalar_ty, layers });
+    }
+}
+
+/// LLVM ABI type for a rustc-proven transparent scalar struct.
 ///
 /// Transparent wrappers can nest (`Outer(Inner(u32))`). rustc still reports
 /// the outer ADT as one scalar, so recurse through transparent scalar fields
@@ -277,18 +362,203 @@ pub(crate) fn transparent_scalar_llvm_type(
     ctx: &mut Context,
     struct_ty: TypeHandle,
 ) -> Result<TypeHandle, anyhow::Error> {
-    let field_ty = transparent_scalar_field(ctx, struct_ty)?;
-    let nested_transparent = {
-        let field_ref = field_ty.deref(ctx);
-        field_ref
-            .downcast_ref::<MirStructType>()
-            .is_some_and(MirStructType::is_transparent_scalar)
-    };
-    if nested_transparent {
-        transparent_scalar_llvm_type(ctx, field_ty)
-    } else {
-        convert_type(ctx, field_ty)
+    Ok(transparent_scalar_abi_info(ctx, struct_ty)?.scalar_ty)
+}
+
+/// Target-stable ABI projection for packed aggregates containing AS3 leaves
+/// across the internal device return boundary.
+///
+/// The function body continues to use the semantic packed LLVM struct with
+/// shared pointers. Only the physical return value recursively replaces AS3
+/// leaves with generic pointers, whose width is stable across the legacy/PTX
+/// and modern NVVM data layouts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackedSharedInternalAbiInfo {
+    pub semantic_ty: TypeHandle,
+    pub storage_ty: TypeHandle,
+}
+
+/// Maximum number of shared-pointer leaves introduced by fixed-array expansion
+/// in one packed-AS3 internal return carrier.
+///
+/// Struct/tuple nesting and direct pointer leaves remain proportional to source
+/// structure. Arrays can encode an arbitrarily large number of per-element
+/// extract/cast/insert sequences compactly, so only array-expanded AS3 leaves
+/// count against this code-shape budget.
+pub(crate) const MAX_PACKED_SHARED_INTERNAL_ABI_ARRAY_REWRITE_LEAVES: u64 = 16;
+
+/// Whether a MIR type converts to a zero-sized LLVM type.
+///
+/// MIR-side mirror of [`is_zero_sized_type`]: zero-length arrays, arrays of
+/// zero-sized elements, and structs/tuples whose fields are all zero-sized
+/// (including empty ones such as `PhantomData`) vanish at the LLVM level and
+/// must not affect ABI-lane classification.
+fn mir_type_is_zero_sized(ctx: &Context, ty: TypeHandle) -> bool {
+    let ty_ref = ty.deref(ctx);
+    if let Some(array_ty) = ty_ref.downcast_ref::<MirArrayType>() {
+        return array_ty.size() == 0 || mir_type_is_zero_sized(ctx, array_ty.element_type());
     }
+    if let Some(struct_ty) = ty_ref.downcast_ref::<MirStructType>() {
+        return struct_ty
+            .field_types
+            .iter()
+            .all(|field| mir_type_is_zero_sized(ctx, *field));
+    }
+    if let Some(tuple_ty) = ty_ref.downcast_ref::<MirTupleType>() {
+        return tuple_ty
+            .get_types()
+            .iter()
+            .all(|field| mir_type_is_zero_sized(ctx, *field));
+    }
+    false
+}
+
+/// Whether a MIR value shape belongs to the recursive packed-AS3 ABI lane.
+///
+/// Structs, tuples, and fixed arrays may nest recursively and may contain any
+/// number of scalar pointer leaves. Zero-sized fields are skipped, matching the
+/// post-conversion field scan this predicate replaced. The array-specific
+/// expansion budget is enforced after conversion from the storage rewrite's
+/// exact AS3 leaf count. Vectors and unrelated aggregate kinds remain
+/// deliberately fail-closed.
+fn packed_shared_internal_abi_mir_shape_is_supported(ctx: &Context, mir_ty: TypeHandle) -> bool {
+    let children = {
+        let ty_ref = mir_ty.deref(ctx);
+        if ty_ref.is::<IntegerType>()
+            || ty_ref.is::<MirFP16Type>()
+            || ty_ref.is::<llvm_types::HalfType>()
+            || ty_ref.is::<FP32Type>()
+            || ty_ref.is::<FP64Type>()
+            || ty_ref.is::<MirPtrType>()
+            || ty_ref.is::<llvm_types::PointerType>()
+        {
+            return true;
+        }
+        if let Some(struct_ty) = ty_ref.downcast_ref::<MirStructType>() {
+            Some(struct_ty.field_types.clone())
+        } else if let Some(tuple_ty) = ty_ref.downcast_ref::<MirTupleType>() {
+            Some(tuple_ty.get_types().to_vec())
+        } else {
+            ty_ref
+                .downcast_ref::<MirArrayType>()
+                .map(|array_ty| vec![array_ty.element_type()])
+        }
+    };
+
+    children.is_some_and(|children| {
+        children.into_iter().all(|child| {
+            mir_type_is_zero_sized(ctx, child)
+                || packed_shared_internal_abi_mir_shape_is_supported(ctx, child)
+        })
+    })
+}
+
+/// Recognize a recursive packed-AS3 internal ABI shape.
+///
+/// The root must remain a byte-faithful packed struct. Nested structs/tuples,
+/// multiple AS3 leaves, and bounded fixed arrays are admitted. Vectors and
+/// unrelated aggregate kinds remain out of scope. The target-stable storage
+/// utility owns the recursive AS3 -> generic rewrite and this classifier only
+/// decides which semantic shapes may use it.
+pub(crate) fn packed_shared_internal_abi_info(
+    ctx: &mut Context,
+    mir_ty: TypeHandle,
+) -> Result<Option<PackedSharedInternalAbiInfo>, anyhow::Error> {
+    let layout = {
+        let ty_ref = mir_ty.deref(ctx);
+        let Some(struct_ty) = ty_ref.downcast_ref::<MirStructType>() else {
+            return Ok(None);
+        };
+        StructLayoutInfo::of_struct(struct_ty)
+    };
+
+    if !packed_shared_internal_abi_mir_shape_is_supported(ctx, mir_ty) {
+        return Ok(None);
+    }
+
+    let map = build_struct_slot_map(ctx, &layout)?;
+    if !map.by_value_layout_faithful {
+        return Ok(None);
+    }
+    let is_packed = map
+        .llvm_struct_ty
+        .deref(ctx)
+        .downcast_ref::<llvm_types::StructType>()
+        .is_some_and(|struct_ty| struct_ty.layout() == llvm_types::StructLayout::Packed);
+    if !is_packed {
+        return Ok(None);
+    }
+
+    let rewrite = target_stable_storage_type(
+        ctx,
+        map.llvm_struct_ty,
+        StorageRewriteOptions {
+            canonicalize_bool: false,
+        },
+        "packed shared internal ABI",
+    )?;
+    if rewrite.shared_pointer_leaves == 0
+        || rewrite.array_shared_pointer_leaves > MAX_PACKED_SHARED_INTERNAL_ABI_ARRAY_REWRITE_LEAVES
+    {
+        return Ok(None);
+    }
+    let Some((storage_size, _)) = llvm_type_size_align(ctx, rewrite.ty) else {
+        return Ok(None);
+    };
+    if layout.total_size > 0 && storage_size != layout.total_size {
+        return Ok(None);
+    }
+
+    Ok(Some(PackedSharedInternalAbiInfo {
+        semantic_ty: map.llvm_struct_ty,
+        storage_ty: rewrite.ty,
+    }))
+}
+
+/// Convert a type that crosses a function boundary as one LLVM value.
+///
+/// A struct with a natural-layout divergence is legal by value only when
+/// [`build_struct_slot_map`] proved that a sequential packed LLVM struct
+/// reproduces rustc's offsets and size. This keeps overlapping/union-like
+/// legacy struct models fail-closed while allowing real `repr(packed)` values.
+/// Packed values containing shared-memory pointers remain target-dependent
+/// because AS3 pointer width differs between modern NVVM and PTX/legacy modes.
+fn convert_by_value_abi_type(
+    ctx: &mut Context,
+    mir_ty: TypeHandle,
+    role: &str,
+) -> Result<TypeHandle, anyhow::Error> {
+    let layout = {
+        let ty_ref = mir_ty.deref(ctx);
+        ty_ref
+            .downcast_ref::<MirStructType>()
+            .map(StructLayoutInfo::of_struct)
+    };
+    let llvm_ty = if let Some(layout) = layout {
+        let map = build_struct_slot_map(ctx, &layout)?;
+        if !map.by_value_layout_faithful {
+            return Err(anyhow::anyhow!(
+                "{} has a rustc struct layout that cannot be represented by an LLVM struct value",
+                role
+            ));
+        }
+        map.llvm_struct_ty
+    } else {
+        convert_type(ctx, mir_ty)?
+    };
+
+    if llvm_packed_struct_contains_pointer_in_address_space(
+        ctx,
+        llvm_ty,
+        llvm_types::address_space::SHARED,
+    ) {
+        return Err(anyhow::anyhow!(
+            "{} contains a packed aggregate with a target-dependent shared-memory pointer",
+            role
+        ));
+    }
+
+    Ok(llvm_ty)
 }
 
 /// Convert a MIR function type to an LLVM function type.
@@ -332,6 +602,7 @@ pub(crate) fn transparent_scalar_llvm_type(
 ///
 /// - Empty tuple `()` becomes `void`
 /// - Empty struct `struct {}` becomes `void`
+/// - Rustc-proven `repr(transparent)` scalar ADTs return the underlying scalar
 /// - Other types are converted normally
 ///
 /// # Arguments
@@ -453,7 +724,11 @@ pub fn convert_function_type(
                 // Flatten in MEMORY ORDER to match struct layout
                 for mem_idx in 0..field_types.len() {
                     let decl_idx = mem_to_decl[mem_idx];
-                    let converted = convert_type(ctx, field_types[decl_idx])?;
+                    let converted = convert_by_value_abi_type(
+                        ctx,
+                        field_types[decl_idx],
+                        "by-value function argument",
+                    )?;
                     // Skip ZST fields - NVPTX can't handle empty params
                     if !is_zero_sized_type(ctx, converted) {
                         inputs.push(converted);
@@ -464,7 +739,7 @@ pub fn convert_function_type(
                 inputs.push(transparent_scalar_llvm_type(ctx, struct_ty)?);
             }
             FlattenKind::None => {
-                let converted = convert_type(ctx, t)?;
+                let converted = convert_by_value_abi_type(ctx, t, "by-value function argument")?;
                 // Skip ZST args - NVPTX can't handle empty params
                 if !is_zero_sized_type(ctx, converted) {
                     inputs.push(converted);
@@ -473,13 +748,30 @@ pub fn convert_function_type(
         }
     }
 
-    // Convert return type, treating empty tuple/struct as void
+    // Convert return type. A rustc-proven transparent scalar wrapper uses
+    // the underlying scalar at the function ABI boundary, while its body
+    // continues to use the ordinary converted aggregate representation.
     let ret_ty = if results_ptr.is_empty() {
         llvm_types::VoidType::get(ctx).into()
     } else {
-        let ty = convert_type(ctx, results_ptr[0])?;
-        // Check if zero-sized (empty struct or struct with only ZST fields)
-        // Note: convert_type already strips ZST fields, so we just check for empty
+        let mir_ret_ty = results_ptr[0];
+        let is_transparent_scalar = {
+            let ty_ref = mir_ret_ty.deref(ctx);
+            ty_ref
+                .downcast_ref::<MirStructType>()
+                .is_some_and(MirStructType::is_transparent_scalar)
+        };
+        let ty = if is_transparent_scalar {
+            transparent_scalar_llvm_type(ctx, mir_ret_ty)?
+        } else if !is_kernel_entry {
+            match packed_shared_internal_abi_info(ctx, mir_ret_ty)? {
+                Some(abi) => abi.storage_ty,
+                None => convert_by_value_abi_type(ctx, mir_ret_ty, "by-value function return")?,
+            }
+        } else {
+            convert_by_value_abi_type(ctx, mir_ret_ty, "by-value function return")?
+        };
+        // Check if zero-sized (empty struct or struct with only ZST fields).
         if is_zero_sized_type(ctx, ty) {
             llvm_types::VoidType::get(ctx).into()
         } else {
@@ -561,14 +853,43 @@ pub(crate) struct StructSlotMap {
     /// `llvm_struct_ty`, padding slots included; `None` when some field type
     /// cannot be sized ([`llvm_type_size_align`] declined).
     pub natural_slot_offsets: Option<Vec<u64>>,
-    /// True when the natural LLVM struct layout cannot honor rustc's recorded
-    /// layout: some field's natural slot offset differs from rustc's byte
-    /// offset, or the natural struct size differs from rustc's total size.
-    /// `repr(packed)` is the canonical case. Address-path consumers fall back
-    /// to byte offsets from the aggregate pointer; value-path consumers
-    /// (construct, whole-value load/store) must fail closed, because an SSA
-    /// value of the natural struct type places fields at the wrong bytes.
+    /// True when rustc's recorded byte layout cannot be represented by a
+    /// naturally laid-out LLVM struct: some field's natural slot offset differs
+    /// from rustc's byte offset, or the natural struct size differs from
+    /// rustc's total size. `repr(packed)` is the canonical case. Address-path
+    /// consumers retain this signal and the natural offsets so the #859
+    /// byte-GEP fallback stays stable for packed field projections.
     pub layout_diverges: bool,
+    /// True when the selected LLVM struct representation reproduces rustc's
+    /// recorded field offsets and total size for by-value movement. Natural
+    /// layouts are faithful when they do not diverge; divergent layouts are
+    /// faithful only when a sequential LLVM packed struct can express them.
+    /// Overlapping/union-like legacy struct models therefore remain false.
+    pub by_value_layout_faithful: bool,
+}
+
+/// Whether a `MirStructType` value lowers to a byte-faithful LLVM struct:
+/// either its natural LLVM layout already matches rustc's offsets and total
+/// size, or the packed-with-explicit-padding representation reproduces them
+/// exactly.
+///
+/// Public only as a coupling oracle for mir-importer: its constant-promotion
+/// gate must never admit a struct layout whose converted storage falls back
+/// to a divergent natural layout, because a promoted constant's byte image
+/// would then disagree with every typed read through the converted struct.
+/// mir-importer asserts agreement against this function in its tests.
+pub fn struct_value_lowering_is_byte_faithful(
+    ctx: &mut Context,
+    struct_ty: TypeHandle,
+) -> Result<bool, anyhow::Error> {
+    let layout = {
+        let ty_ref = struct_ty.deref(ctx);
+        let mir_struct = ty_ref
+            .downcast_ref::<MirStructType>()
+            .ok_or_else(|| anyhow::anyhow!("expected a MirStructType"))?;
+        StructLayoutInfo::of_struct(mir_struct)
+    };
+    Ok(build_struct_slot_map(ctx, &layout)?.by_value_layout_faithful)
 }
 
 /// Lower a struct/tuple layout to its LLVM struct type and slot map.
@@ -700,12 +1021,58 @@ pub(crate) fn build_struct_slot_map(
         }
     }
 
+    // A packed LLVM struct is sequential with alignment 1. That faithfully
+    // represents repr(packed) only when the sequential packed offsets and
+    // final byte count exactly match rustc's metadata. A divergent layout can
+    // also be an old union-like/overlapping model; selecting Packed for such a
+    // shape would merely turn one incorrect sequential layout into another.
+    let packed_walk = if layout_diverges && has_explicit_layout {
+        let mut offsets = Vec::with_capacity(llvm_fields.len());
+        let mut end = 0u64;
+        let mut sizeable = true;
+        for &field in &llvm_fields {
+            offsets.push(end);
+            let Some((field_size, _)) = llvm_type_size_align(ctx, field) else {
+                sizeable = false;
+                break;
+            };
+            let Some(next) = end.checked_add(field_size) else {
+                sizeable = false;
+                break;
+            };
+            end = next;
+        }
+        sizeable.then_some((offsets, end))
+    } else {
+        None
+    };
+    let packed_representable = packed_walk.as_ref().is_some_and(|(offsets, end)| {
+        *end == layout.total_size
+            && decl_to_llvm
+                .iter()
+                .enumerate()
+                .all(|(decl_idx, slot)| match slot {
+                    Some(slot) => offsets[*slot as usize] == layout.field_offsets[decl_idx],
+                    None => true,
+                })
+    });
+
+    let struct_layout = if packed_representable {
+        llvm_types::StructLayout::Packed
+    } else {
+        llvm_types::StructLayout::Unpacked
+    };
+    let llvm_struct_ty: TypeHandle =
+        llvm_types::StructType::get_unnamed(ctx, (llvm_fields, struct_layout)).into();
+    let by_value_layout_faithful = !layout_diverges || packed_representable;
+
     Ok(StructSlotMap {
-        llvm_struct_ty: llvm_types::StructType::get_unnamed(ctx, llvm_fields).into(),
+        llvm_struct_ty,
         decl_to_llvm,
         field_llvm_types,
         natural_slot_offsets,
         layout_diverges,
+        by_value_layout_faithful,
     })
 }
 
@@ -865,7 +1232,11 @@ pub(crate) fn build_union_storage_type(
             storage_fields.push(make_padding_type(ctx, size));
         }
     }
-    let storage: TypeHandle = llvm_types::StructType::get_unnamed(ctx, storage_fields).into();
+    let storage: TypeHandle = llvm_types::StructType::get_unnamed(
+        ctx,
+        (storage_fields, llvm_types::StructLayout::Unpacked),
+    )
+    .into();
     let (llvm_size, llvm_align) = llvm_type_size_align(ctx, storage).ok_or_else(|| {
         anyhow::anyhow!(
             "union `{}` storage has unsupported LLVM layout",
@@ -1039,15 +1410,20 @@ fn collect_llvm_pointer_storage(
         }
         if let Some(struct_ty) = ty_ref.downcast_ref::<llvm_types::StructType>() {
             let fields: Vec<_> = struct_ty.fields().collect();
+            let packed = struct_ty.layout() == llvm_types::StructLayout::Packed;
             let mut end = 0u64;
             for field in fields {
                 let (field_size, field_align) = llvm_type_size_align(ctx, field)?;
-                let field_align = field_align.max(1);
-                let remainder = end % field_align;
-                let field_offset = if remainder == 0 {
+                let field_offset = if packed {
                     end
                 } else {
-                    end.checked_add(field_align - remainder)?
+                    let field_align = field_align.max(1);
+                    let remainder = end % field_align;
+                    if remainder == 0 {
+                        end
+                    } else {
+                        end.checked_add(field_align - remainder)?
+                    }
                 };
                 collect(ctx, field, base_offset.checked_add(field_offset)?, out)?;
                 end = field_offset.checked_add(field_size)?;
@@ -1180,6 +1556,53 @@ pub(crate) fn llvm_type_contains_pointer_in_address_space(
     false
 }
 
+/// Whether a physical by-value image contains a packed struct whose bytes
+/// include a pointer in `address_space`.
+///
+/// Direct pointers in an unpacked aggregate do not trigger this predicate:
+/// their ABI can preserve address-space semantics without observing the
+/// pointer's raw storage width. A pointer nested anywhere under an LLVM packed
+/// struct does trigger it because whole-value construction/load/store/ABI
+/// traffic observes that packed physical image. This distinction keeps normal
+/// AS3 aggregate handling intact while rejecting the target-dependent packed
+/// case (modern NVVM p3:32 versus 64-bit PTX/legacy).
+pub(crate) fn llvm_packed_struct_contains_pointer_in_address_space(
+    ctx: &Context,
+    ty: TypeHandle,
+    address_space: u32,
+) -> bool {
+    let ty_ref = ty.deref(ctx);
+    if let Some(array) = ty_ref.downcast_ref::<llvm_types::ArrayType>() {
+        return llvm_packed_struct_contains_pointer_in_address_space(
+            ctx,
+            array.elem_type(),
+            address_space,
+        );
+    }
+    if let Some(vector) = ty_ref.downcast_ref::<llvm_types::VectorType>() {
+        return llvm_packed_struct_contains_pointer_in_address_space(
+            ctx,
+            vector.elem_type(),
+            address_space,
+        );
+    }
+    if let Some(struct_ty) = ty_ref.downcast_ref::<llvm_types::StructType>() {
+        let fields: Vec<_> = struct_ty.fields().collect();
+        if struct_ty.layout() == llvm_types::StructLayout::Packed
+            && fields
+                .iter()
+                .copied()
+                .any(|field| llvm_type_contains_pointer_in_address_space(ctx, field, address_space))
+        {
+            return true;
+        }
+        return fields.into_iter().any(|field| {
+            llvm_packed_struct_contains_pointer_in_address_space(ctx, field, address_space)
+        });
+    }
+    false
+}
+
 /// Whether this is an aggregate/vector that contains LLVM `i1` storage.
 ///
 /// Rust `bool` is an SSA `i1`, but its memory representation is one complete
@@ -1225,7 +1648,10 @@ pub(crate) fn llvm_byte_faithful_twin(ctx: &mut Context, ty: TypeHandle) -> Opti
     enum Shape {
         Bool,
         Array(TypeHandle, u64),
-        Struct(Vec<TypeHandle>),
+        Struct {
+            fields: Vec<TypeHandle>,
+            layout: llvm_types::StructLayout,
+        },
         Other,
     }
     let shape = {
@@ -1238,7 +1664,10 @@ pub(crate) fn llvm_byte_faithful_twin(ctx: &mut Context, ty: TypeHandle) -> Opti
         } else if let Some(array) = ty_ref.downcast_ref::<llvm_types::ArrayType>() {
             Shape::Array(array.elem_type(), array.size())
         } else if let Some(struct_ty) = ty_ref.downcast_ref::<llvm_types::StructType>() {
-            Shape::Struct(struct_ty.fields().collect())
+            Shape::Struct {
+                fields: struct_ty.fields().collect(),
+                layout: struct_ty.layout(),
+            }
         } else {
             Shape::Other
         }
@@ -1249,12 +1678,12 @@ pub(crate) fn llvm_byte_faithful_twin(ctx: &mut Context, ty: TypeHandle) -> Opti
             let twin = llvm_byte_faithful_twin(ctx, elem)?;
             Some(llvm_types::ArrayType::get(ctx, twin, count).into())
         }
-        Shape::Struct(fields) => {
+        Shape::Struct { fields, layout } => {
             let twins = fields
                 .into_iter()
                 .map(|field| llvm_byte_faithful_twin(ctx, field))
                 .collect::<Option<Vec<_>>>()?;
-            Some(llvm_types::StructType::get_unnamed(ctx, twins).into())
+            Some(llvm_types::StructType::get_unnamed(ctx, (twins, layout)).into())
         }
         Shape::Other => None,
     }
@@ -1320,6 +1749,12 @@ pub(crate) fn llvm_type_is_byte_faithful(ctx: &Context, ty: TypeHandle) -> bool 
     }
     if let Some(struct_ty) = ty_ref.downcast_ref::<llvm_types::StructType>() {
         let fields: Vec<_> = struct_ty.fields().collect();
+        if struct_ty.layout() == llvm_types::StructLayout::Packed {
+            return fields
+                .into_iter()
+                .all(|field| llvm_type_is_byte_faithful(ctx, field));
+        }
+
         let mut end = 0u64;
         let mut max_align = 1u64;
         for field in fields {
@@ -1533,6 +1968,15 @@ pub(crate) fn llvm_type_size_align(ctx: &Context, ty: TypeHandle) -> Option<(u64
     }
     if let Some(struct_ty) = ty_ref.downcast_ref::<llvm_types::StructType>() {
         let fields: Vec<_> = struct_ty.fields().collect();
+        if struct_ty.layout() == llvm_types::StructLayout::Packed {
+            let mut size = 0u64;
+            for field in fields {
+                let (field_size, _) = llvm_type_size_align(ctx, field)?;
+                size = size.checked_add(field_size)?;
+            }
+            return Some((size, 1));
+        }
+
         let (_end, size, align) = natural_struct_layout(ctx, &fields)?;
         return Some((size, align));
     }
@@ -2076,7 +2520,11 @@ pub(crate) fn build_enum_slot_map(
         .map(|c| c.map(|ci| slot_of_claim[ci]))
         .collect();
     Ok(EnumSlotMap {
-        llvm_struct_ty: llvm_types::StructType::get_unnamed(ctx, llvm_fields).into(),
+        llvm_struct_ty: llvm_types::StructType::get_unnamed(
+            ctx,
+            (llvm_fields, llvm_types::StructLayout::Unpacked),
+        )
+        .into(),
         carrier_slot: carrier_claim.map(|claim| slot_of_claim[claim]),
         carrier_llvm_ty: carrier_ty,
         field_slots,
@@ -2203,6 +2651,201 @@ pub(crate) fn validate_initialized_global_layout(
         ));
     }
 
+    Ok(())
+}
+
+/// Validate an initialized global that carries pointer relocations.
+///
+/// Ordinary initialized globals keep their existing conservative semantic
+/// layout validator. Relocated globals use a separate segmented physical
+/// carrier, so a top-level `repr(packed)` struct may use that relocation path
+/// as long as rustc's field ranges are explicit, non-overlapping, and in-bounds.
+/// One direct nested struct may use the same relaxation when the top-level
+/// struct itself has an ordinary, non-divergent LLVM layout and the child's
+/// LLVM packed representation exactly reproduces rustc's offsets and size. A
+/// packed top-level struct may not stack the relaxation on a packed child, and
+/// deeper packed nesting remains on the ordinary fail-closed path.
+pub(crate) fn validate_relocated_initialized_global_layout(
+    ctx: &mut Context,
+    mir_ty: TypeHandle,
+    initializer_size: u64,
+    initializer_align: u64,
+) -> Result<(), anyhow::Error> {
+    match validate_initialized_global_layout(ctx, mir_ty, initializer_size, initializer_align) {
+        Ok(()) => Ok(()),
+        Err(original_error) => {
+            if initializer_align == 0 || !initializer_align.is_power_of_two() {
+                return Err(original_error);
+            }
+
+            let struct_ty = {
+                let ty_ref = mir_ty.deref(ctx);
+                ty_ref.downcast_ref::<MirStructType>().cloned()
+            };
+            let Some(struct_ty) = struct_ty else {
+                return Err(original_error);
+            };
+            if !struct_ty.has_explicit_layout()
+                || struct_ty.total_size() != initializer_size
+                || struct_ty.abi_align != initializer_align
+            {
+                return Err(original_error);
+            }
+
+            validate_relocated_struct_field_ranges(ctx, &struct_ty)?;
+
+            let top_level_layout = StructLayoutInfo::of_struct(&struct_ty);
+            let top_level_map = build_struct_slot_map(ctx, &top_level_layout)?;
+            let top_level_is_ordinary = !top_level_map.layout_diverges
+                && top_level_map.by_value_layout_faithful
+                && top_level_map
+                    .llvm_struct_ty
+                    .deref(ctx)
+                    .downcast_ref::<llvm_types::StructType>()
+                    .is_some_and(|ty| ty.layout() == llvm_types::StructLayout::Unpacked);
+
+            let mut visited = vec![mir_ty];
+            for field_ty in struct_ty.field_types.iter().copied() {
+                if top_level_is_ordinary {
+                    validate_relocated_initialized_global_child(ctx, field_ty, &mut visited)?;
+                } else {
+                    validate_initialized_global_type(ctx, field_ty, &mut visited)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Prove that rustc's explicit field ranges for a relocated top-level struct
+/// are non-overlapping and fit within the evaluated allocation.
+fn validate_relocated_struct_field_ranges(
+    ctx: &mut Context,
+    struct_ty: &MirStructType,
+) -> Result<(), anyhow::Error> {
+    let layout = StructLayoutInfo::of_struct(struct_ty);
+
+    // Relocated globals relax only natural LLVM placement. Preserve the
+    // ordinary struct-layout metadata invariants before accepting rustc's
+    // explicit byte ranges as the physical initializer contract.
+    build_struct_slot_map(ctx, &layout)?;
+
+    let mut ranges = Vec::with_capacity(layout.field_types.len());
+    for (decl_index, field_ty) in layout.field_types.iter().copied().enumerate() {
+        let field_size = if let Some(size) = mir_stored_size(ctx, field_ty) {
+            size
+        } else {
+            let llvm_ty = convert_type(ctx, field_ty)?;
+            llvm_type_size_align(ctx, llvm_ty)
+                .map(|(size, _)| size)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "relocated initialized struct `{}` field {} has unsupported size",
+                        struct_ty.name(),
+                        decl_index
+                    )
+                })?
+        };
+        if field_size == 0 {
+            continue;
+        }
+
+        let start = layout.field_offsets[decl_index];
+        let end = start.checked_add(field_size).ok_or_else(|| {
+            anyhow::anyhow!(
+                "relocated initialized struct `{}` field {} range overflows",
+                struct_ty.name(),
+                decl_index
+            )
+        })?;
+        if end > layout.total_size {
+            return Err(anyhow::anyhow!(
+                "relocated initialized struct `{}` field {} occupies bytes {}..{}, but the allocation is only {} bytes",
+                struct_ty.name(),
+                decl_index,
+                start,
+                end,
+                layout.total_size
+            ));
+        }
+        ranges.push((start, end, decl_index));
+    }
+
+    ranges.sort_by_key(|(start, _, _)| *start);
+    for pair in ranges.windows(2) {
+        let (_, previous_end, previous_index) = pair[0];
+        let (next_start, _, next_index) = pair[1];
+        if next_start < previous_end {
+            return Err(anyhow::anyhow!(
+                "relocated initialized struct `{}` fields {} and {} overlap in rustc's byte layout",
+                struct_ty.name(),
+                previous_index,
+                next_index
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate one direct child of an ordinary relocated initialized global.
+///
+/// The ordinary initialized-global validator remains the default. Only when it
+/// rejects a direct `MirStructType` do we consider the relocation-specific
+/// relaxation, and only if `build_struct_slot_map` proves that the divergent
+/// rustc layout is represented exactly by an LLVM packed struct. Its own field
+/// ranges must still be explicit, non-overlapping, and in-bounds. Children of
+/// that packed struct go back through the ordinary validator, deliberately
+/// limiting this exception to one nesting level.
+fn validate_relocated_initialized_global_child(
+    ctx: &mut Context,
+    mir_ty: TypeHandle,
+    visited: &mut Vec<TypeHandle>,
+) -> Result<(), anyhow::Error> {
+    if visited.contains(&mir_ty) {
+        return Ok(());
+    }
+
+    let mut ordinary_visited = visited.clone();
+    let original_error = match validate_initialized_global_type(ctx, mir_ty, &mut ordinary_visited)
+    {
+        Ok(()) => {
+            *visited = ordinary_visited;
+            return Ok(());
+        }
+        Err(error) => error,
+    };
+
+    let struct_ty = {
+        let ty_ref = mir_ty.deref(ctx);
+        ty_ref.downcast_ref::<MirStructType>().cloned()
+    };
+    let Some(struct_ty) = struct_ty else {
+        return Err(original_error);
+    };
+    if !struct_ty.has_explicit_layout() {
+        return Err(original_error);
+    }
+
+    let layout = StructLayoutInfo::of_struct(&struct_ty);
+    let map = build_struct_slot_map(ctx, &layout)?;
+    let is_exact_packed = map.layout_diverges
+        && map.by_value_layout_faithful
+        && map
+            .llvm_struct_ty
+            .deref(ctx)
+            .downcast_ref::<llvm_types::StructType>()
+            .is_some_and(|ty| ty.layout() == llvm_types::StructLayout::Packed);
+    if !is_exact_packed {
+        return Err(original_error);
+    }
+
+    validate_relocated_struct_field_ranges(ctx, &struct_ty)?;
+
+    visited.push(mir_ty);
+    for field_ty in struct_ty.field_types.iter().copied() {
+        validate_initialized_global_type(ctx, field_ty, visited)?;
+    }
     Ok(())
 }
 
@@ -2511,7 +3154,14 @@ pub(crate) fn get_type_size(ctx: &Context, ty: TypeHandle) -> u64 {
 pub(crate) fn make_slice_struct(ctx: &mut Context) -> TypeHandle {
     let ptr_ty = llvm_types::PointerType::get_generic(ctx);
     let len_ty = IntegerType::get(ctx, 64, Signedness::Signless);
-    llvm_types::StructType::get_unnamed(ctx, vec![ptr_ty.into(), len_ty.into()]).into()
+    llvm_types::StructType::get_unnamed(
+        ctx,
+        (
+            vec![ptr_ty.into(), len_ty.into()],
+            llvm_types::StructLayout::Unpacked,
+        ),
+    )
+    .into()
 }
 
 /// The fat pointer, followed by an index space's runtime layout fields.
@@ -2531,7 +3181,10 @@ pub(crate) fn make_disjoint_slice_struct(
     for space_ty in space_tys {
         fields.push(convert_type(ctx, *space_ty)?);
     }
-    Ok(llvm_types::StructType::get_unnamed(ctx, fields).into())
+    Ok(
+        llvm_types::StructType::get_unnamed(ctx, (fields, llvm_types::StructLayout::Unpacked))
+            .into(),
+    )
 }
 
 #[cfg(test)]
@@ -2543,7 +3196,7 @@ mod tests {
     use super::*;
     use dialect_mir::types::{
         EnumEncoding, EnumVariant, MirArrayType, MirEnumType, MirPtrType, MirStructType,
-        MirTupleType, MirUnionType,
+        MirTupleType, MirUnionType, StructAbiKind,
     };
 
     fn make_ctx() -> Context {
@@ -2579,6 +3232,93 @@ mod tests {
             .expect("expected an LLVM struct type")
             .fields()
             .collect()
+    }
+
+    fn transparent_u32(ctx: &mut Context, name: &str) -> TypeHandle {
+        let u32_ty = mir_uint(ctx, 32);
+        MirStructType::get_with_full_layout_and_abi(
+            ctx,
+            name.into(),
+            vec!["value".into()],
+            vec![u32_ty],
+            vec![0],
+            vec![0],
+            4,
+            4,
+            StructAbiKind::TransparentScalar,
+        )
+        .into()
+    }
+
+    #[test]
+    fn transparent_scalar_return_type_uses_underlying_scalar() {
+        let mut ctx = make_ctx();
+        let wrapper = transparent_u32(&mut ctx, "Scalar");
+        let func_ty = FunctionType::get(&ctx, vec![], vec![wrapper]);
+
+        let lowered = convert_function_type(&mut ctx, func_ty, false).unwrap();
+        let result_ty = lowered.deref(&ctx).result_type();
+        let result_ty_ref = result_ty.deref(&ctx);
+        let integer = result_ty_ref
+            .downcast_ref::<IntegerType>()
+            .expect("transparent u32 return must lower to an integer");
+        assert_eq!(integer.width(), 32);
+    }
+
+    #[test]
+    fn nested_transparent_scalar_abi_records_each_rebuild_layer() {
+        let mut ctx = make_ctx();
+        let inner = transparent_u32(&mut ctx, "Inner");
+        let outer: TypeHandle = MirStructType::get_with_full_layout_and_abi(
+            &mut ctx,
+            "Outer".into(),
+            vec!["inner".into()],
+            vec![inner],
+            vec![0],
+            vec![0],
+            4,
+            4,
+            StructAbiKind::TransparentScalar,
+        )
+        .into();
+
+        let info = transparent_scalar_abi_info(&mut ctx, outer).unwrap();
+        let scalar_ty_ref = info.scalar_ty.deref(&ctx);
+        let integer = scalar_ty_ref
+            .downcast_ref::<IntegerType>()
+            .expect("nested transparent wrapper must resolve to u32");
+        assert_eq!(integer.width(), 32);
+        assert_eq!(info.layers.len(), 2);
+        assert_eq!(info.layers[0].field_slot, 0);
+        assert_eq!(info.layers[1].field_slot, 0);
+    }
+
+    #[test]
+    fn ordinary_one_field_return_remains_aggregate() {
+        let mut ctx = make_ctx();
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let ordinary: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Ordinary".into(),
+            vec!["value".into()],
+            vec![u32_ty],
+            vec![0],
+            vec![0],
+            4,
+            4,
+        )
+        .into();
+        let func_ty = FunctionType::get(&ctx, vec![], vec![ordinary]);
+
+        let lowered = convert_function_type(&mut ctx, func_ty, false).unwrap();
+        assert!(
+            lowered
+                .deref(&ctx)
+                .result_type()
+                .deref(&ctx)
+                .is::<llvm_types::StructType>(),
+            "ordinary one-field structs must not be scalarized"
+        );
     }
 
     #[test]
@@ -4186,6 +4926,61 @@ mod tests {
     }
 
     #[test]
+    fn slot_map_uses_packed_layout_when_natural_offsets_diverge() {
+        let mut ctx = make_ctx();
+        let tag = mir_uint(&mut ctx, 8);
+        let value = mir_uint(&mut ctx, 32);
+        let layout = StructLayoutInfo {
+            field_types: vec![tag, value],
+            mem_to_decl: vec![0, 1],
+            field_offsets: vec![0, 1],
+            total_size: 5,
+        };
+
+        let map = build_struct_slot_map(&mut ctx, &layout).unwrap();
+
+        assert!(map.layout_diverges);
+        assert_eq!(map.decl_to_llvm, vec![Some(0), Some(1)]);
+        let llvm_struct_ty_ref = map.llvm_struct_ty.deref(&ctx);
+        let struct_ty = llvm_struct_ty_ref
+            .downcast_ref::<llvm_types::StructType>()
+            .expect("slot map must produce an LLVM struct");
+        assert_eq!(struct_ty.layout(), llvm_types::StructLayout::Packed);
+        assert_eq!(llvm_type_size_align(&ctx, map.llvm_struct_ty), Some((5, 1)));
+    }
+
+    #[test]
+    fn slot_map_packed_two_keeps_explicit_padding_slot() {
+        let mut ctx = make_ctx();
+        let tag = mir_uint(&mut ctx, 8);
+        let value = mir_uint(&mut ctx, 32);
+        let layout = StructLayoutInfo {
+            field_types: vec![tag, value],
+            mem_to_decl: vec![0, 1],
+            field_offsets: vec![0, 2],
+            total_size: 6,
+        };
+
+        let map = build_struct_slot_map(&mut ctx, &layout).unwrap();
+
+        assert!(map.layout_diverges);
+        assert_eq!(map.decl_to_llvm, vec![Some(0), Some(2)]);
+        let i8s = llvm_int(&mut ctx, 8);
+        let i32s = llvm_int(&mut ctx, 32);
+        let pad1 = pad(&mut ctx, 1);
+        assert_eq!(
+            struct_fields(&ctx, map.llvm_struct_ty),
+            vec![i8s, pad1, i32s]
+        );
+        let llvm_struct_ty_ref = map.llvm_struct_ty.deref(&ctx);
+        let struct_ty = llvm_struct_ty_ref
+            .downcast_ref::<llvm_types::StructType>()
+            .expect("slot map must produce an LLVM struct");
+        assert_eq!(struct_ty.layout(), llvm_types::StructLayout::Packed);
+        assert_eq!(llvm_type_size_align(&ctx, map.llvm_struct_ty), Some((6, 1)));
+    }
+
+    #[test]
     fn slot_map_reorder_plus_padding() {
         let mut ctx = make_ctx();
         // struct { a: u8 @ 8, b: u64 @ 0 }, memory order [b, a], size 16:
@@ -4284,8 +5079,14 @@ mod tests {
         let i32s = llvm_int(&mut ctx, 32);
         let i64s = llvm_int(&mut ctx, 64);
         let enum_pad3 = pad(&mut ctx, 3);
-        let enum_llvm: TypeHandle =
-            llvm_types::StructType::get_unnamed(&ctx, vec![i8s, enum_pad3, i32s]).into();
+        let enum_llvm: TypeHandle = llvm_types::StructType::get_unnamed(
+            &ctx,
+            (
+                vec![i8s, enum_pad3, i32s],
+                llvm_types::StructLayout::Unpacked,
+            ),
+        )
+        .into();
         assert_eq!(
             struct_fields(&ctx, map.llvm_struct_ty),
             vec![enum_llvm, i64s, i32s, i32s]
@@ -4328,6 +5129,379 @@ mod tests {
         assert_eq!(fields.len(), 3, "exactly one (trailing) pad slot");
         let pad7 = pad(&mut ctx, 7);
         assert_eq!(fields[2], pad7);
+    }
+
+    #[test]
+    fn packed_shared_pointer_predicate_ignores_unpacked_direct_pointer() {
+        let ctx = make_ctx();
+        let shared: TypeHandle =
+            llvm_types::PointerType::get(&ctx, llvm_types::address_space::SHARED).into();
+        let unpacked: TypeHandle = llvm_types::StructType::get_unnamed(
+            &ctx,
+            (vec![shared], llvm_types::StructLayout::Unpacked),
+        )
+        .into();
+        assert!(
+            !llvm_packed_struct_contains_pointer_in_address_space(
+                &ctx,
+                unpacked,
+                llvm_types::address_space::SHARED,
+            ),
+            "a direct AS3 pointer in an unpacked aggregate is not a packed physical-image hazard"
+        );
+
+        let packed: TypeHandle = llvm_types::StructType::get_unnamed(
+            &ctx,
+            (vec![shared], llvm_types::StructLayout::Packed),
+        )
+        .into();
+        assert!(
+            llvm_packed_struct_contains_pointer_in_address_space(
+                &ctx,
+                packed,
+                llvm_types::address_space::SHARED,
+            ),
+            "an AS3 pointer under a packed struct must be rejected by by-value paths"
+        );
+    }
+
+    #[test]
+    fn packed_shared_internal_abi_genericizes_one_direct_shared_pointer() {
+        let mut ctx = make_ctx();
+        let tag = mir_uint(&mut ctx, 8);
+        let pointee = mir_uint(&mut ctx, 32);
+        let shared: TypeHandle = MirPtrType::get_shared(&mut ctx, pointee, false).into();
+        let packed: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedShared".into(),
+            vec!["tag".into(), "ptr".into()],
+            vec![tag, shared],
+            vec![0, 1],
+            vec![0, 1],
+            9,
+            1,
+        )
+        .into();
+
+        let abi = packed_shared_internal_abi_info(&mut ctx, packed)
+            .expect("ABI classification must succeed")
+            .expect("one direct packed AS3 pointer must use the internal carrier");
+        assert_eq!(llvm_type_size_align(&ctx, abi.semantic_ty), Some((9, 1)));
+        assert_eq!(llvm_type_size_align(&ctx, abi.storage_ty), Some((9, 1)));
+        assert!(llvm_packed_struct_contains_pointer_in_address_space(
+            &ctx,
+            abi.semantic_ty,
+            llvm_types::address_space::SHARED,
+        ));
+        assert!(!llvm_type_contains_pointer_in_address_space(
+            &ctx,
+            abi.storage_ty,
+            llvm_types::address_space::SHARED,
+        ));
+        assert!(llvm_type_contains_pointer_in_address_space(
+            &ctx,
+            abi.storage_ty,
+            llvm_types::address_space::GENERIC,
+        ));
+    }
+
+    #[test]
+    fn packed_shared_internal_abi_genericizes_multiple_direct_shared_pointers() {
+        let mut ctx = make_ctx();
+        let tag = mir_uint(&mut ctx, 8);
+        let pointee = mir_uint(&mut ctx, 32);
+        let shared: TypeHandle = MirPtrType::get_shared(&mut ctx, pointee, false).into();
+        let packed: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedSharedPair".into(),
+            vec!["tag".into(), "left".into(), "right".into()],
+            vec![tag, shared, shared],
+            vec![0, 1, 2],
+            vec![0, 1, 9],
+            17,
+            1,
+        )
+        .into();
+
+        let abi = packed_shared_internal_abi_info(&mut ctx, packed)
+            .expect("ABI classification must succeed")
+            .expect("multiple direct AS3 leaves must use the recursive internal carrier");
+        assert_eq!(llvm_type_size_align(&ctx, abi.semantic_ty), Some((17, 1)));
+        assert_eq!(llvm_type_size_align(&ctx, abi.storage_ty), Some((17, 1)));
+        assert!(llvm_packed_struct_contains_pointer_in_address_space(
+            &ctx,
+            abi.semantic_ty,
+            llvm_types::address_space::SHARED,
+        ));
+        assert!(!llvm_type_contains_pointer_in_address_space(
+            &ctx,
+            abi.storage_ty,
+            llvm_types::address_space::SHARED,
+        ));
+
+        let fields = struct_fields(&ctx, abi.storage_ty);
+        assert_eq!(fields.len(), 3);
+        for field in &fields[1..] {
+            let field_ref = field.deref(&ctx);
+            let pointer = field_ref
+                .downcast_ref::<llvm_types::PointerType>()
+                .expect("both pointer leaves must remain pointer-typed");
+            assert_eq!(pointer.address_space(), llvm_types::address_space::GENERIC);
+        }
+    }
+
+    #[test]
+    fn packed_shared_internal_abi_genericizes_nested_struct_shared_pointers() {
+        let mut ctx = make_ctx();
+        let pointee = mir_uint(&mut ctx, 32);
+        let shared: TypeHandle = MirPtrType::get_shared(&mut ctx, pointee, false).into();
+        let inner: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "InnerSharedPair".into(),
+            vec!["left".into(), "right".into()],
+            vec![shared, shared],
+            vec![0, 1],
+            vec![0, 8],
+            16,
+            8,
+        )
+        .into();
+        let tag = mir_uint(&mut ctx, 8);
+        let outer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedNestedShared".into(),
+            vec!["tag".into(), "inner".into()],
+            vec![tag, inner],
+            vec![0, 1],
+            vec![0, 1],
+            17,
+            1,
+        )
+        .into();
+
+        let abi = packed_shared_internal_abi_info(&mut ctx, outer)
+            .expect("classification must not error")
+            .expect("nested AS3 leaves must use the recursive internal carrier");
+        assert_eq!(llvm_type_size_align(&ctx, abi.semantic_ty), Some((17, 1)));
+        assert_eq!(llvm_type_size_align(&ctx, abi.storage_ty), Some((17, 1)));
+        assert!(!llvm_type_contains_pointer_in_address_space(
+            &ctx,
+            abi.storage_ty,
+            llvm_types::address_space::SHARED,
+        ));
+
+        let outer_fields = struct_fields(&ctx, abi.storage_ty);
+        let inner_fields = struct_fields(&ctx, outer_fields[1]);
+        assert_eq!(inner_fields.len(), 2);
+        for field in inner_fields {
+            let field_ref = field.deref(&ctx);
+            let pointer = field_ref
+                .downcast_ref::<llvm_types::PointerType>()
+                .expect("nested shared leaves must remain pointer-typed");
+            assert_eq!(pointer.address_space(), llvm_types::address_space::GENERIC);
+        }
+    }
+
+    #[test]
+    fn packed_shared_internal_abi_genericizes_nested_tuple_shared_pointer() {
+        let mut ctx = make_ctx();
+        let pointee = mir_uint(&mut ctx, 32);
+        let shared: TypeHandle = MirPtrType::get_shared(&mut ctx, pointee, false).into();
+        let word = mir_uint(&mut ctx, 32);
+        let inner: TypeHandle = MirTupleType::get_with_layout(
+            &mut ctx,
+            vec![shared, word],
+            vec![0, 1],
+            vec![0, 8],
+            16,
+            8,
+        )
+        .into();
+        let tag = mir_uint(&mut ctx, 8);
+        let outer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedNestedTupleShared".into(),
+            vec!["tag".into(), "inner".into()],
+            vec![tag, inner],
+            vec![0, 1],
+            vec![0, 1],
+            17,
+            1,
+        )
+        .into();
+
+        let abi = packed_shared_internal_abi_info(&mut ctx, outer)
+            .expect("classification must not error")
+            .expect("an AS3 leaf nested in a tuple must use the recursive carrier");
+        let outer_fields = struct_fields(&ctx, abi.storage_ty);
+        let inner_fields = struct_fields(&ctx, outer_fields[1]);
+        let inner_field_ref = inner_fields[0].deref(&ctx);
+        let pointer = inner_field_ref
+            .downcast_ref::<llvm_types::PointerType>()
+            .expect("nested tuple leaf must remain pointer-typed");
+        assert_eq!(pointer.address_space(), llvm_types::address_space::GENERIC);
+        assert_eq!(llvm_type_size_align(&ctx, abi.storage_ty), Some((17, 1)));
+    }
+
+    #[test]
+    fn packed_shared_internal_abi_skips_zero_sized_fields() {
+        let mut ctx = make_ctx();
+        let tag = mir_uint(&mut ctx, 8);
+        let byte = mir_uint(&mut ctx, 8);
+        let marker: TypeHandle = MirArrayType::get(&mut ctx, byte, 0).into();
+        let pointee = mir_uint(&mut ctx, 32);
+        let shared: TypeHandle = MirPtrType::get_shared(&mut ctx, pointee, false).into();
+        let packed: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedSharedZstMarker".into(),
+            vec!["tag".into(), "marker".into(), "ptr".into()],
+            vec![tag, marker, shared],
+            vec![0, 1, 2],
+            vec![0, 1, 1],
+            9,
+            1,
+        )
+        .into();
+
+        let abi = packed_shared_internal_abi_info(&mut ctx, packed)
+            .expect("ABI classification must succeed")
+            .expect("a zero-sized field must not knock the struct out of the ABI lane");
+        assert_eq!(llvm_type_size_align(&ctx, abi.semantic_ty), Some((9, 1)));
+        assert_eq!(llvm_type_size_align(&ctx, abi.storage_ty), Some((9, 1)));
+        assert!(!llvm_type_contains_pointer_in_address_space(
+            &ctx,
+            abi.storage_ty,
+            llvm_types::address_space::SHARED,
+        ));
+    }
+
+    #[test]
+    fn packed_shared_internal_abi_genericizes_bounded_shared_pointer_array() {
+        let mut ctx = make_ctx();
+        let pointee = mir_uint(&mut ctx, 32);
+        let shared: TypeHandle = MirPtrType::get_shared(&mut ctx, pointee, false).into();
+        let shared_array: TypeHandle = MirArrayType::get(&mut ctx, shared, 2).into();
+        let tag = mir_uint(&mut ctx, 8);
+        let outer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedSharedArray".into(),
+            vec!["tag".into(), "ptrs".into()],
+            vec![tag, shared_array],
+            vec![0, 1],
+            vec![0, 1],
+            17,
+            1,
+        )
+        .into();
+
+        let abi = packed_shared_internal_abi_info(&mut ctx, outer)
+            .expect("classification must not error")
+            .expect("a bounded AS3 array must use the target-stable internal carrier");
+        assert_eq!(llvm_type_size_align(&ctx, abi.semantic_ty), Some((17, 1)));
+        assert_eq!(llvm_type_size_align(&ctx, abi.storage_ty), Some((17, 1)));
+        assert!(!llvm_type_contains_pointer_in_address_space(
+            &ctx,
+            abi.storage_ty,
+            llvm_types::address_space::SHARED,
+        ));
+
+        let outer_fields = struct_fields(&ctx, abi.storage_ty);
+        let array_ref = outer_fields[1].deref(&ctx);
+        let array = array_ref
+            .downcast_ref::<llvm_types::ArrayType>()
+            .expect("bounded array field must remain an LLVM array");
+        assert_eq!(array.size(), 2);
+        let element = array.elem_type();
+        let element_ref = element.deref(&ctx);
+        let pointer = element_ref
+            .downcast_ref::<llvm_types::PointerType>()
+            .expect("array elements must remain pointer-typed");
+        assert_eq!(pointer.address_space(), llvm_types::address_space::GENERIC);
+    }
+
+    #[test]
+    fn packed_shared_internal_abi_accepts_array_rewrite_at_exact_bound() {
+        let mut ctx = make_ctx();
+        let pointee = mir_uint(&mut ctx, 32);
+        let shared: TypeHandle = MirPtrType::get_shared(&mut ctx, pointee, false).into();
+        let count = MAX_PACKED_SHARED_INTERNAL_ABI_ARRAY_REWRITE_LEAVES;
+        let shared_array: TypeHandle = MirArrayType::get(&mut ctx, shared, count).into();
+        let tag = mir_uint(&mut ctx, 8);
+        let outer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedSharedArrayAtBound".into(),
+            vec!["tag".into(), "ptrs".into()],
+            vec![tag, shared_array],
+            vec![0, 1],
+            vec![0, 1],
+            1 + 8 * count,
+            1,
+        )
+        .into();
+
+        assert!(
+            packed_shared_internal_abi_info(&mut ctx, outer)
+                .expect("classification must not error")
+                .is_some(),
+            "the exact bounded-array rewrite limit must remain supported"
+        );
+    }
+
+    #[test]
+    fn packed_shared_internal_abi_rejects_array_rewrite_above_bound() {
+        let mut ctx = make_ctx();
+        let pointee = mir_uint(&mut ctx, 32);
+        let shared: TypeHandle = MirPtrType::get_shared(&mut ctx, pointee, false).into();
+        let count = MAX_PACKED_SHARED_INTERNAL_ABI_ARRAY_REWRITE_LEAVES + 1;
+        let shared_array: TypeHandle = MirArrayType::get(&mut ctx, shared, count).into();
+        let tag = mir_uint(&mut ctx, 8);
+        let outer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedSharedArrayAboveBound".into(),
+            vec!["tag".into(), "ptrs".into()],
+            vec![tag, shared_array],
+            vec![0, 1],
+            vec![0, 1],
+            1 + 8 * count,
+            1,
+        )
+        .into();
+
+        assert!(
+            packed_shared_internal_abi_info(&mut ctx, outer)
+                .expect("classification must not error")
+                .is_none(),
+            "array-expanded AS3 leaves above the explicit budget must fail closed"
+        );
+    }
+
+    #[test]
+    fn packed_shared_internal_abi_rejects_shared_pointer_vector() {
+        let mut ctx = make_ctx();
+        let tag = mir_uint(&mut ctx, 8);
+        let shared_pointer: TypeHandle =
+            llvm_types::PointerType::get(&ctx, llvm_types::address_space::SHARED).into();
+        let shared_vector: TypeHandle =
+            llvm_types::VectorType::get(&ctx, shared_pointer, 2, llvm_types::VectorTypeKind::Fixed)
+                .into();
+        let outer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedSharedVector".into(),
+            vec!["tag".into(), "ptrs".into()],
+            vec![tag, shared_vector],
+            vec![0, 1],
+            vec![0, 1],
+            17,
+            1,
+        )
+        .into();
+
+        assert!(
+            packed_shared_internal_abi_info(&mut ctx, outer)
+                .expect("classification must not error")
+                .is_none(),
+            "shared-pointer vectors must remain outside the packed-AS3 internal ABI lane"
+        );
     }
 
     #[test]
@@ -4421,6 +5595,209 @@ mod tests {
         .into();
         let err = validate_initialized_global_layout(&mut ctx, outer, 16, 8).unwrap_err();
         assert!(err.to_string().contains("lowers at byte"));
+    }
+
+    #[test]
+    fn relocated_initialized_global_layout_accepts_top_level_packed_struct() {
+        let mut ctx = make_ctx();
+        let byte = mir_uint(&mut ctx, 8);
+        let target = mir_uint(&mut ctx, 32);
+        let pointer: TypeHandle = MirPtrType::get_global(&mut ctx, target, false).into();
+        let packed: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedRelocation".into(),
+            vec!["tag".into(), "ptr".into()],
+            vec![byte, pointer],
+            vec![0, 1],
+            vec![0, 1],
+            9,
+            1,
+        )
+        .into();
+
+        validate_relocated_initialized_global_layout(&mut ctx, packed, 9, 1)
+            .expect("relocated top-level packed struct must be accepted");
+        assert!(validate_initialized_global_layout(&mut ctx, packed, 9, 1).is_err());
+    }
+
+    #[test]
+    fn relocated_initialized_global_layout_accepts_thin_pointer_union() {
+        let mut ctx = make_ctx();
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let word_ptr: TypeHandle = MirPtrType::get_generic(&mut ctx, u32_ty, false).into();
+        let byte_ptr: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let union_ty: TypeHandle = MirUnionType::get(
+            &mut ctx,
+            "RelocatedPointerUnion".into(),
+            vec!["word".into(), "byte".into()],
+            vec![word_ptr, byte_ptr],
+            8,
+            8,
+        )
+        .into();
+
+        validate_relocated_initialized_global_layout(&mut ctx, union_ty, 8, 8)
+            .expect("one pointer-word union must be valid relocated global storage");
+    }
+
+    #[test]
+    fn relocated_initialized_global_layout_rejects_malformed_memory_order() {
+        let mut ctx = make_ctx();
+        let byte = mir_uint(&mut ctx, 8);
+        let target = mir_uint(&mut ctx, 32);
+        let pointer: TypeHandle = MirPtrType::get_global(&mut ctx, target, false).into();
+        let malformed: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "MalformedPackedRelocation".into(),
+            vec!["tag".into(), "ptr".into()],
+            vec![byte, pointer],
+            vec![0, 0],
+            vec![0, 1],
+            9,
+            1,
+        )
+        .into();
+
+        let error = validate_relocated_initialized_global_layout(&mut ctx, malformed, 9, 1)
+            .expect_err("malformed memory order must remain unsupported");
+        assert!(error.to_string().contains("not a permutation"), "{error}");
+    }
+
+    #[test]
+    fn relocated_initialized_global_layout_accepts_one_direct_nested_packed_struct() {
+        let mut ctx = make_ctx();
+        let byte = mir_uint(&mut ctx, 8);
+        let word = mir_uint(&mut ctx, 32);
+        let pointer: TypeHandle = MirPtrType::get_global(&mut ctx, word, false).into();
+        let nested_packed: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "NestedPackedRelocation".into(),
+            vec!["tag".into(), "ptr".into()],
+            vec![byte, pointer],
+            vec![0, 1],
+            vec![0, 1],
+            9,
+            1,
+        )
+        .into();
+        let outer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "OuterPackedRelocation".into(),
+            vec!["head".into(), "nested".into()],
+            vec![word, nested_packed],
+            vec![0, 1],
+            vec![0, 4],
+            16,
+            4,
+        )
+        .into();
+
+        validate_relocated_initialized_global_layout(&mut ctx, outer, 16, 4)
+            .expect("one direct nested packed relocation carrier must be accepted");
+        assert!(validate_initialized_global_layout(&mut ctx, outer, 16, 4).is_err());
+    }
+
+    #[test]
+    fn relocated_initialized_global_layout_rejects_packed_root_with_packed_child() {
+        let mut ctx = make_ctx();
+        let byte = mir_uint(&mut ctx, 8);
+        let word = mir_uint(&mut ctx, 32);
+        let target = mir_uint(&mut ctx, 32);
+        let pointer: TypeHandle = MirPtrType::get_global(&mut ctx, target, false).into();
+        let nested_packed: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "NestedPackedRelocation".into(),
+            vec!["tag".into(), "ptr".into()],
+            vec![byte, pointer],
+            vec![0, 1],
+            vec![0, 1],
+            9,
+            1,
+        )
+        .into();
+        let packed_root: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedRootRelocation".into(),
+            vec!["tag".into(), "word".into(), "nested".into()],
+            vec![byte, word, nested_packed],
+            vec![0, 1, 2],
+            vec![0, 1, 5],
+            14,
+            1,
+        )
+        .into();
+
+        let error = validate_relocated_initialized_global_layout(&mut ctx, packed_root, 14, 1)
+            .expect_err("a packed top-level struct must not stack the nested packed relaxation");
+        assert!(error.to_string().contains("lowers at byte"), "{error}");
+    }
+
+    #[test]
+    fn relocated_initialized_global_layout_rejects_deeper_packed_nesting() {
+        let mut ctx = make_ctx();
+        let byte = mir_uint(&mut ctx, 8);
+        let word = mir_uint(&mut ctx, 32);
+        let target = mir_uint(&mut ctx, 32);
+        let pointer: TypeHandle = MirPtrType::get_global(&mut ctx, target, false).into();
+        let inner_packed: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "InnerPackedRelocation".into(),
+            vec!["tag".into(), "ptr".into()],
+            vec![byte, pointer],
+            vec![0, 1],
+            vec![0, 1],
+            9,
+            1,
+        )
+        .into();
+        let middle_packed: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "MiddlePackedRelocation".into(),
+            vec!["tag".into(), "word".into(), "inner".into()],
+            vec![byte, word, inner_packed],
+            vec![0, 1, 2],
+            vec![0, 1, 5],
+            14,
+            1,
+        )
+        .into();
+        let outer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "OuterDeepPackedRelocation".into(),
+            vec!["head".into(), "middle".into()],
+            vec![word, middle_packed],
+            vec![0, 1],
+            vec![0, 4],
+            20,
+            4,
+        )
+        .into();
+
+        let error = validate_relocated_initialized_global_layout(&mut ctx, outer, 20, 4)
+            .expect_err("packed relocation relaxation must stop after one nesting level");
+        assert!(error.to_string().contains("lowers at byte"), "{error}");
+    }
+
+    #[test]
+    fn relocated_initialized_global_layout_rejects_overlapping_struct_fields() {
+        let mut ctx = make_ctx();
+        let word = mir_uint(&mut ctx, 32);
+        let overlapping: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "OverlappingRelocation".into(),
+            vec!["left".into(), "right".into()],
+            vec![word, word],
+            vec![0, 1],
+            vec![0, 0],
+            4,
+            1,
+        )
+        .into();
+
+        let error = validate_relocated_initialized_global_layout(&mut ctx, overlapping, 4, 1)
+            .expect_err("overlapping field ranges must remain unsupported");
+        assert!(error.to_string().contains("overlap"), "{error}");
     }
 
     #[test]

@@ -14,12 +14,14 @@ use llvm_export::{
     op_interfaces::CastOpInterface,
     ops::{
         AddrSpaceCastOp, AddressOfOp, AllocaOp, BitcastOp, BrOp, CallOp, CondBrOp, ConstantOp,
-        DebugLocalTypeKind, DebugLocalVariableInfo, DebugSourcePosition, DebugSourceScope,
-        DebugSourceScopeLocation, DebugSourceScopeMap, DebugValueOp, FuncOp, GepIndex,
-        GetElementPtrOp, GlobalInitializerRelocation, GlobalOp, GlobalOpExt, InlineAsmOp, LoadOp,
-        ReturnOp, SelectOp, StoreOp, UndefOp, encode_global_initializer_relocations,
+        DebugEnumDiscriminant, DebugEnumVariant, DebugFragment, DebugFragmentVariableInfo,
+        DebugLocalTypeKind, DebugLocalVariableInfo, DebugProjectedVariableInfo,
+        DebugSourcePosition, DebugSourceScope, DebugSourceScopeLocation, DebugSourceScopeMap,
+        DebugValueExpression, DebugValueExpressionOp, DebugValueListOp, DebugValueOp, FuncOp,
+        GepIndex, GetElementPtrOp, GlobalInitializerRelocation, GlobalOp, GlobalOpExt, InlineAsmOp,
+        LoadOp, ReturnOp, SelectOp, StoreOp, UndefOp, encode_global_initializer_relocations,
     },
-    types::{ArrayType, FuncType, HalfType, PointerType, StructType, VoidType},
+    types::{ArrayType, FuncType, HalfType, PointerType, StructLayout, StructType, VoidType},
 };
 use pliron::{
     basic_block::BasicBlock,
@@ -1850,7 +1852,7 @@ fn initialized_global_exports_static_pointer_relocation() {
 
     // Insert the reference first. Module symbol indexing must make relocation
     // resolution independent of textual global order.
-    let reference_ty = StructType::get_unnamed(&ctx, vec![i64_ty.into()]);
+    let reference_ty = StructType::get_unnamed(&ctx, (vec![i64_ty.into()], StructLayout::Unpacked));
     let reference = GlobalOp::new_with_alignment(
         &mut ctx,
         "reference".try_into().unwrap(),
@@ -1906,6 +1908,73 @@ fn initialized_global_exports_static_pointer_relocation() {
 }
 
 #[test]
+fn initialized_global_exports_unaligned_pointer_relocation_as_packed_storage() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "packed_static_relocation".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Signless);
+    let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
+
+    let literal_ty = ArrayType::get(&ctx, i8_ty.into(), 1);
+    let reference_ty = StructType::get_unnamed(
+        &ctx,
+        (vec![literal_ty.into(), i64_ty.into()], StructLayout::Packed),
+    );
+    let reference = GlobalOp::new_with_alignment(
+        &mut ctx,
+        "packed_reference".try_into().unwrap(),
+        reference_ty.into(),
+        1,
+    );
+    reference.set_address_space(&mut ctx, 1);
+    reference.set_source_global_key(&mut ctx, "PACKED_REFERENCE");
+    reference.set_initializer_hex(&mut ctx, "7b0000000000000000");
+    let encoded = encode_global_initializer_relocations(&[GlobalInitializerRelocation {
+        source_offset: 1,
+        width_bytes: 8,
+        target_address_space: 1,
+        target_addend: 0,
+        target_key: "TARGET".to_string(),
+    }]);
+    reference.set_initializer_relocations(&mut ctx, &encoded);
+    reference.get_operation().insert_at_back(module_block, &ctx);
+
+    let target_ty = ArrayType::get(&ctx, i8_ty.into(), 4);
+    let target =
+        GlobalOp::new_with_alignment(&mut ctx, "target".try_into().unwrap(), target_ty.into(), 4);
+    target.set_address_space(&mut ctx, 1);
+    target.set_source_global_key(&mut ctx, "TARGET");
+    target.set_initializer_hex(&mut ctx, "78563412");
+    target.get_operation().insert_at_back(module_block, &ctx);
+
+    let modern = export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &NvvmExportConfig::new(NvvmIrDialect::Modern),
+    )
+    .expect("modern packed relocated initializer export succeeds");
+    assert!(
+        modern.contains(
+            r#"@packed_reference = addrspace(1) global <{ [1 x i8], i64 }> <{ [1 x i8] c"\7B", i64 ptrtoint (ptr addrspacecast (ptr addrspace(1) @target to ptr) to i64) }>, align 1"#
+        ),
+        "{modern}"
+    );
+
+    let legacy = export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &NvvmExportConfig::new(NvvmIrDialect::LegacyLlvm7),
+    )
+    .expect("legacy packed relocated initializer export succeeds");
+    assert!(
+        legacy.contains(
+            r#"@packed_reference = addrspace(1) global <{ [1 x i8], i64 }> <{ [1 x i8] c"\7B", i64 ptrtoint (i8* addrspacecast (i8 addrspace(1)* bitcast ([4 x i8] addrspace(1)* @target to i8 addrspace(1)*) to i8*) to i64) }>, align 1"#
+        ),
+        "{legacy}"
+    );
+}
+
+#[test]
 fn initialized_global_exports_multiple_relocations_and_addends() {
     let mut ctx = Context::new();
     let module = ModuleOp::new(&mut ctx, "multiple_static_relocations".try_into().unwrap());
@@ -1937,7 +2006,10 @@ fn initialized_global_exports_multiple_relocations_and_addends() {
     target_b.set_initializer_hex(&mut ctx, "1011121314151617");
     target_b.get_operation().insert_at_back(module_block, &ctx);
 
-    let table_ty = StructType::get_unnamed(&ctx, vec![i64_ty.into(), i64_ty.into()]);
+    let table_ty = StructType::get_unnamed(
+        &ctx,
+        (vec![i64_ty.into(), i64_ty.into()], StructLayout::Unpacked),
+    );
     let table = GlobalOp::new_with_alignment(
         &mut ctx,
         "reference_table".try_into().unwrap(),
@@ -1987,7 +2059,7 @@ fn initialized_global_relocation_rejects_unknown_target_key() {
     let module = ModuleOp::new(&mut ctx, "unknown_relocation_target".try_into().unwrap());
     let module_block = module_top_block(&mut ctx, &module);
     let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
-    let reference_ty = StructType::get_unnamed(&ctx, vec![i64_ty.into()]);
+    let reference_ty = StructType::get_unnamed(&ctx, (vec![i64_ty.into()], StructLayout::Unpacked));
     let reference = GlobalOp::new_with_alignment(
         &mut ctx,
         "reference".try_into().unwrap(),
@@ -2694,6 +2766,188 @@ fn full_debug_metadata_emits_dbg_declare_for_tagged_allocas() {
 }
 
 #[test]
+fn full_debug_metadata_emits_rust_enum_variant_parts() {
+    let mut ctx = Context::new();
+
+    let module = ModuleOp::new(&mut ctx, "enum_debug".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&ctx, void_ty.to_handle(), vec![], false);
+    let func = FuncOp::new(&mut ctx, "enum_debug_kernel".try_into().unwrap(), func_ty);
+    let func_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/enum.rs", 10, 1);
+    func.get_operation().deref_mut(&ctx).set_loc(func_loc);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
+    let one_attr = IntegerAttr::new(i32_ty, APInt::from_u32(1, NonZero::new(32).unwrap()));
+    let one = ConstantOp::new(&mut ctx, one_attr.into());
+    one.get_operation().insert_at_back(entry, &ctx);
+    let one_val = one.get_operation().deref(&ctx).get_result(0);
+
+    let direct = AllocaOp::new(&mut ctx, i64_ty.into(), one_val);
+    let direct_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/enum.rs", 11, 9);
+    direct.get_operation().deref_mut(&ctx).set_loc(direct_loc);
+    llvm_export::ops::set_debug_local_variable(
+        &mut ctx,
+        direct.get_operation(),
+        DebugLocalVariableInfo {
+            name: "direct".to_string(),
+            argument_index: None,
+            ty: DebugLocalTypeKind::Enum {
+                name: "Direct".to_string(),
+                size_bits: 64,
+                discriminant: Some(DebugEnumDiscriminant {
+                    offset_bits: 0,
+                    ty: Box::new(DebugLocalTypeKind::Basic {
+                        name: "u8".to_string(),
+                        size_bits: 8,
+                        encoding: "DW_ATE_unsigned",
+                    }),
+                }),
+                variants: vec![
+                    DebugEnumVariant {
+                        name: "Small".to_string(),
+                        discriminant: Some(3),
+                        members: vec![llvm_export::ops::DebugTypeMember {
+                            name: "0".to_string(),
+                            offset_bits: 32,
+                            ty: DebugLocalTypeKind::Basic {
+                                name: "u32".to_string(),
+                                size_bits: 32,
+                                encoding: "DW_ATE_unsigned",
+                            },
+                        }],
+                    },
+                    DebugEnumVariant {
+                        name: "Empty".to_string(),
+                        discriminant: Some(9),
+                        members: vec![],
+                    },
+                ],
+            },
+        },
+    );
+    direct.get_operation().insert_at_back(entry, &ctx);
+
+    let niche = AllocaOp::new(&mut ctx, i64_ty.into(), one_val);
+    let niche_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/enum.rs", 12, 9);
+    niche.get_operation().deref_mut(&ctx).set_loc(niche_loc);
+    llvm_export::ops::set_debug_local_variable(
+        &mut ctx,
+        niche.get_operation(),
+        DebugLocalVariableInfo {
+            name: "niche".to_string(),
+            argument_index: None,
+            ty: DebugLocalTypeKind::Enum {
+                name: "OptionRef".to_string(),
+                size_bits: 64,
+                discriminant: Some(DebugEnumDiscriminant {
+                    offset_bits: 0,
+                    ty: Box::new(DebugLocalTypeKind::Basic {
+                        name: "usize".to_string(),
+                        size_bits: 64,
+                        encoding: "DW_ATE_unsigned",
+                    }),
+                }),
+                variants: vec![
+                    DebugEnumVariant {
+                        name: "None".to_string(),
+                        discriminant: Some(0),
+                        members: vec![],
+                    },
+                    DebugEnumVariant {
+                        name: "Some".to_string(),
+                        discriminant: None,
+                        members: vec![llvm_export::ops::DebugTypeMember {
+                            name: "0".to_string(),
+                            offset_bits: 0,
+                            ty: DebugLocalTypeKind::Pointer {
+                                name: "&u32".to_string(),
+                                size_bits: 64,
+                            },
+                        }],
+                    },
+                ],
+            },
+        },
+    );
+    niche.get_operation().insert_at_back(entry, &ctx);
+
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let config = DebugConfig {
+        inner: PtxExportConfig,
+        debug_kind: DebugKind::Full,
+    };
+    let ir =
+        export_module_to_string_with_config(&ctx, &module, &config).expect("enum debug export");
+
+    assert!(
+        ir.contains("!DICompositeType(tag: DW_TAG_variant_part"),
+        "Rust enums must contain a DW_TAG_variant_part:\n{ir}"
+    );
+    assert!(
+        ir.contains("flags: DIFlagArtificial"),
+        "the physical enum carrier must be marked artificial:\n{ir}"
+    );
+    let discriminator_member = ir
+        .lines()
+        .find(|line| {
+            line.contains("!DIDerivedType(tag: DW_TAG_member")
+                && line.contains("flags: DIFlagArtificial")
+        })
+        .expect("enum discriminator member");
+    assert!(
+        discriminator_member.contains("scope: !"),
+        "the physical enum carrier must be scoped to its enum object:\n{discriminator_member}\n{ir}"
+    );
+    let variant_part = ir
+        .lines()
+        .find(|line| line.contains("!DICompositeType(tag: DW_TAG_variant_part"))
+        .expect("enum variant part");
+    assert!(
+        variant_part.contains("scope: !"),
+        "the variant part must be scoped to its enum object:\n{variant_part}\n{ir}"
+    );
+    let direct_variant_member = ir
+        .lines()
+        .find(|line| {
+            line.contains("!DIDerivedType(tag: DW_TAG_member, name: \"Small\"")
+                && line.contains("extraData: i8 3")
+        })
+        .expect("direct enum variant member");
+    assert!(
+        direct_variant_member.contains("scope: !"),
+        "variant members must be scoped to their DW_TAG_variant_part:\n{direct_variant_member}\n{ir}"
+    );
+    assert!(
+        ir.contains("extraData: i8 3") && ir.contains("extraData: i8 9"),
+        "direct-tag variants must carry their physical discriminant values:\n{ir}"
+    );
+    assert!(
+        ir.contains("extraData: i64 0"),
+        "the tagged niche variant must carry the niche value:\n{ir}"
+    );
+
+    let some_variant_member = ir
+        .lines()
+        .find(|line| {
+            line.contains("!DIDerivedType(tag: DW_TAG_member, name: \"Some\"")
+                && line.contains("baseType:")
+        })
+        .expect("Some variant member");
+    assert!(
+        !some_variant_member.contains("extraData:"),
+        "the untagged niche variant must be the default branch:\n{some_variant_member}\n{ir}"
+    );
+}
+
+#[test]
 fn full_debug_metadata_uses_file_scope_for_cross_file_local_variables() {
     let mut ctx = Context::new();
 
@@ -2815,6 +3069,36 @@ fn full_debug_metadata_emits_dbg_value_for_promoted_locals() {
         12,
         5,
     );
+    llvm_export::ops::set_debug_fragment_variables(
+        &mut ctx,
+        dbg_value.get_operation(),
+        &[DebugFragmentVariableInfo {
+            variable: DebugLocalVariableInfo {
+                name: "pair".to_string(),
+                argument_index: None,
+                ty: DebugLocalTypeKind::Array {
+                    name: "[u32; 2]".to_string(),
+                    size_bits: 64,
+                    element: Box::new(DebugLocalTypeKind::Basic {
+                        name: "u32".to_string(),
+                        size_bits: 32,
+                        encoding: "DW_ATE_unsigned",
+                    }),
+                    count: 2,
+                },
+            },
+            fragment: DebugFragment {
+                offset_bits: 32,
+                size_bits: 32,
+            },
+            source_scope: None,
+            declaration: Some(DebugSourcePosition {
+                file: PathBuf::from("/tmp/cuda-oxide/tests/declarations.rs"),
+                line: 13,
+                column: 5,
+            }),
+        }],
+    );
     dbg_value.get_operation().insert_at_back(entry, &ctx);
 
     ReturnOp::new(&mut ctx, None)
@@ -2852,8 +3136,132 @@ fn full_debug_metadata_emits_dbg_value_for_promoted_locals() {
         "dbg.value should still be located at the value's current source point:\n{ir}"
     );
     assert!(
+        ir.contains("DW_OP_LLVM_fragment, 32, 32"),
+        "dbg.value should preserve scalarized source-variable fragments:\n{ir}"
+    );
+    assert!(
+        ir.contains("!DILocalVariable(name: \"pair\", scope: !") && ir.contains("line: 13"),
+        "fragment dbg.value should describe the complete source variable:\n{ir}"
+    );
+    assert!(
         !ir.contains("llvm.dbg.declare"),
         "a value-only debug record should not force dbg.declare:\n{ir}"
+    );
+}
+
+#[test]
+fn full_debug_metadata_emits_diarglist_for_multi_value_locations() {
+    let mut ctx = Context::new();
+
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_region = module.get_operation().deref(&ctx).get_region(0);
+    let module_block = {
+        let region = module_region.deref(&ctx);
+        region.iter(&ctx).next().unwrap()
+    };
+
+    let ptr_ty = PointerType::get(&ctx, 0);
+    let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(
+        &ctx,
+        void_ty.to_handle(),
+        vec![ptr_ty.into(), i64_ty.into()],
+        false,
+    );
+    let func = FuncOp::new(&mut ctx, "debug_kernel".try_into().unwrap(), func_ty);
+    let func_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/kernel.rs", 40, 1);
+    func.get_operation().deref_mut(&ctx).set_loc(func_loc);
+
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let base = entry.deref(&ctx).get_argument(0);
+    let index = entry.deref(&ctx).get_argument(1);
+    let dbg_value = DebugValueListOp::new(&mut ctx, vec![base, index]);
+    let dbg_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/kernel.rs", 41, 17);
+    dbg_value.get_operation().deref_mut(&ctx).set_loc(dbg_loc);
+    llvm_export::ops::set_debug_local_variable(
+        &mut ctx,
+        dbg_value.get_operation(),
+        DebugLocalVariableInfo {
+            name: "item".to_string(),
+            argument_index: None,
+            ty: DebugLocalTypeKind::Basic {
+                name: "u32".to_string(),
+                size_bits: 32,
+                encoding: "DW_ATE_unsigned",
+            },
+        },
+    );
+    llvm_export::ops::set_debug_value_expression(
+        &mut ctx,
+        dbg_value.get_operation(),
+        &DebugValueExpression::new(vec![
+            DebugValueExpressionOp::Arg(0),
+            DebugValueExpressionOp::Arg(1),
+            DebugValueExpressionOp::ConstU(4),
+            DebugValueExpressionOp::Mul,
+            DebugValueExpressionOp::Plus,
+            DebugValueExpressionOp::Deref,
+        ]),
+    );
+    dbg_value.get_operation().insert_at_back(entry, &ctx);
+
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let config = DebugConfig {
+        inner: PtxExportConfig,
+        debug_kind: DebugKind::Full,
+    };
+    let ir =
+        export_module_to_string_with_config(&ctx, &module, &config).expect("debug export succeeds");
+
+    assert!(
+        ir.contains("call void @llvm.dbg.value(metadata !DIArgList(ptr %v0, i64 %v1), metadata !"),
+        "multi-value debug records should emit an inline DIArgList:\n{ir}"
+    );
+    assert!(
+        ir.contains(
+            "!DIExpression(DW_OP_LLVM_arg, 0, DW_OP_LLVM_arg, 1, DW_OP_constu, 4, DW_OP_mul, DW_OP_plus, DW_OP_deref)"
+        ),
+        "multi-value debug records should emit the typed location recipe:\n{ir}"
+    );
+    assert!(
+        ir.contains("declare void @llvm.dbg.value(metadata, metadata, metadata)"),
+        "multi-value records should reuse the ordinary dbg.value intrinsic declaration:\n{ir}"
+    );
+
+    let Some(llvm_as) = ["llvm-as-22", "llvm-as-21", "llvm-as"]
+        .into_iter()
+        .find(|tool| {
+            std::process::Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|out| out.status.success())
+        })
+    else {
+        eprintln!("skipping llvm-as parse gate: no llvm-as-22/llvm-as-21/llvm-as on PATH");
+        return;
+    };
+
+    let ll_path = std::env::temp_dir().join(format!(
+        "cuda_oxide_diarglist_parse_gate_{}.ll",
+        std::process::id()
+    ));
+    std::fs::write(&ll_path, &ir).expect("write temp .ll");
+    let output = std::process::Command::new(llvm_as)
+        .arg("-o")
+        .arg("/dev/null")
+        .arg(&ll_path)
+        .output()
+        .expect("run llvm-as");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let _ = std::fs::remove_file(&ll_path);
+    assert!(
+        output.status.success(),
+        "{llvm_as} rejected the emitted multi-value debug module:\n{stderr}\n--- module ---\n{ir}"
     );
 }
 
@@ -3694,5 +4102,305 @@ fn kernel_keeps_host_addressable_pointer_parameters_and_device_functions_keep_sh
     assert!(
         ir.contains("define void @device_shared(ptr addrspace(3) %v0)"),
         "{ir}"
+    );
+}
+
+#[test]
+fn full_debug_metadata_emits_scalarized_fragment_dbg_declares() {
+    let mut ctx = Context::new();
+
+    let module = ModuleOp::new(&mut ctx, "fragment_debug".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&ctx, void_ty.into(), vec![], false);
+    let func = FuncOp::new(
+        &mut ctx,
+        "fragment_debug_kernel".try_into().unwrap(),
+        func_ty,
+    );
+    let func_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/fragments.rs", 10, 1);
+    func.get_operation().deref_mut(&ctx).set_loc(func_loc);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let one_attr = IntegerAttr::new(i32_ty, APInt::from_u32(1, NonZero::new(32).unwrap()));
+    let one = ConstantOp::new(&mut ctx, one_attr.into());
+    let one_value = one.get_operation().deref(&ctx).get_result(0);
+    one.get_operation().insert_at_back(entry, &ctx);
+
+    let whole_ty = DebugLocalTypeKind::Array {
+        name: "[u32; 2]".to_string(),
+        size_bits: 64,
+        element: Box::new(DebugLocalTypeKind::Basic {
+            name: "u32".to_string(),
+            size_bits: 32,
+            encoding: "DW_ATE_unsigned",
+        }),
+        count: 2,
+    };
+    for (index, offset_bits) in [0u64, 32].into_iter().enumerate() {
+        let alloca = AllocaOp::new(&mut ctx, i32_ty.into(), one_value);
+        llvm_export::ops::set_debug_fragment_variables(
+            &mut ctx,
+            alloca.get_operation(),
+            &[DebugFragmentVariableInfo {
+                variable: DebugLocalVariableInfo {
+                    name: "pair".to_string(),
+                    argument_index: None,
+                    ty: whole_ty.clone(),
+                },
+                fragment: DebugFragment {
+                    offset_bits,
+                    size_bits: 32,
+                },
+                source_scope: None,
+                declaration: Some(DebugSourcePosition {
+                    file: PathBuf::from("/tmp/cuda-oxide/tests/fragments.rs"),
+                    line: 11,
+                    column: 9,
+                }),
+            }],
+        );
+        let loc = src_location(
+            &mut ctx,
+            "/tmp/cuda-oxide/tests/fragments.rs",
+            12 + index as i32,
+            9,
+        );
+        alloca.get_operation().deref_mut(&ctx).set_loc(loc);
+        alloca.get_operation().insert_at_back(entry, &ctx);
+    }
+
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let config = DebugConfig {
+        inner: PtxExportConfig,
+        debug_kind: DebugKind::Full,
+    };
+    let ir =
+        export_module_to_string_with_config(&ctx, &module, &config).expect("debug export succeeds");
+
+    assert!(
+        ir.contains("DW_OP_LLVM_fragment, 0, 32"),
+        "first scalarized piece should describe the low fragment:\n{ir}"
+    );
+    assert!(
+        ir.contains("DW_OP_LLVM_fragment, 32, 32"),
+        "second scalarized piece should describe the high fragment:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("!DILocalVariable(name: \"pair\"").count(),
+        1,
+        "all pieces must share one DILocalVariable identity:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("call void @llvm.dbg.declare").count(),
+        2,
+        "each scalarized storage piece should emit one dbg.declare:\n{ir}"
+    );
+
+    let Some(llvm_as) = ["llvm-as-22", "llvm-as-21", "llvm-as"]
+        .into_iter()
+        .find(|tool| {
+            std::process::Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|out| out.status.success())
+        })
+    else {
+        eprintln!("skipping fragment llvm-as parse gate: no llvm-as on PATH");
+        return;
+    };
+    let ll_path = std::env::temp_dir().join(format!(
+        "cuda_oxide_fragment_parse_gate_{}.ll",
+        std::process::id()
+    ));
+    std::fs::write(&ll_path, &ir).expect("write fragment temp .ll");
+    let output = std::process::Command::new(llvm_as)
+        .arg("-o")
+        .arg("/dev/null")
+        .arg(&ll_path)
+        .output()
+        .expect("run llvm-as for fragments");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let _ = std::fs::remove_file(&ll_path);
+    assert!(
+        output.status.success(),
+        "{llvm_as} rejected scalarized fragment debug metadata:\n{stderr}\n--- module ---\n{ir}"
+    );
+}
+
+#[test]
+fn full_debug_metadata_emits_projected_dbg_declares() {
+    let mut ctx = Context::new();
+
+    let module = ModuleOp::new(&mut ctx, "projected_debug".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&ctx, void_ty.into(), vec![], false);
+    let func = FuncOp::new(
+        &mut ctx,
+        "projected_debug_kernel".try_into().unwrap(),
+        func_ty,
+    );
+    let func_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/projected.rs", 10, 1);
+    func.get_operation().deref_mut(&ctx).set_loc(func_loc);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let one_attr = IntegerAttr::new(i32_ty, APInt::from_u32(1, NonZero::new(32).unwrap()));
+    let one = ConstantOp::new(&mut ctx, one_attr.into());
+    let one_value = one.get_operation().deref(&ctx).get_result(0);
+    one.get_operation().insert_at_back(entry, &ctx);
+
+    let storage_ty = ArrayType::get(&ctx, i32_ty.into(), 8);
+    let alloca = AllocaOp::new(&mut ctx, storage_ty.into(), one_value);
+    llvm_export::ops::set_debug_projected_variables(
+        &mut ctx,
+        alloca.get_operation(),
+        &[
+            DebugProjectedVariableInfo {
+                variable: DebugLocalVariableInfo {
+                    name: "field_value".to_string(),
+                    argument_index: None,
+                    ty: DebugLocalTypeKind::Basic {
+                        name: "u32".to_string(),
+                        size_bits: 32,
+                        encoding: "DW_ATE_unsigned",
+                    },
+                },
+                dereference_base: false,
+                offset_bytes: 8,
+                source_scope: None,
+                declaration: Some(DebugSourcePosition {
+                    file: PathBuf::from("/tmp/cuda-oxide/tests/projected.rs"),
+                    line: 11,
+                    column: 9,
+                }),
+            },
+            DebugProjectedVariableInfo {
+                variable: DebugLocalVariableInfo {
+                    name: "tuple_value".to_string(),
+                    argument_index: None,
+                    ty: DebugLocalTypeKind::Basic {
+                        name: "u64".to_string(),
+                        size_bits: 64,
+                        encoding: "DW_ATE_unsigned",
+                    },
+                },
+                dereference_base: false,
+                offset_bytes: 16,
+                source_scope: None,
+                declaration: Some(DebugSourcePosition {
+                    file: PathBuf::from("/tmp/cuda-oxide/tests/projected.rs"),
+                    line: 12,
+                    column: 9,
+                }),
+            },
+            DebugProjectedVariableInfo {
+                variable: DebugLocalVariableInfo {
+                    name: "array_value".to_string(),
+                    argument_index: None,
+                    ty: DebugLocalTypeKind::Basic {
+                        name: "u32".to_string(),
+                        size_bits: 32,
+                        encoding: "DW_ATE_unsigned",
+                    },
+                },
+                dereference_base: false,
+                offset_bytes: 24,
+                source_scope: None,
+                declaration: Some(DebugSourcePosition {
+                    file: PathBuf::from("/tmp/cuda-oxide/tests/projected.rs"),
+                    line: 13,
+                    column: 9,
+                }),
+            },
+            DebugProjectedVariableInfo {
+                variable: DebugLocalVariableInfo {
+                    name: "deref_value".to_string(),
+                    argument_index: None,
+                    ty: DebugLocalTypeKind::Basic {
+                        name: "u32".to_string(),
+                        size_bits: 32,
+                        encoding: "DW_ATE_unsigned",
+                    },
+                },
+                dereference_base: true,
+                offset_bytes: 0,
+                source_scope: None,
+                declaration: Some(DebugSourcePosition {
+                    file: PathBuf::from("/tmp/cuda-oxide/tests/projected.rs"),
+                    line: 14,
+                    column: 9,
+                }),
+            },
+            DebugProjectedVariableInfo {
+                variable: DebugLocalVariableInfo {
+                    name: "deref_field_value".to_string(),
+                    argument_index: None,
+                    ty: DebugLocalTypeKind::Basic {
+                        name: "u64".to_string(),
+                        size_bits: 64,
+                        encoding: "DW_ATE_unsigned",
+                    },
+                },
+                dereference_base: true,
+                offset_bytes: 32,
+                source_scope: None,
+                declaration: Some(DebugSourcePosition {
+                    file: PathBuf::from("/tmp/cuda-oxide/tests/projected.rs"),
+                    line: 15,
+                    column: 9,
+                }),
+            },
+        ],
+    );
+    alloca.get_operation().insert_at_back(entry, &ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let config = DebugConfig {
+        inner: PtxExportConfig,
+        debug_kind: DebugKind::Full,
+    };
+    let ir = export_module_to_string_with_config(&ctx, &module, &config)
+        .expect("projected debug export succeeds");
+
+    assert_eq!(
+        ir.matches("call void @llvm.dbg.declare").count(),
+        5,
+        "each projected source variable should get its own dbg.declare:\n{ir}"
+    );
+    for name in [
+        "field_value",
+        "tuple_value",
+        "array_value",
+        "deref_value",
+        "deref_field_value",
+    ] {
+        assert!(
+            ir.contains(&format!("!DILocalVariable(name: \"{name}\"")),
+            "missing projected variable {name}:\n{ir}"
+        );
+    }
+    for offset in [8u64, 16, 24] {
+        assert!(
+            ir.contains(&format!("!DIExpression(DW_OP_plus_uconst, {offset})")),
+            "missing static projection offset {offset}:\n{ir}"
+        );
+    }
+    assert!(
+        ir.contains("!DIExpression(DW_OP_deref)"),
+        "missing dereference-only debug expression:\n{ir}"
+    );
+    assert!(
+        ir.contains("!DIExpression(DW_OP_deref, DW_OP_plus_uconst, 32)"),
+        "missing dereference-plus-field debug expression:\n{ir}"
     );
 }

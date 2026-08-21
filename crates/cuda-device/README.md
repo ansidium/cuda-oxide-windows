@@ -46,6 +46,39 @@
 
 - *cooperative_groups* also features support for warp/block reductions and scans
 
+### The remaining public modules
+
+The table above covers the most-used modules, but it is not the whole crate.
+The remaining public modules are below. There is no GPU column here because
+the minimum architecture varies per function, not per module. `int`, for
+example, has plain scalar min/max that runs anywhere, plus `min.relu.s32`
+which needs `sm_90+`. Each function's rustdoc states its own requirement.
+
+| Module       | Description                                                                     |
+|--------------|---------------------------------------------------------------------------------|
+| `access`     | Choosing a tile shape from a target memory transaction width.                   |
+| `async_copy` | Classic global-to-shared asynchronous copy intrinsics                           |
+| `bf16`       | Scalar `bf16` min/max; each value is the `u16` bit pattern of one bfloat16       |
+| `bf16x2`     | Packed `bf16x2` arithmetic; two values per `u32`, the first in the low 16 bits   |
+| `constant`   | `ConstantMemory<T>` -- module-scope statics in PTX `.const` (address space 4)    |
+| `convert`    | PTX type-conversion instructions                                                |
+| `dotprod`    | Integer dot products: `dp4a` (packed bytes) and `dp2a` (packed halves)           |
+| `f16`        | Scalar `f16` min/max; each value is the `u16` bit pattern of one IEEE half       |
+| `f16x2`      | Packed `f16x2` arithmetic; two values per `u32`, the first in the low 16 bits    |
+| `f32x2`      | Native SM100 two-lane `f32` arithmetic, each pair carried in a `u64`            |
+| `float`      | Scalar floating-point intrinsics                                                |
+| `i16x2`      | Packed 16-bit integer min/max; two values per `u32`, the first in the low bits   |
+| `iket`       | Semantic annotations for In-Kernel Event Tracing; compiler markers behind macros |
+| `int`        | Scalar integer intrinsics, including the `sm_90+` `min.relu.s32`/`max.relu.s32`  |
+| `mma_frag`   | Fragment index algebra for the `m16n8k16` tensor-core accumulator                |
+| `prmt`       | Byte permutation intrinsics                                                     |
+| `ptx`        | Inline PTX support; user code goes through `ptx_asm!`, not this module directly  |
+| `swizzle`    | XOR swizzles for shared memory, and the bank-conflict arithmetic to pick one     |
+| `uniform`    | Launch-uniform scalar witnesses for APIs needing a value identical in every thread|
+| `vector`     | Over-aligned element types, and a checked way to view a flat slice as them       |
+| `view`       | Checked-once views for 32-bit kernel indexing, backed by a launch contract       |
+| `wmma`       | Warp-level matrix ops: `movmatrix`, `mma.sync`, and cooperative `ldmatrix` loads |
+
 ## Key Types
 
 ### `ThreadIndex<'kernel, IndexSpace>` and `DisjointSlice<T, IndexSpace>`
@@ -120,8 +153,8 @@ Typestate-based async barrier for TMA and MMA synchronization (Hopper+). Tracks 
 
 Two kinds of atomics work on device:
 
-- **`cuda_device::atomic::*`** -- 18 scoped GPU atomic types across three scopes (`Device`/`.gpu`, `Block`/`.cta`, `System`/`.sys`) and six value types (u32, i32, u64, i64, f32, f64). These give explicit control over scope and ordering.
-- **`core::sync::atomic::*`** -- standard library atomics (`AtomicU32`, `AtomicBool`, etc.) also compile to GPU code, defaulting to device scope.
+- **`cuda_device::atomic::*`** -- 21 scoped GPU atomic types across three scopes (`Device`/`.gpu`, `Block`/`.cta`, `System`/`.sys`) and seven value types (u32, i32, u64, i64, f16, f32, f64). These give explicit control over scope and ordering.
+- **`core::sync::atomic::*`** -- standard library atomics (`AtomicU32`, `AtomicBool`, etc.) also compile to GPU code. These always lower with **system scope** (`.sys`), not device scope, for safe host-device coherence -- matching CUDA C++ `cuda::atomic<T>` defaults. Reach for the `cuda_device::atomic` types above when you want `.gpu` or `.cta` instead.
 
 Both paths emit the same NVVM atomic ops and share the full lowering pipeline to PTX.
 
@@ -173,20 +206,25 @@ and `globaltimer()`.
 
 ## Proc-Macro Re-exports
 
-These are defined in `cuda-macros` and re-exported from `cuda-device` for convenience:
+These are defined in `cuda-macros` and re-exported from `cuda-device` for
+convenience. The table is the whole `pub use cuda_macros::{...}` list in
+`src/lib.rs`:
 
-| Attribute                | Purpose                                       |
-|--------------------------|-----------------------------------------------|
-| `#[kernel]`              | Mark a function as a GPU kernel entry point   |
-| `#[device]`              | Mark a helper function or extern block        |
-| `#[launch_bounds]`       | Set max threads / min blocks per SM           |
-| `#[cluster_launch]`      | Set compile-time cluster dimensions           |
-| `#[cooperative_launch]`  | Launch as cooperative (for `grid::sync()`)    |
-| `#[convergent]`          | Mark as convergent (barrier semantics)        |
-| `#[pure]`                | Mark as pure (no side effects)                |
-| `#[readonly]`            | Mark as read-only                             |
-| `gpu_printf!`            | Device-side printf                            |
-| `ptx_asm!`               | Unsafe CUDA inline PTX                        |
+| Attribute                | Purpose                                                                                |
+|--------------------------|----------------------------------------------------------------------------------------|
+| `#[kernel]`              | Mark a function as a GPU kernel entry point                                            |
+| `#[device]`              | Mark a helper function or extern block                                                 |
+| `#[cuda_module]`         | Collect a module's kernels into a typed host module with `load` and launchers          |
+| `#[launch_bounds]`       | Set max threads / min blocks per SM                                                    |
+| `#[launch_contract]`     | Declare a kernel's launch requirements, unlocking a safe launch                        |
+| `#[cluster_launch]`      | Set compile-time cluster dimensions                                                    |
+| `#[cooperative_launch]`  | Launch as cooperative (for `grid::sync()`)                                             |
+| `#[convergent]`          | Mark as convergent (barrier semantics)                                                 |
+| `#[pure]`                | Mark as pure (no side effects)                                                         |
+| `#[readonly]`            | Mark as read-only                                                                      |
+| `#[constant]`            | Place a `ConstantMemory<T>` static in constant memory, plus a host `set_<name>` setter |
+| `gpu_printf!`            | Device-side printf                                                                     |
+| `ptx_asm!`               | Unsafe CUDA inline PTX                                                                 |
 
 ## Safety Model
 

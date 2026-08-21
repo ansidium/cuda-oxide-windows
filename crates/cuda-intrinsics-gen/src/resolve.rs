@@ -22,34 +22,35 @@ use crate::model::{
     EvidenceStageKind, ExecutionControlOperation, ExtendedMinMax, ExtendedMinMaxAdapter,
     ExtendedMinMaxAdmission, ExtendedMinMaxFormat, ExtendedMinMaxNan, ExtendedMinMaxOperation,
     ExtendedMinMaxSubnormal, ImportedAddressSpace, ImportedFile, ImportedIntrinsic,
-    IntrinsicBackend, IntrinsicSource, LdmatrixAdapter, LdmatrixAddressContract, LdmatrixElement,
-    LdmatrixLayout, LdmatrixMemoryOrder, LdmatrixMultiplicity, LdmatrixParticipation,
-    LdmatrixShape, LdmatrixStateSpace, MaskEncoding, MatchOperandEncoding, MbarrierBasicAdapter,
-    MbarrierBasicOperation, MbarrierExtended, MbarrierExtendedAdapter, MbarrierExtendedAdmission,
-    MbarrierExtendedOperation, MbarrierExtendedSourceContract, MbarrierStateSpace,
-    MovmatrixAdapter, MovmatrixParticipation, OverlayBackendLowering, OverlayFile,
-    OverlayIntrinsic, OverlayShardFile, PackedAluAdapter, PackedAluFormat, PackedAluOperation,
-    PackedAtomicAccessContract, PackedAtomicAdapter, PackedAtomicAtomicity,
-    PackedAtomicCodegenContract, PackedAtomicFormat, PackedAtomicOperation, PackedAtomicOrdering,
-    PackedAtomicPointerContract, PackedAtomicReturnContract, PackedAtomicRounding,
-    PackedAtomicScope, PackedAtomicScopeContract, PackedAtomicStateSpace, PackedAtomicSubnormal,
-    PackedConversionAdapter, PackedConversionDestinationFormat, PackedConversionFp8Admission,
-    PackedConversionFp8Direction, PackedConversionFp8F16x2Admission, PackedConversionFp8Format,
-    PackedConversionRounding, PackedConversionSaturation, PackedConversionSourceFormat,
-    PreSm70MemberMaskRule, Prmt, PrmtAdapter, PrmtAdmission, PrmtMode, PtxVersion, ReduxAdapter,
-    ReduxOperation, ReduxParticipation, RegisterMma, RegisterMmaAccumulator, RegisterMmaAdapter,
-    RegisterMmaAmpereFloatAdmission, RegisterMmaAmpereFloatVariant, RegisterMmaBinaryAdmission,
-    RegisterMmaCompatibilitySource, RegisterMmaElement, RegisterMmaF8F6F4Admission,
-    RegisterMmaFp8Admission, RegisterMmaIntegerAdmission, RegisterMmaKind, RegisterMmaLayout,
-    RegisterMmaOperation, RegisterMmaOverflow, RegisterMmaParticipation, RegisterMmaShape,
-    RuntimeValidation, ScalarArithmetic, ScalarArithmeticAdmission, ScalarArithmeticFormat,
-    ScalarArithmeticOperation, ScalarArithmeticRounding, ScalarArithmeticSaturation,
-    ScalarArithmeticSubnormal, ScalarConversion, ScalarConversionAdapter,
-    ScalarConversionAdmission, ScalarConversionDestinationFormat,
-    ScalarConversionResultRepresentation, ScalarConversionRounding, ScalarConversionSaturation,
-    ScalarConversionSourceFormat, ScalarMath, ScalarMathAdmission, ScalarMathFormat,
-    ScalarMathOperation, ScalarMathPrecision, ScalarMathSubnormal, SparseMma, SparseMmaAccumulator,
-    SparseMmaAdapter, SparseMmaCompatibilitySource, SparseMmaElement, SparseMmaF8F6F4Admission,
+    IntegerMinMaxFormat, IntegerMinMaxOperation, IntrinsicBackend, IntrinsicSource,
+    LdmatrixAdapter, LdmatrixAddressContract, LdmatrixElement, LdmatrixLayout, LdmatrixMemoryOrder,
+    LdmatrixMultiplicity, LdmatrixParticipation, LdmatrixShape, LdmatrixStateSpace, MaskEncoding,
+    MatchOperandEncoding, MbarrierBasicAdapter, MbarrierBasicOperation, MbarrierExtended,
+    MbarrierExtendedAdapter, MbarrierExtendedAdmission, MbarrierExtendedOperation,
+    MbarrierExtendedSourceContract, MbarrierStateSpace, MovmatrixAdapter, MovmatrixParticipation,
+    OverlayBackendLowering, OverlayFile, OverlayIntrinsic, OverlayShardFile, PackedAluAdapter,
+    PackedAluFormat, PackedAluOperation, PackedAtomicAccessContract, PackedAtomicAdapter,
+    PackedAtomicAtomicity, PackedAtomicCodegenContract, PackedAtomicFormat, PackedAtomicOperation,
+    PackedAtomicOrdering, PackedAtomicPointerContract, PackedAtomicReturnContract,
+    PackedAtomicRounding, PackedAtomicScope, PackedAtomicScopeContract, PackedAtomicStateSpace,
+    PackedAtomicSubnormal, PackedConversionAdapter, PackedConversionDestinationFormat,
+    PackedConversionFp8Admission, PackedConversionFp8Direction, PackedConversionFp8F16x2Admission,
+    PackedConversionFp8Format, PackedConversionRounding, PackedConversionSaturation,
+    PackedConversionSourceFormat, PreSm70MemberMaskRule, Prmt, PrmtAdapter, PrmtAdmission,
+    PrmtMode, PtxVersion, ReduxAdapter, ReduxOperation, ReduxParticipation, RegisterMma,
+    RegisterMmaAccumulator, RegisterMmaAdapter, RegisterMmaAmpereFloatAdmission,
+    RegisterMmaAmpereFloatVariant, RegisterMmaBinaryAdmission, RegisterMmaCompatibilitySource,
+    RegisterMmaElement, RegisterMmaF8F6F4Admission, RegisterMmaFp8Admission,
+    RegisterMmaIntegerAdmission, RegisterMmaKind, RegisterMmaLayout, RegisterMmaOperation,
+    RegisterMmaOverflow, RegisterMmaParticipation, RegisterMmaShape, RuntimeValidation,
+    ScalarArithmetic, ScalarArithmeticAdmission, ScalarArithmeticFormat, ScalarArithmeticOperation,
+    ScalarArithmeticRounding, ScalarArithmeticSaturation, ScalarArithmeticSubnormal,
+    ScalarConversion, ScalarConversionAdapter, ScalarConversionAdmission,
+    ScalarConversionDestinationFormat, ScalarConversionResultRepresentation,
+    ScalarConversionRounding, ScalarConversionSaturation, ScalarConversionSourceFormat, ScalarMath,
+    ScalarMathAdmission, ScalarMathFormat, ScalarMathOperation, ScalarMathPrecision,
+    ScalarMathSubnormal, SparseMma, SparseMmaAccumulator, SparseMmaAdapter,
+    SparseMmaCompatibilitySource, SparseMmaElement, SparseMmaF8F6F4Admission,
     SparseMmaF8F6F4F16Admission, SparseMmaIntegerAdmission, SparseMmaLayout, SparseMmaLlvmAdapter,
     SparseMmaMetadata, SparseMmaOverflow, SparseMmaParticipation, SparseMmaSelector,
     SparseMmaShape, SpecialRegister, SpecialRegisterAdmission, SpecialRegisterKind,
@@ -73,6 +74,7 @@ use crate::model::{
 use crate::ptx::{InstructionPattern, OperandPattern};
 use crate::util::{canonical_text_bytes, read_json, sha256_bytes, sha256_text_file};
 use anyhow::{Context, Result, bail, ensure};
+use ptx_parse::ParseError;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -441,9 +443,9 @@ pub(crate) fn test_catalog_with_tcgen05(repo_root: &Path) -> Result<CatalogFile>
         .filter(|record| record.family == "tcgen05")
         .count();
     match active_count {
-        228 => return Ok(catalog),
+        233 => return Ok(catalog),
         0 => {}
-        count => bail!("active tcgen05 catalog has {count} of 228 records"),
+        count => bail!("active tcgen05 catalog has {count} of 233 records"),
     }
     let imported: ImportedFile = read_json(&repo_root.join("intrinsics/imported.json"))?;
     let imported_by_record = index_imported_intrinsics(&imported)?;
@@ -1534,19 +1536,20 @@ fn shares_tma_prefetch_tile_symbol(record: &OverlayIntrinsic, symbol: &str) -> b
     symbol == expected_symbol
 }
 
-fn shares_tcgen05_mma_ws_symbol(record: &OverlayIntrinsic, symbol: &str) -> bool {
-    symbol == "llvm.nvvm.tcgen05.mma.ws.tensor"
-        && record.tcgen05.as_ref().is_some_and(|tcgen05| {
-            matches!(
+fn shares_tcgen05_mma_symbol(record: &OverlayIntrinsic, symbol: &str) -> bool {
+    record.tcgen05.as_ref().is_some_and(|tcgen05| {
+        (symbol == "llvm.nvvm.tcgen05.mma.ws.tensor"
+            && matches!(
                 tcgen05.operation,
                 Tcgen05Operation::MmaWsF16
                     | Tcgen05Operation::MmaWsBf16
                     | Tcgen05Operation::MmaWsTf32
-            ) || tcgen05
+            ))
+            || tcgen05
                 .mma
                 .as_ref()
-                .is_some_and(|mma| mma.form == Tcgen05MmaForm::WsTensor)
-        })
+                .is_some_and(|mma| symbol == tcgen05_mma_llvm_symbol(mma.form))
+    })
 }
 
 fn shares_tcgen05_ld_symbol(record: &OverlayIntrinsic, symbol: &str) -> bool {
@@ -1648,7 +1651,7 @@ fn validate_unique_overlay(records: &[OverlayIntrinsic], intrinsic_abi: u32) -> 
             let is_resolved = record.resolved_llvm_symbol.is_some();
             let shares_reviewed_symbol = shares_tma_2d_g2s_symbol(record, symbol)
                 || shares_tma_prefetch_tile_symbol(record, symbol)
-                || shares_tcgen05_mma_ws_symbol(record, symbol)
+                || shares_tcgen05_mma_symbol(record, symbol)
                 || shares_tcgen05_ld_symbol(record, symbol)
                 || shares_tcgen05_st_symbol(record, symbol);
             if let Some((previous_was_resolved, previous_shared_symbol)) =
@@ -2046,6 +2049,7 @@ fn validate_policy(
         )?,
         "warp_shuffle" => validate_warp_shuffle_policy(policy, declaration)?,
         "packed_alu" => validate_packed_alu_policy(policy, source, declaration)?,
+        "integer_minmax" => validate_integer_minmax_policy(policy, source, declaration)?,
         "packed_conversion" => validate_packed_conversion_policy(policy, source, declaration)?,
         "scalar_conversion" => validate_scalar_conversion_policy(
             policy,
@@ -2365,11 +2369,12 @@ fn validate_policy(
             "{} has a declaration but no NVPTX TableGen selection record",
             policy.id
         );
-        let matching_selections: Vec<_> = declaration
-            .selections
-            .iter()
-            .filter(|selection| selection_matches_policy(policy, selection))
-            .collect();
+        let mut matching_selections = Vec::new();
+        for selection in &declaration.selections {
+            if selection_matches_policy(policy, selection)? {
+                matching_selections.push(selection);
+            }
+        }
         let expected_selection_count = match policy.family.as_str() {
             "vote" | "warp_barrier" | "elect" => 2,
             "warp_match" => 4,
@@ -2501,69 +2506,80 @@ fn validate_policy(
 fn selection_matches_policy(
     policy: &OverlayIntrinsic,
     selection: &crate::model::ImportedSelection,
-) -> bool {
+) -> Result<bool, ParseError> {
     if policy.family == "wgmma_control" {
         let Some(control) = &policy.wgmma_control else {
-            return false;
+            return Ok(false);
         };
         let recipe = wgmma_control_recipe(control.mode);
         let selection_shape_matches = if control.mode == WgmmaControlMode::WaitGroup {
             selection.asm == "wgmma.wait_group.sync.aligned \t$n;"
         } else {
-            policy.expected_ptx.matches(&selection.asm)
+            policy.expected_ptx.matches(&selection.asm)?
         };
-        return selection.source_record == recipe.selection_record
+        return Ok(selection.source_record == recipe.selection_record
             && selection_shape_matches
             && selection.predicates == ["Subtarget->getPTXVersion() >= 80", "hasSM90a"]
-            && selection.constraints.is_empty();
+            && selection.constraints.is_empty());
     }
 
     if policy.family == "tma" {
-        return selection_matches_tma_policy(policy, selection);
+        return Ok(selection_matches_tma_policy(policy, selection));
     }
     if matches!(
         policy.family.as_str(),
         "counted_barrier" | "grid_dependency" | "register_control"
     ) {
         let Some(operation) = ExecutionControlOperation::from_catalog_id(&policy.id) else {
-            return false;
+            return Ok(false);
         };
         let recipe = execution_control_recipe(operation);
-        return recipe
+        return Ok(recipe
             .selection_records
             .contains(&selection.source_record.as_str())
             && selection.asm == recipe.selection_asm
             && selection.predicates == recipe.selection_predicates
-            && selection.constraints.is_empty();
+            && selection.constraints.is_empty());
     }
     if policy.family == "tcgen05" {
         let Some(tcgen05) = &policy.tcgen05 else {
-            return false;
+            return Ok(false);
         };
         if let Some(mma) = &tcgen05.mma {
             let expected = if mma.alias.is_some() {
-                BTreeSet::from([tcgen05_mma_selection_asm(
-                    Tcgen05MmaForm::WsTensor,
-                    Tcgen05MmaKind::F8f6f4,
-                    1,
-                    None,
-                    Some(0),
-                    Some(Tcgen05MmaBUsage::Discard),
-                )])
+                BTreeSet::from([if tcgen05_mma_is_ws(mma.form) {
+                    tcgen05_mma_selection_asm(
+                        mma.form,
+                        Tcgen05MmaKind::F8f6f4,
+                        1,
+                        None,
+                        Some(0),
+                        Some(Tcgen05MmaBUsage::Discard),
+                    )
+                } else {
+                    tcgen05_mma_selection_asm(
+                        mma.form,
+                        Tcgen05MmaKind::F8f6f4,
+                        1,
+                        Some("discard"),
+                        None,
+                        None,
+                    )
+                }])
             } else {
                 tcgen05_mma_valid_selection_asms(mma.form)
             };
-            return expected.contains(&selection.asm)
+            return Ok(expected.contains(&selection.asm)
                 && selection.predicates
                     == [if selection.asm.contains(".kind::i8.") {
                         "Subtarget->hasTcgen05MMAI8Kind()"
                     } else {
                         "Subtarget->hasTcgen05InstSupport()"
                     }]
-                && selection.constraints.is_empty();
+                && selection.constraints.is_empty());
         }
         if tcgen05.source_contract != Tcgen05SourceContract::ExactTablegenSelection {
-            return false;
+            return Ok(false);
         }
         if let Some(cp) = tcgen05.cp {
             let recipe = tcgen05_cp_member_recipe(cp.member);
@@ -2571,7 +2587,7 @@ fn selection_matches_policy(
                 Tcgen05CpGroup::Cg1 => 1,
                 Tcgen05CpGroup::Cg2 => 2,
             };
-            return selection.source_record
+            return Ok(selection.source_record
                 == format!("TCGEN05_CP_{}_cg{group}", recipe.selection_stem)
                 && selection.asm
                     == format!(
@@ -2579,157 +2595,159 @@ fn selection_matches_policy(
                         recipe.ptx_suffix
                     )
                 && selection.predicates == ["Subtarget->hasTcgen05InstSupport()"]
-                && selection.constraints.is_empty();
+                && selection.constraints.is_empty());
         }
         let recipe = tcgen05_recipe(tcgen05.operation);
-        return recipe.selection_record == Some(selection.source_record.as_str())
-            && recipe.selection_asm == Some(selection.asm.as_str())
-            && selection.constraints.is_empty();
+        return Ok(
+            recipe.selection_record == Some(selection.source_record.as_str())
+                && recipe.selection_asm == Some(selection.asm.as_str())
+                && selection.constraints.is_empty(),
+        );
     }
     if policy.family == "sparse_mma" {
         let Some(last) = policy.expected_ptx.operands.last() else {
-            return false;
+            return Ok(false);
         };
         if *last != OperandPattern::Immediate {
-            return false;
+            return Ok(false);
         }
         let mut selection_shape = policy.expected_ptx.clone();
         *selection_shape.operands.last_mut().unwrap() = OperandPattern::RegisterOrImmediate;
-        return selection_shape.matches(&selection.asm) && selection.constraints.is_empty();
+        return Ok(selection_shape.matches(&selection.asm)? && selection.constraints.is_empty());
     }
     if policy.family == "sync" {
         if policy.id == "sync_threads" {
-            return selection.source_record == "BARRIER_CTA_SYNC_ALIGNED_ALL_i"
+            return Ok(selection.source_record == "BARRIER_CTA_SYNC_ALIGNED_ALL_i"
                 && selection.asm == "bar.sync \t$i;"
                 && selection.predicates.is_empty()
-                && selection.constraints.is_empty();
+                && selection.constraints.is_empty());
         }
         let Some(scope) = threadfence_scope_for_id(&policy.id) else {
-            return false;
+            return Ok(false);
         };
         let recipe = threadfence_recipe(scope);
-        return selection.source_record == recipe.selection_record
+        return Ok(selection.source_record == recipe.selection_record
             && selection.asm == format!("membar.{};", recipe.ptx_level)
             && selection.predicates.is_empty()
-            && selection.constraints.is_empty();
+            && selection.constraints.is_empty());
     }
 
     if policy.family == "vote" {
         let Some(vote) = &policy.vote else {
-            return false;
+            return Ok(false);
         };
         let recipe = vote_recipe(vote.mode);
-        return [recipe.immediate_selection, recipe.register_selection]
+        return Ok([recipe.immediate_selection, recipe.register_selection]
             .contains(&selection.source_record.as_str())
-            && policy.expected_ptx.matches(&selection.asm)
+            && policy.expected_ptx.matches(&selection.asm)?
             && selection.constraints.address_space.is_none()
-            && selection.constraints.immediate_bindings.is_empty();
+            && selection.constraints.immediate_bindings.is_empty());
     }
 
     if policy.family == "warp_match" {
         let Some(warp_match) = &policy.warp_match else {
-            return false;
+            return Ok(false);
         };
         let recipe = warp_match_recipe(warp_match.mode, warp_match.value_width);
-        return recipe
+        return Ok(recipe
             .selections
             .contains(&selection.source_record.as_str())
-            && policy.expected_ptx.matches(&selection.asm)
-            && selection.constraints.is_empty();
+            && policy.expected_ptx.matches(&selection.asm)?
+            && selection.constraints.is_empty());
     }
 
     if policy.family == "elect" {
-        return ["INT_ELECT_SYNC_I", "INT_ELECT_SYNC_R"]
+        return Ok(["INT_ELECT_SYNC_I", "INT_ELECT_SYNC_R"]
             .contains(&selection.source_record.as_str())
             && selection.asm == "elect.sync \t$dest|$pred, $mask;"
-            && selection.constraints.is_empty();
+            && selection.constraints.is_empty());
     }
 
     if policy.family == "warp_barrier" {
-        return policy.warp_barrier.is_some()
+        return Ok(policy.warp_barrier.is_some()
             && ["INT_BAR_WARP_SYNC_I", "INT_BAR_WARP_SYNC_R"]
                 .contains(&selection.source_record.as_str())
-            && policy.expected_ptx.matches(&selection.asm)
-            && selection.constraints.is_empty();
+            && policy.expected_ptx.matches(&selection.asm)?
+            && selection.constraints.is_empty());
     }
 
     if policy.family == "warp_shuffle" {
         let Some(shuffle) = &policy.warp_shuffle else {
-            return false;
+            return Ok(false);
         };
         let recipe = warp_shuffle_recipe(shuffle.mode, shuffle.value_kind);
-        return selection.asm
+        return Ok(selection.asm
             == format!(
                 "shfl.sync.{}.b32 \t$dst, $src, $offset, $mask, $threadmask;",
                 recipe.ptx_mode
             )
-            && selection.constraints.is_empty();
+            && selection.constraints.is_empty());
     }
 
     if policy.family == "cp_async_copy" {
         let Some(copy) = &policy.cp_async_copy else {
-            return false;
+            return Ok(false);
         };
         let Some(recipe) = cp_async_copy_recipe(copy) else {
-            return false;
+            return Ok(false);
         };
-        return recipe
+        return Ok(recipe
             .selections
             .contains(&selection.source_record.as_str())
-            && policy.expected_ptx.matches(&selection.asm)
-            && selection.constraints.is_empty();
+            && policy.expected_ptx.matches(&selection.asm)?
+            && selection.constraints.is_empty());
     }
 
     if policy.family == "cp_async_control" {
         let Some(control) = &policy.cp_async_control else {
-            return false;
+            return Ok(false);
         };
         let recipe = cp_async_control_recipe(control.operation);
         let instruction_matches = if control.operation == CpAsyncControlOperation::WaitGroup {
             selection.asm == "cp.async.wait_group \t$n;"
         } else {
-            policy.expected_ptx.matches(&selection.asm)
+            policy.expected_ptx.matches(&selection.asm)?
         };
-        return selection.source_record == recipe.selection
+        return Ok(selection.source_record == recipe.selection
             && instruction_matches
-            && selection.constraints.is_empty();
+            && selection.constraints.is_empty());
     }
 
     if policy.family == "cp_async_mbarrier" {
         let Some(bridge) = &policy.cp_async_mbarrier else {
-            return false;
+            return Ok(false);
         };
         let recipe = cp_async_mbarrier_recipe(bridge.operation, bridge.state_space);
-        return selection.source_record == recipe.selection
+        return Ok(selection.source_record == recipe.selection
             && selection.asm == recipe.selection_asm
-            && selection.constraints.is_empty();
+            && selection.constraints.is_empty());
     }
 
     if policy.family == "mbarrier_basic" {
         let Some(mbarrier) = &policy.mbarrier_basic else {
-            return false;
+            return Ok(false);
         };
         let recipe = mbarrier_basic_recipe(mbarrier.operation);
-        return selection.source_record == recipe.selection
-            && policy.expected_ptx.matches(&selection.asm)
-            && selection.constraints.is_empty();
+        return Ok(selection.source_record == recipe.selection
+            && policy.expected_ptx.matches(&selection.asm)?
+            && selection.constraints.is_empty());
     }
 
-    if !policy.expected_ptx.matches(&selection.asm)
+    if !policy.expected_ptx.matches(&selection.asm)?
         || policy
             .selected_address_space
             .is_some_and(|address_space| selection.constraints.address_space != Some(address_space))
     {
-        return false;
+        return Ok(false);
     }
 
     let Some(dot_product) = &policy.dot_product else {
-        return true;
+        return Ok(true);
     };
     if selection.constraints.address_space.is_some() {
-        return false;
+        return Ok(false);
     }
-    match dot_product.adapter {
+    Ok(match dot_product.adapter {
         DotProductAdapter::DirectThreeOperands => {
             selection.constraints.immediate_bindings.is_empty()
         }
@@ -2738,7 +2756,7 @@ fn selection_matches_policy(
                 && selection.constraints.immediate_bindings[0].argument_index == 2
                 && selection.constraints.immediate_bindings[0].value == 0
         }
-    }
+    })
 }
 
 fn selection_matches_tma_policy(
@@ -3163,6 +3181,7 @@ fn expand_threadfence_admission(admission: &ThreadfenceAdmission) -> Result<Vec<
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -3627,6 +3646,7 @@ fn expand_clc_admission(admission: &ClcAdmission) -> Result<Vec<OverlayIntrinsic
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -4442,7 +4462,6 @@ const TMA_OPERATIONS: [TmaOperation; 47] = [
     TmaOperation::PrefetchTileGather4TwoDimensionalCacheHint,
 ];
 
-const TMA_REDUCTION_FIRST_ABI_ID: u32 = 923;
 const TMA_REDUCTION_OPERATIONS: [TmaReductionOperation; 8] = [
     TmaReductionOperation::Add,
     TmaReductionOperation::And,
@@ -4475,20 +4494,14 @@ fn tma_reduction_matrix() -> Vec<TmaReduction> {
     reductions
 }
 
-fn tma_reduction_expected_abi_id(reduction: TmaReduction) -> String {
-    let index = tma_reduction_matrix()
-        .into_iter()
-        .position(|candidate| candidate == reduction)
-        .expect("TMA reduction must belong to the closed matrix");
-    format!("i{:04}", TMA_REDUCTION_FIRST_ABI_ID + index as u32)
-}
-
 #[cfg(test)]
 fn tma_reduction_admission_variants() -> Vec<TmaReductionAdmissionVariant> {
     tma_reduction_matrix()
         .into_iter()
-        .map(|reduction| TmaReductionAdmissionVariant {
-            abi_id: tma_reduction_expected_abi_id(reduction),
+        .enumerate()
+        .map(|(index, reduction)| TmaReductionAdmissionVariant {
+            // Preserve the repository's current ledger assignments in this test fixture.
+            abi_id: format!("i{:04}", 923 + index),
             operation: reduction.operation,
             load_mode: reduction.load_mode,
             dimensions: reduction.dimensions,
@@ -4607,19 +4620,13 @@ fn expand_tma_reduction_variant(
     admission: &TmaAdmission,
     variant: &TmaReductionAdmissionVariant,
 ) -> Result<OverlayIntrinsic> {
+    validate_abi_id(&variant.abi_id)?;
     let reduction = TmaReduction {
         operation: variant.operation,
         load_mode: variant.load_mode,
         dimensions: variant.dimensions,
     };
     let recipe = tma_reduction_recipe(reduction)?;
-    let expected_abi_id = tma_reduction_expected_abi_id(reduction);
-    ensure!(
-        variant.abi_id == expected_abi_id,
-        "{} must keep reserved ABI ID {}",
-        recipe.id,
-        expected_abi_id
-    );
 
     Ok(OverlayIntrinsic {
         id: recipe.id.clone(),
@@ -4706,6 +4713,7 @@ fn expand_tma_reduction_variant(
         warp_shuffle: None,
         dot_product: None,
         packed_alu: None,
+        integer_minmax: None,
         packed_conversion: None,
         scalar_conversion: None,
         scalar_arithmetic: None,
@@ -5864,6 +5872,7 @@ fn expand_tma_admission(admission: &TmaAdmission) -> Result<Vec<OverlayIntrinsic
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -6059,7 +6068,6 @@ fn validate_tma_reduction_policy(
     let recipe = tma_reduction_recipe(reduction)?;
     ensure!(
         policy.id == recipe.id
-            && policy.abi_id == tma_reduction_expected_abi_id(reduction)
             && policy.operation_key == recipe.operation_key
             && policy.source.is_none()
             && policy.source_record.as_deref() == Some(recipe.source_record.as_str())
@@ -7480,13 +7488,17 @@ fn tcgen05_mma_expected_ptx(
 }
 
 fn tcgen05_mma_rust_arguments(form: Tcgen05MmaForm, alias: Option<Tcgen05MmaAlias>) -> Vec<String> {
-    if alias.is_some() {
+    if alias.is_some() && form == Tcgen05MmaForm::WsTensor {
         return ["u32", "u32", "u64", "u64", "u32", "bool"]
             .into_iter()
             .map(str::to_owned)
             .collect();
     }
-    tcgen05_mma_llvm_arguments(form)
+    let mut arguments = tcgen05_mma_llvm_arguments(form);
+    if alias.is_some() {
+        arguments.truncate(arguments.len() - 3);
+    }
+    arguments
         .iter()
         .map(|argument| match argument.as_str() {
             "tmem_ptr" | "i32" => "u32",
@@ -7500,14 +7512,8 @@ fn tcgen05_mma_rust_arguments(form: Tcgen05MmaForm, alias: Option<Tcgen05MmaAlia
 
 fn tcgen05_mma_dialect_operands(
     form: Tcgen05MmaForm,
-    alias: Option<Tcgen05MmaAlias>,
+    _alias: Option<Tcgen05MmaAlias>,
 ) -> Vec<String> {
-    if alias.is_some() {
-        return ["i32", "i32", "i64", "i32", "i1"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-    }
     let mut arguments = tcgen05_mma_llvm_arguments(form);
     arguments.truncate(arguments.len() - 3);
     arguments
@@ -7522,6 +7528,37 @@ fn tcgen05_mma_dialect_operands(
         .collect()
 }
 
+fn tcgen05_mma_public_id(form: Tcgen05MmaForm, alias: Option<Tcgen05MmaAlias>) -> String {
+    alias.map_or_else(
+        || format!("tcgen05_mma_{}", tcgen05_mma_form_name(form)),
+        |alias| {
+            let alias = tcgen05_mma_alias_name(alias);
+            if form == Tcgen05MmaForm::WsTensor {
+                format!("tcgen05_mma_ws_{alias}")
+            } else {
+                format!("tcgen05_mma_{alias}")
+            }
+        },
+    )
+}
+
+fn tcgen05_mma_operation_key(form: Tcgen05MmaForm, alias: Option<Tcgen05MmaAlias>) -> String {
+    let base = tcgen05_mma_form_name(form).replace('_', ".");
+    alias.map_or_else(
+        || format!("tcgen05.mma.{base}"),
+        |alias| format!("tcgen05.mma.{base}.{}", tcgen05_mma_alias_name(alias)),
+    )
+}
+
+fn tcgen05_mma_adapter(form: Tcgen05MmaForm, alias: Option<Tcgen05MmaAlias>) -> Tcgen05Adapter {
+    match alias {
+        Some(_) if form == Tcgen05MmaForm::WsTensor => {
+            Tcgen05Adapter::MmaWsFixedSelectorsDropLegacyADescriptor
+        }
+        _ => Tcgen05Adapter::MmaDirectSelectors,
+    }
+}
+
 fn materialize_tcgen05_mma_variant(
     admission: &Tcgen05Admission,
     variant: &Tcgen05MmaAdmissionVariant,
@@ -7530,19 +7567,8 @@ fn materialize_tcgen05_mma_variant(
 ) -> OverlayIntrinsic {
     let form = variant.form;
     let alias = variant.alias;
-    let id = alias.map_or_else(
-        || format!("tcgen05_mma_{}", tcgen05_mma_form_name(form)),
-        |alias| format!("tcgen05_mma_ws_{}", tcgen05_mma_alias_name(alias)),
-    );
-    let operation_key = alias.map_or_else(
-        || {
-            format!(
-                "tcgen05.mma.{}",
-                tcgen05_mma_form_name(form).replace('_', ".")
-            )
-        },
-        |alias| format!("tcgen05.mma.ws.tensor.{}", tcgen05_mma_alias_name(alias)),
-    );
+    let id = tcgen05_mma_public_id(form, alias);
+    let operation_key = tcgen05_mma_operation_key(form, alias);
     let llvm_arguments = tcgen05_mma_llvm_arguments(form);
     let rust_arguments = tcgen05_mma_rust_arguments(form, alias);
     let dialect_operands = tcgen05_mma_dialect_operands(form, alias);
@@ -7628,6 +7654,7 @@ fn materialize_tcgen05_mma_variant(
         warp_shuffle: None,
         dot_product: None,
         packed_alu: None,
+        integer_minmax: None,
         packed_conversion: None,
         scalar_conversion: None,
         scalar_arithmetic: None,
@@ -7662,11 +7689,7 @@ fn materialize_tcgen05_mma_variant(
                 llvm_target: llvm_target.clone(),
                 libnvvm_target: libnvvm_target.clone(),
             }),
-            adapter: if alias.is_some() {
-                Tcgen05Adapter::MmaWsFixedSelectorsDropLegacyADescriptor
-            } else {
-                Tcgen05Adapter::MmaDirectSelectors
-            },
+            adapter: tcgen05_mma_adapter(form, alias),
             source_contract: Tcgen05SourceContract::TablegenSelectionChangesPtx,
             runtime_validation: admission.runtime_validation,
         }),
@@ -7675,10 +7698,14 @@ fn materialize_tcgen05_mma_variant(
         ldmatrix_adapter: None,
         selected_address_space: None,
         expected_ptx: tcgen05_mma_expected_ptx(form, alias),
-        summary: if alias.is_some() {
-            "Issues one f8f6f4 warp-specialized tensor-memory MMA.".into()
-        } else {
-            "Issues one selector-controlled tensor-memory MMA.".into()
+        summary: match (form, alias) {
+            (Tcgen05MmaForm::WsTensor, Some(_)) => {
+                "Issues one f8f6f4 warp-specialized tensor-memory MMA.".into()
+            }
+            (Tcgen05MmaForm::Shared, Some(_)) => {
+                "Issues one f8f6f4 standard tensor-memory MMA.".into()
+            }
+            _ => "Issues one selector-controlled tensor-memory MMA.".into(),
         },
     }
 }
@@ -8513,6 +8540,7 @@ fn expand_tcgen05_admission(admission: &Tcgen05Admission) -> Result<Vec<OverlayI
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -8601,13 +8629,8 @@ fn expand_tcgen05_admission(admission: &Tcgen05Admission) -> Result<Vec<OverlayI
                 .eq(expected_cp),
             "compact tcgen05 copy admission must list all 34 variants in canonical order"
         );
-        for (index, variant) in admission.cp_variants.iter().enumerate() {
-            let reserved = format!("i{:04}", 578 + index);
-            ensure!(
-                variant.abi_id == reserved,
-                "tcgen05 copy variant {} must keep reserved ABI ID {reserved}",
-                index + 1
-            );
+        for variant in &admission.cp_variants {
+            validate_abi_id(&variant.abi_id)?;
             let base_id = if variant.group == Cg1 {
                 "tcgen05_cp_smem_to_tmem"
             } else {
@@ -8662,13 +8685,8 @@ fn expand_tcgen05_admission(admission: &Tcgen05Admission) -> Result<Vec<OverlayI
             .expect("closed tcgen05 load base")
             .clone();
         let first_load = records.len();
-        for (index, variant) in admission.ld_variants.iter().enumerate() {
-            let reserved = format!("i{:04}", 612 + index);
-            ensure!(
-                variant.abi_id == reserved,
-                "tcgen05 load variant {} must keep reserved ABI ID {reserved}",
-                index + 1
-            );
+        for variant in &admission.ld_variants {
+            validate_abi_id(&variant.abi_id)?;
             records.push(materialize_tcgen05_ld_variant(&base, admission, variant));
         }
         for pair in records[first_load..].chunks_exact(2) {
@@ -8728,13 +8746,8 @@ fn expand_tcgen05_admission(admission: &Tcgen05Admission) -> Result<Vec<OverlayI
             .expect("closed tcgen05 store base")
             .clone();
         let first_store = records.len();
-        for (index, variant) in admission.st_variants.iter().enumerate() {
-            let reserved = format!("i{:04}", 670 + index);
-            ensure!(
-                variant.abi_id == reserved,
-                "tcgen05 store variant {} must keep reserved ABI ID {reserved}",
-                index + 1
-            );
+        for variant in &admission.st_variants {
+            validate_abi_id(&variant.abi_id)?;
             records.push(materialize_tcgen05_st_variant(&base, admission, variant));
         }
         for pair in records[first_store..].chunks_exact(2) {
@@ -8811,13 +8824,8 @@ fn expand_tcgen05_admission(admission: &Tcgen05Admission) -> Result<Vec<OverlayI
             .expect("closed tcgen05 offset load/store base")
             .clone();
         let first_load = records.len();
-        for (index, variant) in admission.ld_offset_variants.iter().enumerate() {
-            let reserved = format!("i{:04}", 728 + index);
-            ensure!(
-                variant.abi_id == reserved,
-                "tcgen05 offset load variant {} must keep reserved ABI ID {reserved}",
-                index + 1
-            );
+        for variant in &admission.ld_offset_variants {
+            validate_abi_id(&variant.abi_id)?;
             records.push(materialize_tcgen05_ld_variant(&base, admission, variant));
         }
         for pair in records[first_load..].chunks_exact(2) {
@@ -8837,13 +8845,8 @@ fn expand_tcgen05_admission(admission: &Tcgen05Admission) -> Result<Vec<OverlayI
         }
 
         let first_store = records.len();
-        for (index, variant) in admission.st_offset_variants.iter().enumerate() {
-            let reserved = format!("i{:04}", 744 + index);
-            ensure!(
-                variant.abi_id == reserved,
-                "tcgen05 offset store variant {} must keep reserved ABI ID {reserved}",
-                index + 1
-            );
+        for variant in &admission.st_offset_variants {
+            validate_abi_id(&variant.abi_id)?;
             records.push(materialize_tcgen05_st_variant(&base, admission, variant));
         }
         for pair in records[first_store..].chunks_exact(2) {
@@ -8891,6 +8894,11 @@ fn expand_tcgen05_admission(admission: &Tcgen05Admission) -> Result<Vec<OverlayI
                     .into_iter()
                     .map(|alias| (Tcgen05MmaForm::WsTensor, Some(alias))),
             )
+            .chain(
+                TCGEN05_MMA_ALIASES
+                    .into_iter()
+                    .map(|alias| (Tcgen05MmaForm::Shared, Some(alias))),
+            )
             .collect::<Vec<_>>();
         ensure!(
             admission
@@ -8898,17 +8906,11 @@ fn expand_tcgen05_admission(admission: &Tcgen05Admission) -> Result<Vec<OverlayI
                 .iter()
                 .map(|variant| (variant.form, variant.alias))
                 .eq(expected_variants),
-            "compact tcgen05 MMA admission must list all 19 APIs in canonical order"
+            "compact tcgen05 MMA admission must list all 24 APIs in canonical order"
         );
-        for (index, variant) in admission.mma_variants.iter().enumerate() {
-            let reserved = format!("i{:04}", 763 + index);
-            ensure!(
-                variant.abi_id == reserved,
-                "tcgen05 MMA variant {} must keep reserved ABI ID {reserved}",
-                index + 1
-            );
+        for variant in &admission.mma_variants {
+            validate_abi_id(&variant.abi_id)?;
         }
-
         let expected_llvm = expected_tcgen05_mma_target_contracts(IntrinsicBackend::LlvmNvptx);
         let expected_libnvvm = expected_tcgen05_mma_target_contracts(IntrinsicBackend::LibNvvm);
         ensure!(
@@ -9059,31 +9061,19 @@ fn validate_tcgen05_mma_policy(
 ) -> Result<()> {
     let form = mma.form;
     let alias = mma.alias;
-    let id = alias.map_or_else(
-        || format!("tcgen05_mma_{}", tcgen05_mma_form_name(form)),
-        |alias| format!("tcgen05_mma_ws_{}", tcgen05_mma_alias_name(alias)),
-    );
-    let operation_key = alias.map_or_else(
-        || {
-            format!(
-                "tcgen05.mma.{}",
-                tcgen05_mma_form_name(form).replace('_', ".")
-            )
+    ensure!(
+        match alias {
+            Some(alias) => {
+                matches!(form, Tcgen05MmaForm::Shared | Tcgen05MmaForm::WsTensor)
+                    && TCGEN05_MMA_ALIASES.contains(&alias)
+            }
+            None => TCGEN05_MMA_FORMS.contains(&form),
         },
-        |alias| format!("tcgen05.mma.ws.tensor.{}", tcgen05_mma_alias_name(alias)),
+        "{} has an unsupported tcgen05 MMA identity",
+        policy.id
     );
-    let index = if let Some(alias) = alias {
-        14 + TCGEN05_MMA_ALIASES
-            .iter()
-            .position(|candidate| *candidate == alias)
-            .context("unknown tcgen05 MMA alias")?
-    } else {
-        TCGEN05_MMA_FORMS
-            .iter()
-            .position(|candidate| *candidate == form)
-            .context("unknown tcgen05 MMA form")?
-    };
-    let abi_id = format!("i{:04}", 763 + index);
+    let id = tcgen05_mma_public_id(form, alias);
+    let operation_key = tcgen05_mma_operation_key(form, alias);
     let llvm_arguments = tcgen05_mma_llvm_arguments(form);
     let expected_fixed = alias.map(|_| Tcgen05MmaFixedSelectors {
         kind: Tcgen05MmaKind::F8f6f4,
@@ -9092,7 +9082,6 @@ fn validate_tcgen05_mma_policy(
     });
     ensure!(
         policy.id == id
-            && policy.abi_id == abi_id
             && policy.operation_key == operation_key
             && policy.source.is_none()
             && policy.source_record.as_deref() == Some(tcgen05_mma_source_record(form).as_str())
@@ -9153,12 +9142,7 @@ fn validate_tcgen05_mma_policy(
             && tcgen05.st.is_none()
             && mma.selector_layout == tcgen05_mma_selector_layout(form)
             && mma.fixed_selectors == expected_fixed
-            && tcgen05.adapter
-                == if alias.is_some() {
-                    Tcgen05Adapter::MmaWsFixedSelectorsDropLegacyADescriptor
-                } else {
-                    Tcgen05Adapter::MmaDirectSelectors
-                }
+            && tcgen05.adapter == tcgen05_mma_adapter(form, alias)
             && tcgen05.source_contract == Tcgen05SourceContract::TablegenSelectionChangesPtx
             && tcgen05.runtime_validation == RuntimeValidation::Unexecuted,
         "{} tcgen05 MMA semantics or selector contract changed",
@@ -9233,14 +9217,18 @@ fn validate_tcgen05_mma_policy(
 
     let expected_all = tcgen05_mma_all_selection_asms(form);
     let expected_valid = if alias.is_some() {
-        BTreeSet::from([tcgen05_mma_selection_asm(
-            Tcgen05MmaForm::WsTensor,
-            Tcgen05MmaKind::F8f6f4,
-            1,
-            None,
-            Some(0),
-            Some(Tcgen05MmaBUsage::Discard),
-        )])
+        BTreeSet::from([if tcgen05_mma_is_ws(form) {
+            tcgen05_mma_selection_asm(
+                form,
+                Tcgen05MmaKind::F8f6f4,
+                1,
+                None,
+                Some(0),
+                Some(Tcgen05MmaBUsage::Discard),
+            )
+        } else {
+            tcgen05_mma_selection_asm(form, Tcgen05MmaKind::F8f6f4, 1, Some("discard"), None, None)
+        }])
     } else {
         tcgen05_mma_valid_selection_asms(form)
     };
@@ -9302,14 +9290,10 @@ fn validate_tcgen05_ld_policy(
     } else {
         &TCGEN05_LD_VARIANTS
     };
-    let source_index = variants
-        .iter()
-        .position(|identity| *identity == (ld.shape, ld.multiplicity))
-        .with_context(|| format!("{} has an unsupported tcgen05 load identity", policy.id))?;
-    let first_abi = if has_half_split_offset { 728 } else { 612 };
-    let expected_abi_id = format!(
-        "i{:04}",
-        first_abi + source_index * 2 + usize::from(ld.pack16)
+    ensure!(
+        variants.contains(&(ld.shape, ld.multiplicity)),
+        "{} has an unsupported tcgen05 load identity",
+        policy.id
     );
     let id = tcgen05_ld_id(ld);
     let source_record = tcgen05_ld_source_record(ld);
@@ -9356,7 +9340,6 @@ fn validate_tcgen05_ld_policy(
     };
     ensure!(
         policy.id == id
-            && policy.abi_id == expected_abi_id
             && policy.operation_key
                 == format!(
                     "tcgen05.ld.{}.{}.{}",
@@ -9452,14 +9435,10 @@ fn validate_tcgen05_st_policy(
     } else {
         &TCGEN05_ST_VARIANTS
     };
-    let source_index = variants
-        .iter()
-        .position(|identity| *identity == (st.shape, st.multiplicity))
-        .with_context(|| format!("{} has an unsupported tcgen05 store identity", policy.id))?;
-    let first_abi = if has_half_split_offset { 744 } else { 670 };
-    let expected_abi_id = format!(
-        "i{:04}",
-        first_abi + source_index * 2 + usize::from(st.unpack16)
+    ensure!(
+        variants.contains(&(st.shape, st.multiplicity)),
+        "{} has an unsupported tcgen05 store identity",
+        policy.id
     );
     let id = tcgen05_st_id(st);
     let source_record = tcgen05_st_source_record(st);
@@ -9505,7 +9484,6 @@ fn validate_tcgen05_st_policy(
     };
     ensure!(
         policy.id == id
-            && policy.abi_id == expected_abi_id
             && policy.operation_key
                 == format!(
                     "tcgen05.st.{}.{}.{}",
@@ -9595,6 +9573,11 @@ fn validate_tcgen05_cp_policy(
     tcgen05: &Tcgen05,
     cp: Tcgen05Cp,
 ) -> Result<()> {
+    ensure!(
+        TCGEN05_CP_MEMBERS.contains(&cp.member),
+        "{} has an unsupported tcgen05 copy identity",
+        policy.id
+    );
     let recipe = tcgen05_cp_member_recipe(cp.member);
     let group = match cp.group {
         Tcgen05CpGroup::Cg1 => 1,
@@ -9603,14 +9586,6 @@ fn validate_tcgen05_cp_policy(
     let group_suffix = if group == 1 { "" } else { "_cg2" };
     let id_suffix = recipe.llvm_suffix.replace('.', "_");
     let id = format!("tcgen05_cp_{id_suffix}{group_suffix}");
-    let member_index = TCGEN05_CP_MEMBERS
-        .iter()
-        .position(|member| *member == cp.member)
-        .expect("closed tcgen05 copy member");
-    let expected_abi_id = format!(
-        "i{:04}",
-        578 + member_index * 2 + usize::from(cp.group == Tcgen05CpGroup::Cg2)
-    );
     let operation = if group == 1 {
         Tcgen05Operation::CpSmemToTmem
     } else {
@@ -9629,7 +9604,6 @@ fn validate_tcgen05_cp_policy(
         .collect::<Vec<String>>();
     ensure!(
         policy.id == id
-            && policy.abi_id == expected_abi_id
             && policy.operation_key == format!("tcgen05.cp.{}.cg{group}", recipe.llvm_suffix)
             && policy.source.is_none()
             && policy.source_record.as_deref() == Some(source_record.as_str())
@@ -11718,6 +11692,7 @@ fn validate_selected_target_predicates(
     let mut has_tcgen05_mma_i8_support = false;
     let mut has_ldstmatrix_blackwell_support = false;
     let mut has_mma_block_scale_support = false;
+    let mut has_redux_sync_f32_support = false;
     for predicate in &selection.predicates {
         if let Some(value) = predicate.strip_prefix("Subtarget->getPTXVersion() >= ") {
             let value = value.parse::<u16>().with_context(|| {
@@ -11903,6 +11878,22 @@ fn validate_selected_target_predicates(
                 policy.id
             );
             has_mma_block_scale_support = true;
+        } else if predicate == "Subtarget->hasReduxSyncF32()" {
+            ensure!(
+                policy.family == "redux"
+                    && policy
+                        .redux
+                        .as_ref()
+                        .is_some_and(|redux| redux_recipe(redux.operation).value_type == "f32"),
+                "{} uses the f32 redux target predicate outside an f32 redux operation",
+                policy.id
+            );
+            ensure!(
+                !has_redux_sync_f32_support && imported_ptx.is_none() && imported_sm.is_none(),
+                "{} has duplicate or conflicting f32 redux target predicates",
+                policy.id
+            );
+            has_redux_sync_f32_support = true;
         } else {
             bail!(
                 "{} selected instruction has unsupported target predicate {predicate:?}; target gates must fail closed",
@@ -11965,6 +11956,17 @@ fn validate_selected_target_predicates(
         ensure!(
             minimum_ptx_matches && target_matches,
             "{} MMA block-scale predicate requires its reviewed Blackwell target matrix",
+            policy.id
+        );
+        return Ok(());
+    }
+    if has_redux_sync_f32_support {
+        ensure!(
+            selection.predicates.len() == 1
+                && overlay_ptx == 86
+                && policy.targets == REDUX_F32_TARGETS
+                && policy.minimum_sm.is_none(),
+            "{} f32 redux selection must carry only the hasReduxSyncF32 predicate and its reviewed Blackwell target matrix",
             policy.id
         );
         return Ok(());
@@ -12685,6 +12687,7 @@ fn expand_special_register_admission(
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -13321,6 +13324,7 @@ fn cluster_sreg_policy(recipe: ClusterSregRecipe) -> OverlayIntrinsic {
         warp_shuffle: None,
         dot_product: None,
         packed_alu: None,
+        integer_minmax: None,
         packed_conversion: None,
         scalar_conversion: None,
         scalar_arithmetic: None,
@@ -13624,10 +13628,10 @@ fn validate_redux_policy(policy: &OverlayIntrinsic, declaration: &ImportedIntrin
     ensure!(
         policy.dialect_op_type == recipe.dialect_op_type
             && policy.dialect_op_name == recipe.dialect_op_name
-            && policy.dialect_operands == ["i32", "i32"]
-            && policy.dialect_results == ["i32"]
-            && policy.llvm_arguments == ["i32", "i32"]
-            && policy.llvm_results == ["i32"]
+            && policy.dialect_operands == ["i32", recipe.value_type]
+            && policy.dialect_results == [recipe.value_type]
+            && policy.llvm_arguments == [recipe.value_type, "i32"]
+            && policy.llvm_results == [recipe.value_type]
             && policy.lowering == "generated_redux",
         "{} is outside the generated two-operand redux recipe",
         policy.id
@@ -13637,10 +13641,10 @@ fn validate_redux_policy(policy: &OverlayIntrinsic, declaration: &ImportedIntrin
             && policy.memory == "inaccessible_read_write"
             && policy.convergent
             && policy.execution_scope == "warp"
-            && policy.minimum_ptx == "7.0"
-            && policy.minimum_sm.as_deref() == Some("sm_80")
+            && policy.minimum_ptx == recipe.minimum_ptx
+            && policy.minimum_sm.as_deref() == recipe.minimum_sm
             && policy.ptx_result == recipe.rust_value
-            && policy.targets == "all",
+            && policy.targets == recipe.targets,
         "{} redux effects, carrier, or target floor disagree with its operation recipe",
         policy.id
     );
@@ -13687,7 +13691,7 @@ fn validate_redux_policy(policy: &OverlayIntrinsic, declaration: &ImportedIntrin
     );
     ensure!(
         policy.expected_ptx.mnemonic == "redux"
-            && policy.expected_ptx.modifiers == ["sync", recipe.ptx_operation, recipe.ptx_type]
+            && policy.expected_ptx.modifiers == recipe.ptx_modifiers
             && policy.expected_ptx.operands
                 == [
                     OperandPattern::Register,
@@ -13700,6 +13704,10 @@ fn validate_redux_policy(policy: &OverlayIntrinsic, declaration: &ImportedIntrin
     Ok(())
 }
 
+// Pinned LLVM's hasReduxSyncF32(): accel {100} at PTX 8.6, family {100} at
+// PTX 8.8. The catalog carries the accel floor with the a/f target union.
+const REDUX_F32_TARGETS: &str = "sm_100a|sm_100f|sm_103a|sm_103f";
+
 struct ReduxRecipe {
     id: &'static str,
     operation_key: &'static str,
@@ -13707,10 +13715,13 @@ struct ReduxRecipe {
     llvm_symbol: &'static str,
     rust_name: &'static str,
     rust_value: &'static str,
+    value_type: &'static str,
     dialect_op_type: &'static str,
     dialect_op_name: &'static str,
-    ptx_operation: &'static str,
-    ptx_type: &'static str,
+    ptx_modifiers: &'static [&'static str],
+    minimum_ptx: &'static str,
+    minimum_sm: Option<&'static str>,
+    targets: &'static str,
 }
 
 fn redux_recipe(operation: ReduxOperation) -> ReduxRecipe {
@@ -13722,10 +13733,13 @@ fn redux_recipe(operation: ReduxOperation) -> ReduxRecipe {
             llvm_symbol: "llvm.nvvm.redux.sync.add",
             rust_name: "redux_sync_add",
             rust_value: "u32",
+            value_type: "i32",
             dialect_op_type: "ReduxSyncAddOp",
             dialect_op_name: "nvvm.redux_sync_add",
-            ptx_operation: "add",
-            ptx_type: "s32",
+            ptx_modifiers: &["sync", "add", "s32"],
+            minimum_ptx: "7.0",
+            minimum_sm: Some("sm_80"),
+            targets: "all",
         },
         ReduxOperation::Umin => ReduxRecipe {
             id: "redux_sync_min_u32",
@@ -13734,10 +13748,13 @@ fn redux_recipe(operation: ReduxOperation) -> ReduxRecipe {
             llvm_symbol: "llvm.nvvm.redux.sync.umin",
             rust_name: "redux_sync_min_u32",
             rust_value: "u32",
+            value_type: "i32",
             dialect_op_type: "ReduxSyncUminOp",
             dialect_op_name: "nvvm.redux_sync_umin",
-            ptx_operation: "min",
-            ptx_type: "u32",
+            ptx_modifiers: &["sync", "min", "u32"],
+            minimum_ptx: "7.0",
+            minimum_sm: Some("sm_80"),
+            targets: "all",
         },
         ReduxOperation::Min => ReduxRecipe {
             id: "redux_sync_min_i32",
@@ -13746,10 +13763,13 @@ fn redux_recipe(operation: ReduxOperation) -> ReduxRecipe {
             llvm_symbol: "llvm.nvvm.redux.sync.min",
             rust_name: "redux_sync_min_i32",
             rust_value: "i32",
+            value_type: "i32",
             dialect_op_type: "ReduxSyncMinOp",
             dialect_op_name: "nvvm.redux_sync_min",
-            ptx_operation: "min",
-            ptx_type: "s32",
+            ptx_modifiers: &["sync", "min", "s32"],
+            minimum_ptx: "7.0",
+            minimum_sm: Some("sm_80"),
+            targets: "all",
         },
         ReduxOperation::Umax => ReduxRecipe {
             id: "redux_sync_max_u32",
@@ -13758,10 +13778,13 @@ fn redux_recipe(operation: ReduxOperation) -> ReduxRecipe {
             llvm_symbol: "llvm.nvvm.redux.sync.umax",
             rust_name: "redux_sync_max_u32",
             rust_value: "u32",
+            value_type: "i32",
             dialect_op_type: "ReduxSyncUmaxOp",
             dialect_op_name: "nvvm.redux_sync_umax",
-            ptx_operation: "max",
-            ptx_type: "u32",
+            ptx_modifiers: &["sync", "max", "u32"],
+            minimum_ptx: "7.0",
+            minimum_sm: Some("sm_80"),
+            targets: "all",
         },
         ReduxOperation::Max => ReduxRecipe {
             id: "redux_sync_max_i32",
@@ -13770,10 +13793,13 @@ fn redux_recipe(operation: ReduxOperation) -> ReduxRecipe {
             llvm_symbol: "llvm.nvvm.redux.sync.max",
             rust_name: "redux_sync_max_i32",
             rust_value: "i32",
+            value_type: "i32",
             dialect_op_type: "ReduxSyncMaxOp",
             dialect_op_name: "nvvm.redux_sync_max",
-            ptx_operation: "max",
-            ptx_type: "s32",
+            ptx_modifiers: &["sync", "max", "s32"],
+            minimum_ptx: "7.0",
+            minimum_sm: Some("sm_80"),
+            targets: "all",
         },
         ReduxOperation::And => ReduxRecipe {
             id: "redux_sync_and",
@@ -13782,10 +13808,13 @@ fn redux_recipe(operation: ReduxOperation) -> ReduxRecipe {
             llvm_symbol: "llvm.nvvm.redux.sync.and",
             rust_name: "redux_sync_and",
             rust_value: "u32",
+            value_type: "i32",
             dialect_op_type: "ReduxSyncAndOp",
             dialect_op_name: "nvvm.redux_sync_and",
-            ptx_operation: "and",
-            ptx_type: "b32",
+            ptx_modifiers: &["sync", "and", "b32"],
+            minimum_ptx: "7.0",
+            minimum_sm: Some("sm_80"),
+            targets: "all",
         },
         ReduxOperation::Or => ReduxRecipe {
             id: "redux_sync_or",
@@ -13794,10 +13823,13 @@ fn redux_recipe(operation: ReduxOperation) -> ReduxRecipe {
             llvm_symbol: "llvm.nvvm.redux.sync.or",
             rust_name: "redux_sync_or",
             rust_value: "u32",
+            value_type: "i32",
             dialect_op_type: "ReduxSyncOrOp",
             dialect_op_name: "nvvm.redux_sync_or",
-            ptx_operation: "or",
-            ptx_type: "b32",
+            ptx_modifiers: &["sync", "or", "b32"],
+            minimum_ptx: "7.0",
+            minimum_sm: Some("sm_80"),
+            targets: "all",
         },
         ReduxOperation::Xor => ReduxRecipe {
             id: "redux_sync_xor",
@@ -13806,10 +13838,133 @@ fn redux_recipe(operation: ReduxOperation) -> ReduxRecipe {
             llvm_symbol: "llvm.nvvm.redux.sync.xor",
             rust_name: "redux_sync_xor",
             rust_value: "u32",
+            value_type: "i32",
             dialect_op_type: "ReduxSyncXorOp",
             dialect_op_name: "nvvm.redux_sync_xor",
-            ptx_operation: "xor",
-            ptx_type: "b32",
+            ptx_modifiers: &["sync", "xor", "b32"],
+            minimum_ptx: "7.0",
+            minimum_sm: Some("sm_80"),
+            targets: "all",
+        },
+        ReduxOperation::Fmin => ReduxRecipe {
+            id: "redux_sync_min_f32",
+            operation_key: "warp.redux.sync.min.f32",
+            source_record: "int_nvvm_redux_sync_fmin",
+            llvm_symbol: "llvm.nvvm.redux.sync.fmin",
+            rust_name: "redux_sync_min_f32",
+            rust_value: "f32",
+            value_type: "f32",
+            dialect_op_type: "ReduxSyncFminOp",
+            dialect_op_name: "nvvm.redux_sync_fmin",
+            ptx_modifiers: &["sync", "min", "f32"],
+            minimum_ptx: "8.6",
+            minimum_sm: None,
+            targets: REDUX_F32_TARGETS,
+        },
+        ReduxOperation::FminNan => ReduxRecipe {
+            id: "redux_sync_min_nan_f32",
+            operation_key: "warp.redux.sync.min.nan.f32",
+            source_record: "int_nvvm_redux_sync_fmin_NaN",
+            llvm_symbol: "llvm.nvvm.redux.sync.fmin.NaN",
+            rust_name: "redux_sync_min_nan_f32",
+            rust_value: "f32",
+            value_type: "f32",
+            dialect_op_type: "ReduxSyncFminNanOp",
+            dialect_op_name: "nvvm.redux_sync_fmin_nan",
+            ptx_modifiers: &["sync", "min", "NaN", "f32"],
+            minimum_ptx: "8.6",
+            minimum_sm: None,
+            targets: REDUX_F32_TARGETS,
+        },
+        ReduxOperation::FminAbs => ReduxRecipe {
+            id: "redux_sync_min_abs_f32",
+            operation_key: "warp.redux.sync.min.abs.f32",
+            source_record: "int_nvvm_redux_sync_fmin_abs",
+            llvm_symbol: "llvm.nvvm.redux.sync.fmin.abs",
+            rust_name: "redux_sync_min_abs_f32",
+            rust_value: "f32",
+            value_type: "f32",
+            dialect_op_type: "ReduxSyncFminAbsOp",
+            dialect_op_name: "nvvm.redux_sync_fmin_abs",
+            ptx_modifiers: &["sync", "min", "abs", "f32"],
+            minimum_ptx: "8.6",
+            minimum_sm: None,
+            targets: REDUX_F32_TARGETS,
+        },
+        ReduxOperation::FminAbsNan => ReduxRecipe {
+            id: "redux_sync_min_abs_nan_f32",
+            operation_key: "warp.redux.sync.min.abs.nan.f32",
+            source_record: "int_nvvm_redux_sync_fmin_abs_NaN",
+            llvm_symbol: "llvm.nvvm.redux.sync.fmin.abs.NaN",
+            rust_name: "redux_sync_min_abs_nan_f32",
+            rust_value: "f32",
+            value_type: "f32",
+            dialect_op_type: "ReduxSyncFminAbsNanOp",
+            dialect_op_name: "nvvm.redux_sync_fmin_abs_nan",
+            ptx_modifiers: &["sync", "min", "abs", "NaN", "f32"],
+            minimum_ptx: "8.6",
+            minimum_sm: None,
+            targets: REDUX_F32_TARGETS,
+        },
+        ReduxOperation::Fmax => ReduxRecipe {
+            id: "redux_sync_max_f32",
+            operation_key: "warp.redux.sync.max.f32",
+            source_record: "int_nvvm_redux_sync_fmax",
+            llvm_symbol: "llvm.nvvm.redux.sync.fmax",
+            rust_name: "redux_sync_max_f32",
+            rust_value: "f32",
+            value_type: "f32",
+            dialect_op_type: "ReduxSyncFmaxOp",
+            dialect_op_name: "nvvm.redux_sync_fmax",
+            ptx_modifiers: &["sync", "max", "f32"],
+            minimum_ptx: "8.6",
+            minimum_sm: None,
+            targets: REDUX_F32_TARGETS,
+        },
+        ReduxOperation::FmaxNan => ReduxRecipe {
+            id: "redux_sync_max_nan_f32",
+            operation_key: "warp.redux.sync.max.nan.f32",
+            source_record: "int_nvvm_redux_sync_fmax_NaN",
+            llvm_symbol: "llvm.nvvm.redux.sync.fmax.NaN",
+            rust_name: "redux_sync_max_nan_f32",
+            rust_value: "f32",
+            value_type: "f32",
+            dialect_op_type: "ReduxSyncFmaxNanOp",
+            dialect_op_name: "nvvm.redux_sync_fmax_nan",
+            ptx_modifiers: &["sync", "max", "NaN", "f32"],
+            minimum_ptx: "8.6",
+            minimum_sm: None,
+            targets: REDUX_F32_TARGETS,
+        },
+        ReduxOperation::FmaxAbs => ReduxRecipe {
+            id: "redux_sync_max_abs_f32",
+            operation_key: "warp.redux.sync.max.abs.f32",
+            source_record: "int_nvvm_redux_sync_fmax_abs",
+            llvm_symbol: "llvm.nvvm.redux.sync.fmax.abs",
+            rust_name: "redux_sync_max_abs_f32",
+            rust_value: "f32",
+            value_type: "f32",
+            dialect_op_type: "ReduxSyncFmaxAbsOp",
+            dialect_op_name: "nvvm.redux_sync_fmax_abs",
+            ptx_modifiers: &["sync", "max", "abs", "f32"],
+            minimum_ptx: "8.6",
+            minimum_sm: None,
+            targets: REDUX_F32_TARGETS,
+        },
+        ReduxOperation::FmaxAbsNan => ReduxRecipe {
+            id: "redux_sync_max_abs_nan_f32",
+            operation_key: "warp.redux.sync.max.abs.nan.f32",
+            source_record: "int_nvvm_redux_sync_fmax_abs_NaN",
+            llvm_symbol: "llvm.nvvm.redux.sync.fmax.abs.NaN",
+            rust_name: "redux_sync_max_abs_nan_f32",
+            rust_value: "f32",
+            value_type: "f32",
+            dialect_op_type: "ReduxSyncFmaxAbsNanOp",
+            dialect_op_name: "nvvm.redux_sync_fmax_abs_nan",
+            ptx_modifiers: &["sync", "max", "abs", "NaN", "f32"],
+            minimum_ptx: "8.6",
+            minimum_sm: None,
+            targets: REDUX_F32_TARGETS,
         },
     }
 }
@@ -14256,6 +14411,7 @@ fn expand_stmatrix_admission(admission: &StmatrixAdmission) -> Result<Vec<Overla
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -14910,8 +15066,149 @@ fn packed_alu_recipe(
 ) -> Option<PackedAluRecipe> {
     match format {
         PackedAluFormat::Bf16x2 => packed_bf16x2_alu_recipe(operation),
-        PackedAluFormat::F16x2 => Some(packed_f16x2_alu_recipe(operation)),
+        PackedAluFormat::F16x2 => packed_f16x2_alu_recipe(operation),
+        PackedAluFormat::F32x2 => packed_f32x2_alu_recipe(operation),
     }
+}
+
+fn packed_f32x2_alu_recipe(operation: PackedAluOperation) -> Option<PackedAluRecipe> {
+    let (
+        id,
+        abi_id,
+        operation_key,
+        rust_name,
+        dialect_op_type,
+        dialect_op_name,
+        arity,
+        head,
+        modifiers,
+        section,
+        url,
+    ) = match operation {
+        PackedAluOperation::Add => (
+            "add_f32x2",
+            "i0995",
+            "packed.alu.f32x2.add",
+            "add_f32x2",
+            "AddF32x2Op",
+            "nvvm.add_f32x2",
+            2,
+            "add.rn.f32x2",
+            &["rn", "f32x2"][..],
+            "9.7.3.1 Floating Point Instructions: add",
+            "https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-add",
+        ),
+        PackedAluOperation::AddFtz => (
+            "add_ftz_f32x2",
+            "i0996",
+            "packed.alu.f32x2.add.ftz",
+            "add_ftz_f32x2",
+            "AddFtzF32x2Op",
+            "nvvm.add_ftz_f32x2",
+            2,
+            "add.rn.ftz.f32x2",
+            &["rn", "ftz", "f32x2"][..],
+            "9.7.3.1 Floating Point Instructions: add",
+            "https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-add",
+        ),
+        PackedAluOperation::Sub => (
+            "sub_f32x2",
+            "i0997",
+            "packed.alu.f32x2.sub",
+            "sub_f32x2",
+            "SubF32x2Op",
+            "nvvm.sub_f32x2",
+            2,
+            "sub.rn.f32x2",
+            &["rn", "f32x2"][..],
+            "9.7.3.2 Floating Point Instructions: sub",
+            "https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-sub",
+        ),
+        PackedAluOperation::SubFtz => (
+            "sub_ftz_f32x2",
+            "i0998",
+            "packed.alu.f32x2.sub.ftz",
+            "sub_ftz_f32x2",
+            "SubFtzF32x2Op",
+            "nvvm.sub_ftz_f32x2",
+            2,
+            "sub.rn.ftz.f32x2",
+            &["rn", "ftz", "f32x2"][..],
+            "9.7.3.2 Floating Point Instructions: sub",
+            "https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-sub",
+        ),
+        PackedAluOperation::Mul => (
+            "mul_f32x2",
+            "i0999",
+            "packed.alu.f32x2.mul",
+            "mul_f32x2",
+            "MulF32x2Op",
+            "nvvm.mul_f32x2",
+            2,
+            "mul.rn.f32x2",
+            &["rn", "f32x2"][..],
+            "9.7.3.3 Floating Point Instructions: mul",
+            "https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-mul",
+        ),
+        PackedAluOperation::MulFtz => (
+            "mul_ftz_f32x2",
+            "i1000",
+            "packed.alu.f32x2.mul.ftz",
+            "mul_ftz_f32x2",
+            "MulFtzF32x2Op",
+            "nvvm.mul_ftz_f32x2",
+            2,
+            "mul.rn.ftz.f32x2",
+            &["rn", "ftz", "f32x2"][..],
+            "9.7.3.3 Floating Point Instructions: mul",
+            "https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-mul",
+        ),
+        PackedAluOperation::Fma => (
+            "fma_f32x2",
+            "i1001",
+            "packed.alu.f32x2.fma",
+            "fma_f32x2",
+            "FmaF32x2Op",
+            "nvvm.fma_f32x2",
+            3,
+            "fma.rn.f32x2",
+            &["rn", "f32x2"][..],
+            "9.7.3.4 Floating Point Instructions: fma",
+            "https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-fma",
+        ),
+        PackedAluOperation::FmaFtz => (
+            "fma_ftz_f32x2",
+            "i1002",
+            "packed.alu.f32x2.fma.ftz",
+            "fma_ftz_f32x2",
+            "FmaFtzF32x2Op",
+            "nvvm.fma_ftz_f32x2",
+            3,
+            "fma.rn.ftz.f32x2",
+            &["rn", "ftz", "f32x2"][..],
+            "9.7.3.4 Floating Point Instructions: fma",
+            "https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-fma",
+        ),
+        _ => return None,
+    };
+    Some(PackedAluRecipe {
+        id,
+        abi_id,
+        operation_key,
+        rust_name,
+        dialect_op_type,
+        dialect_op_name,
+        arity,
+        must_use: true,
+        ptx_mnemonic: head,
+        modifiers,
+        native_minimum_sm: 100,
+        minimum_ptx: "8.6",
+        minimum_sm: "sm_100",
+        ptx_isa_section: section,
+        ptx_isa_url: url,
+        source: PackedAluRecipeSource::PtxNative,
+    })
 }
 
 fn packed_bf16x2_alu_recipe(operation: PackedAluOperation) -> Option<PackedAluRecipe> {
@@ -15134,7 +15431,8 @@ fn packed_bf16x2_alu_recipe(operation: PackedAluOperation) -> Option<PackedAluRe
                 selection_asm: "abs.bf16x2 \t$dst, $src0;",
             },
         },
-        // The ftz and sat fma forms do not exist for bf16x2 in the PTX ISA at
+        // The f32x2-only operation keys are outside this admission. The ftz
+        // and sat fma forms also do not exist for bf16x2 in the PTX ISA at
         // all: ptxas rejects hand-written `fma.rn.ftz.bf16x2` with
         // "Illegal modifier '.ftz' for instruction 'fma'", and accepts
         // `fma.rn.relu.bf16x2` beside it. LLVM declares the intrinsics anyway,
@@ -15142,17 +15440,20 @@ fn packed_bf16x2_alu_recipe(operation: PackedAluOperation) -> Option<PackedAluRe
         // intrinsic %llvm.nvvm.fma.rn.ftz.bf16x2"), but the assembler is the
         // authority here. Reject them rather than admit a recipe that has no
         // instruction to lower to.
-        PackedAluOperation::FmaFtz
+        PackedAluOperation::AddFtz
+        | PackedAluOperation::SubFtz
+        | PackedAluOperation::MulFtz
+        | PackedAluOperation::FmaFtz
         | PackedAluOperation::FmaSat
         | PackedAluOperation::FmaFtzSat
         | PackedAluOperation::FmaFtzRelu => return None,
     })
 }
 
-fn packed_f16x2_alu_recipe(operation: PackedAluOperation) -> PackedAluRecipe {
+fn packed_f16x2_alu_recipe(operation: PackedAluOperation) -> Option<PackedAluRecipe> {
     const PURE: &[&str] = &["IntrNoMem", "IntrSpeculatable"];
     const COMMUTATIVE_PURE: &[&str] = &["Commutative", "IntrNoMem", "IntrSpeculatable"];
-    match operation {
+    Some(match operation {
         PackedAluOperation::Fma => PackedAluRecipe {
             id: "fma_f16x2",
             abi_id: "i0072",
@@ -15468,7 +15769,13 @@ fn packed_f16x2_alu_recipe(operation: PackedAluOperation) -> PackedAluRecipe {
                 selection_asm: "abs.f16x2 \t$dst, $src0;",
             },
         },
-    }
+        // These operations were added for the f32x2 admission. Keeping them
+        // outside the f16x2 recipe avoids silently expanding this PR's scope,
+        // even where a similarly spelled PTX form may exist.
+        PackedAluOperation::AddFtz | PackedAluOperation::SubFtz | PackedAluOperation::MulFtz => {
+            return None;
+        }
+    })
 }
 
 /// Per-backend PTX and SM floors, which can sit above the recipe's own floor.
@@ -15536,19 +15843,20 @@ fn validate_packed_alu_policy(
         .packed_alu
         .as_ref()
         .with_context(|| format!("{} has no closed packed-ALU contract", policy.id))?;
+    let recipe = packed_alu_recipe(packed.format, packed.operation)
+        .with_context(|| format!("{} is outside the closed packed-ALU recipe", policy.id))?;
+    let (rust_module, rust_type, dialect_type, expected_adapter) = match packed.format {
+        PackedAluFormat::Bf16x2 => ("bf16x2", "u32", "i32", PackedAluAdapter::DirectPackedU32),
+        PackedAluFormat::F16x2 => ("f16x2", "u32", "i32", PackedAluAdapter::DirectPackedU32),
+        PackedAluFormat::F32x2 => ("f32x2", "u64", "i64", PackedAluAdapter::DirectPackedU64),
+    };
     ensure!(
-        packed.adapter == PackedAluAdapter::DirectPackedU32,
+        packed.adapter == expected_adapter,
         "{} requests an unsupported packed-ALU adapter",
         policy.id
     );
-    let recipe = packed_alu_recipe(packed.format, packed.operation)
-        .with_context(|| format!("{} is outside the closed packed-ALU recipe", policy.id))?;
-    let rust_module = match packed.format {
-        PackedAluFormat::Bf16x2 => "bf16x2",
-        PackedAluFormat::F16x2 => "f16x2",
-    };
-    let rust_arguments = vec!["u32"; recipe.arity];
-    let dialect_operands = vec!["i32"; recipe.arity];
+    let rust_arguments = vec![rust_type; recipe.arity];
+    let dialect_operands = vec![dialect_type; recipe.arity];
     ensure!(
         policy.id == recipe.id
             && policy.abi_id == recipe.abi_id
@@ -15560,7 +15868,7 @@ fn validate_packed_alu_policy(
         policy.rust_module == rust_module
             && policy.rust_name == recipe.rust_name
             && policy.rust_arguments == rust_arguments
-            && policy.rust_result == "u32"
+            && policy.rust_result == rust_type
             && policy.safe
             && policy.must_use == recipe.must_use
             && policy
@@ -15578,7 +15886,7 @@ fn validate_packed_alu_policy(
         policy.dialect_op_type == recipe.dialect_op_type
             && policy.dialect_op_name == recipe.dialect_op_name
             && policy.dialect_operands == dialect_operands
-            && policy.dialect_results == ["i32"]
+            && policy.dialect_results == [dialect_type]
             && policy.lowering == "generated_packed_alu_inline_ptx",
         "{} is outside the closed packed-ALU dialect and lowering recipe",
         policy.id
@@ -15590,7 +15898,7 @@ fn validate_packed_alu_policy(
             && policy.execution_scope == "thread"
             && policy.minimum_ptx == recipe.minimum_ptx
             && policy.minimum_sm.as_deref() == Some(recipe.minimum_sm)
-            && policy.ptx_result == "u32"
+            && policy.ptx_result == rust_type
             && policy.targets == "all"
             && packed.native_minimum_sm == recipe.native_minimum_sm,
         "{} packed-ALU effects, carrier, or target floor disagree",
@@ -17005,7 +17313,7 @@ fn packed_conversion_recipe_f32x2(
             abi_id: "i0071",
             operation_key: "packed.convert.f32x2.bf16x2.nearest_even",
             rust_name: "cvt_f32x2_bf16x2",
-            compatibility_path: "cuda_device::tcgen05::cvt_f32x2_bf16x2",
+            compatibility_path: "cuda_device::convert::cvt_bf16x2_f32",
             dialect_op_type: "CvtF32x2Bf16x2Op",
             dialect_op_name: "nvvm.cvt_f32x2_bf16x2",
             source_record: "int_nvvm_ff2bf16x2_rn",
@@ -17514,6 +17822,7 @@ fn packed_conversion_overlay_record(
         warp_shuffle: None,
         dot_product: None,
         packed_alu: None,
+        integer_minmax: None,
         packed_conversion: Some(conversion.clone()),
         scalar_conversion: None,
         scalar_arithmetic: None,
@@ -18012,6 +18321,7 @@ fn scalar_conversion_overlay_record(
         warp_shuffle: None,
         dot_product: None,
         packed_alu: None,
+        integer_minmax: None,
         packed_conversion: None,
         scalar_conversion: Some(ScalarConversion {
             source_format: ScalarConversionSourceFormat::F32,
@@ -18178,7 +18488,6 @@ fn validate_scalar_conversion_policy(
 #[derive(Clone)]
 struct ScalarArithmeticRecipe {
     id: String,
-    abi_id: String,
     operation_key: String,
     source_record: String,
     llvm_symbol: String,
@@ -18264,10 +18573,9 @@ fn scalar_arithmetic_rounding_name(rounding: ScalarArithmeticRounding) -> &'stat
 }
 
 fn scalar_arithmetic_recipe(variant: ScalarArithmeticVariant) -> Option<ScalarArithmeticRecipe> {
-    let canonical = canonical_scalar_arithmetic_variants();
-    let index = canonical
-        .iter()
-        .position(|candidate| *candidate == variant)?;
+    if !canonical_scalar_arithmetic_variants().contains(&variant) {
+        return None;
+    }
     let (format, operation, rounding, subnormal, saturation) = variant;
     let operation_name = scalar_arithmetic_operation_name(operation);
     let rounding_name = scalar_arithmetic_rounding_name(rounding);
@@ -18366,7 +18674,6 @@ fn scalar_arithmetic_recipe(variant: ScalarArithmeticVariant) -> Option<ScalarAr
 
     Some(ScalarArithmeticRecipe {
         id,
-        abi_id: format!("i{:04}", 390 + index),
         operation_key: format!(
             "scalar.arithmetic.{operation_name}.{modifier_symbol}.{format_name}"
         ),
@@ -18413,6 +18720,7 @@ fn expand_scalar_arithmetic_admission(
         .variants
         .iter()
         .map(|variant| {
+            validate_abi_id(&variant.abi_id)?;
             let identity = (
                 variant.format,
                 variant.operation,
@@ -18422,13 +18730,7 @@ fn expand_scalar_arithmetic_admission(
             );
             let recipe = scalar_arithmetic_recipe(identity)
                 .context("scalar arithmetic is outside the closed recipe set")?;
-            ensure!(
-                variant.abi_id == recipe.abi_id,
-                "{} must reserve ABI ID {}",
-                recipe.id,
-                recipe.abi_id
-            );
-            scalar_arithmetic_overlay_record(recipe, admission, identity)
+            scalar_arithmetic_overlay_record(recipe, admission, identity, &variant.abi_id)
         })
         .collect()
 }
@@ -18437,6 +18739,7 @@ fn scalar_arithmetic_overlay_record(
     recipe: ScalarArithmeticRecipe,
     admission: &ScalarArithmeticAdmission,
     variant: ScalarArithmeticVariant,
+    abi_id: &str,
 ) -> Result<OverlayIntrinsic> {
     let (format, operation, rounding, subnormal, saturation) = variant;
     let rust_arguments = vec![recipe.rust_type.into(); recipe.argument_count];
@@ -18448,7 +18751,7 @@ fn scalar_arithmetic_overlay_record(
     );
     Ok(OverlayIntrinsic {
         id: recipe.id.clone(),
-        abi_id: recipe.abi_id,
+        abi_id: abi_id.into(),
         operation_key: recipe.operation_key,
         family: "scalar_arithmetic".into(),
         source: None,
@@ -18518,6 +18821,7 @@ fn scalar_arithmetic_overlay_record(
         warp_shuffle: None,
         dot_product: None,
         packed_alu: None,
+        integer_minmax: None,
         packed_conversion: None,
         scalar_conversion: None,
         scalar_arithmetic: Some(ScalarArithmetic {
@@ -18589,7 +18893,6 @@ fn validate_scalar_arithmetic_policy(
     let signature = vec![recipe.rust_type.to_owned(); recipe.argument_count];
     ensure!(
         policy.id == recipe.id
-            && policy.abi_id == recipe.abi_id
             && policy.operation_key == recipe.operation_key
             && policy.source_record.as_deref() == Some(recipe.source_record.as_str())
             && policy.llvm_symbol.as_deref() == Some(recipe.llvm_symbol.as_str())
@@ -18735,11 +19038,12 @@ fn validate_scalar_arithmetic_policy(
             policy.id
         );
     }
-    let selected = declaration
-        .selections
-        .iter()
-        .filter(|selection| selection_matches_policy(policy, selection))
-        .collect::<Vec<_>>();
+    let mut selected = Vec::new();
+    for selection in &declaration.selections {
+        if selection_matches_policy(policy, selection)? {
+            selected.push(selection);
+        }
+    }
     ensure!(
         selected.len() == 1 && selected[0].source_record == recipe.selection_record,
         "{} must select only its direct scalar arithmetic instruction",
@@ -18850,7 +19154,6 @@ enum ScalarMathRecipeSource {
 
 struct ScalarMathRecipe {
     id: String,
-    abi_id: String,
     operation_key: String,
     source: ScalarMathRecipeSource,
     rust_type: &'static str,
@@ -18964,10 +19267,9 @@ fn canonical_scalar_math_variants() -> Vec<ScalarMathVariant> {
 }
 
 fn scalar_math_recipe(variant: ScalarMathVariant) -> Option<ScalarMathRecipe> {
-    let canonical = canonical_scalar_math_variants();
-    let index = canonical
-        .iter()
-        .position(|candidate| *candidate == variant)?;
+    if !canonical_scalar_math_variants().contains(&variant) {
+        return None;
+    }
     let (format, operation, precision, subnormal) = variant;
     let operation_name = scalar_math_operation_name(operation);
     let precision_name = scalar_math_precision_name(precision);
@@ -19066,7 +19368,6 @@ fn scalar_math_recipe(variant: ScalarMathVariant) -> Option<ScalarMathRecipe> {
 
     Some(ScalarMathRecipe {
         id,
-        abi_id: format!("i{:04}", 782 + index),
         operation_key: format!("scalar.math.{operation_name}.{modifier_symbol}.{format_name}"),
         source,
         rust_type: format_name,
@@ -19105,6 +19406,7 @@ fn expand_scalar_math_admission(admission: &ScalarMathAdmission) -> Result<Vec<O
         .variants
         .iter()
         .map(|variant| {
+            validate_abi_id(&variant.abi_id)?;
             let identity = (
                 variant.format,
                 variant.operation,
@@ -19113,13 +19415,7 @@ fn expand_scalar_math_admission(admission: &ScalarMathAdmission) -> Result<Vec<O
             );
             let recipe = scalar_math_recipe(identity)
                 .context("scalar math is outside the closed recipe set")?;
-            ensure!(
-                variant.abi_id == recipe.abi_id,
-                "{} must reserve ABI ID {}",
-                recipe.id,
-                recipe.abi_id
-            );
-            scalar_math_overlay_record(recipe, admission, identity)
+            scalar_math_overlay_record(recipe, admission, identity, &variant.abi_id)
         })
         .collect()
 }
@@ -19128,6 +19424,7 @@ fn scalar_math_overlay_record(
     recipe: ScalarMathRecipe,
     admission: &ScalarMathAdmission,
     variant: ScalarMathVariant,
+    abi_id: &str,
 ) -> Result<OverlayIntrinsic> {
     let (format, operation, precision, subnormal) = variant;
     let ptx_operands = vec![OperandPattern::Register; 2]; // 1 result + 1 operand
@@ -19177,7 +19474,7 @@ fn scalar_math_overlay_record(
         };
     Ok(OverlayIntrinsic {
         id: recipe.id.clone(),
-        abi_id: recipe.abi_id,
+        abi_id: abi_id.into(),
         operation_key: recipe.operation_key,
         family: "scalar_math".into(),
         source,
@@ -19246,6 +19543,7 @@ fn scalar_math_overlay_record(
         warp_shuffle: None,
         dot_product: None,
         packed_alu: None,
+        integer_minmax: None,
         packed_conversion: None,
         scalar_conversion: None,
         scalar_arithmetic: None,
@@ -19341,10 +19639,7 @@ fn validate_scalar_math_policy(
         }
     };
     ensure!(
-        policy.id == recipe.id
-            && policy.abi_id == recipe.abi_id
-            && policy.operation_key == recipe.operation_key
-            && source_matches,
+        policy.id == recipe.id && policy.operation_key == recipe.operation_key && source_matches,
         "{} scalar-math identity or LLVM source changed",
         policy.id
     );
@@ -19461,7 +19756,6 @@ type ExtendedMinMaxVariant = (
 
 struct ExtendedMinMaxRecipe {
     id: String,
-    abi_id: String,
     operation_key: String,
     source_record: String,
     llvm_symbol: String,
@@ -19510,8 +19804,9 @@ fn canonical_extended_minmax_variants() -> Vec<ExtendedMinMaxVariant> {
     // `bf16` `ftz` declarations exist but have no NVPTX selection pattern and
     // fail instruction selection, so they are deliberately absent here.
     //
-    // These variants were admitted after the first block, so they continue the
-    // ABI id space at a second base - see `extended_minmax_abi_id`.
+    // ABI identity is intentionally absent from this canonical list. Existing
+    // and future IDs are carried by admission entries and enforced by the
+    // global append-only ABI ledger.
     let scalar_halves = |operation| {
         [
             (F16, operation, Preserve, Number, false),
@@ -19534,28 +19829,6 @@ fn canonical_extended_minmax_variants() -> Vec<ExtendedMinMaxVariant> {
         .chain(scalar_halves(Min))
         .chain(scalar_halves(Max))
         .collect()
-}
-
-/// Maps a canonical variant index to its reserved ABI id.
-///
-/// The family was admitted as one contiguous block at
-/// `EXTENDED_MINMAX_FIRST_ABI_BASE`. Later additions cannot continue that block
-/// because the ids immediately after it were already reserved by other
-/// families, so they open a second block instead. The ledger is append-only,
-/// which makes the discontinuity permanent.
-fn extended_minmax_abi_id(index: usize) -> String {
-    const EXTENDED_MINMAX_FIRST_ABI_BASE: usize = 550;
-    const EXTENDED_MINMAX_FIRST_ABI_COUNT: usize = 28;
-    const EXTENDED_MINMAX_SECOND_ABI_BASE: usize = 830;
-
-    if index < EXTENDED_MINMAX_FIRST_ABI_COUNT {
-        format!("i{:04}", EXTENDED_MINMAX_FIRST_ABI_BASE + index)
-    } else {
-        format!(
-            "i{:04}",
-            EXTENDED_MINMAX_SECOND_ABI_BASE + index - EXTENDED_MINMAX_FIRST_ABI_COUNT
-        )
-    }
 }
 
 /// Joins an operation name, its modifiers, and its format into one identifier.
@@ -19593,9 +19866,9 @@ fn extended_minmax_operation_name(operation: ExtendedMinMaxOperation) -> &'stati
 }
 
 fn extended_minmax_recipe(variant: ExtendedMinMaxVariant) -> Option<ExtendedMinMaxRecipe> {
-    let index = canonical_extended_minmax_variants()
-        .iter()
-        .position(|candidate| *candidate == variant)?;
+    if !canonical_extended_minmax_variants().contains(&variant) {
+        return None;
+    }
     let (format, operation, subnormal, nan, xorsign_abs) = variant;
     let operation_name = extended_minmax_operation_name(operation);
     let format_name = extended_minmax_format_name(format);
@@ -19758,7 +20031,6 @@ fn extended_minmax_recipe(variant: ExtendedMinMaxVariant) -> Option<ExtendedMinM
     };
     Some(ExtendedMinMaxRecipe {
         id,
-        abi_id: extended_minmax_abi_id(index),
         operation_key: format!(
             "floating.minmax.{format_name}.{operation_name}.{}.{}.{}",
             match subnormal {
@@ -19819,6 +20091,7 @@ fn expand_extended_minmax_admission(
         .variants
         .iter()
         .map(|variant| {
+            validate_abi_id(&variant.abi_id)?;
             let identity = (
                 variant.format,
                 variant.operation,
@@ -19828,13 +20101,7 @@ fn expand_extended_minmax_admission(
             );
             let recipe = extended_minmax_recipe(identity)
                 .context("extended min/max is outside the closed recipe set")?;
-            ensure!(
-                variant.abi_id == recipe.abi_id,
-                "{} must reserve ABI ID {}",
-                recipe.id,
-                recipe.abi_id
-            );
-            extended_minmax_overlay_record(recipe, admission, identity)
+            extended_minmax_overlay_record(recipe, admission, identity, &variant.abi_id)
         })
         .collect()
 }
@@ -19843,13 +20110,14 @@ fn extended_minmax_overlay_record(
     recipe: ExtendedMinMaxRecipe,
     admission: &ExtendedMinMaxAdmission,
     variant: ExtendedMinMaxVariant,
+    abi_id: &str,
 ) -> Result<OverlayIntrinsic> {
     let (format, operation, subnormal, nan, xorsign_abs) = variant;
     let rust_arguments = vec![recipe.rust_type.to_owned(); 2];
     let dialect_operands = vec![recipe.dialect_type.to_owned(); 2];
     Ok(OverlayIntrinsic {
         id: recipe.id.clone(),
-        abi_id: recipe.abi_id,
+        abi_id: abi_id.into(),
         operation_key: recipe.operation_key,
         family: "extended_minmax".into(),
         source: None,
@@ -19915,6 +20183,7 @@ fn extended_minmax_overlay_record(
         warp_shuffle: None,
         dot_product: None,
         packed_alu: None,
+        integer_minmax: None,
         packed_conversion: None,
         scalar_conversion: None,
         scalar_arithmetic: None,
@@ -20000,7 +20269,6 @@ fn validate_extended_minmax_policy(
     );
     ensure!(
         policy.id == recipe.id
-            && policy.abi_id == recipe.abi_id
             && policy.operation_key == recipe.operation_key
             && policy.source_record.as_deref() == Some(recipe.source_record.as_str())
             && policy.llvm_symbol.as_deref() == Some(recipe.llvm_symbol.as_str())
@@ -21351,6 +21619,7 @@ fn expand_register_mma_integer_admission(
             warp_shuffle: None,
             dot_product: None,
             packed_alu: None,
+        integer_minmax: None,
             packed_conversion: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
@@ -21671,6 +21940,7 @@ fn expand_register_mma_f8f6f4_admission(
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -21883,6 +22153,7 @@ fn expand_register_mma_mxf8f6f4_admission(
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -22183,6 +22454,7 @@ fn expand_register_mma_fp8_admission(
                         warp_shuffle: None,
                         dot_product: None,
                         packed_alu: None,
+                integer_minmax: None,
                         packed_conversion: None,
                         scalar_conversion: None,
                         scalar_arithmetic: None,
@@ -22379,6 +22651,7 @@ fn expand_register_mma_ampere_float_admission(
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -22566,6 +22839,7 @@ fn expand_register_mma_binary_admission(
             warp_shuffle: None,
             dot_product: None,
             packed_alu: None,
+        integer_minmax: None,
             packed_conversion: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
@@ -23382,6 +23656,7 @@ fn sparse_mma_overlay_record(
         warp_shuffle: None,
         dot_product: None,
         packed_alu: None,
+        integer_minmax: None,
         packed_conversion: None,
         scalar_conversion: None,
         scalar_arithmetic: None,
@@ -23499,7 +23774,7 @@ fn validate_sparse_mma_policy(
                 mma.accumulator,
                 SparseMmaAccumulator::F16 | SparseMmaAccumulator::F32
             ) || declaration.selections[0].predicates == ["Subtarget->hasMMABlockScale()"])
-            && selection_matches_policy(policy, &declaration.selections[0]),
+            && selection_matches_policy(policy, &declaration.selections[0])?,
         "{} imported sparse MMA declaration changed its class, immediate range, properties, or exact selection contract",
         policy.id
     );
@@ -23609,7 +23884,7 @@ fn validate_register_mma_policy(
         declaration.classes.iter().any(|class| class == "NVVM_MMA")
             && declaration.properties == ["IntrNoCallback", "IntrNoMem"]
             && declaration.selections.len() == 1
-            && selection_matches_policy(policy, &declaration.selections[0]),
+            && selection_matches_policy(policy, &declaration.selections[0])?,
         "{} imported MMA declaration changed its class, properties, or exact selection contract",
         policy.id
     );
@@ -23859,7 +24134,7 @@ fn validate_register_mma_fp8_policy(
     ensure!(
         declaration.classes == ["SDPatternOperator", "Intrinsic", "NVVM_MMA"]
             && declaration.properties == ["IntrNoCallback", "IntrNoMem"]
-            && selection_matches_policy(policy, selection)
+            && selection_matches_policy(policy, selection)?
             && selection.predicates == expected_predicates
             && selection.constraints.is_empty(),
         "{} imported standard FP8 declaration or selection changed",
@@ -24000,7 +24275,7 @@ fn validate_register_mma_f8f6f4_policy(
     ensure!(
         declaration.classes == ["SDPatternOperator", "Intrinsic", "NVVM_MMA"]
             && declaration.properties == ["IntrNoCallback", "IntrNoMem"]
-            && selection_matches_policy(policy, selection)
+            && selection_matches_policy(policy, selection)?
             && selection.predicates == ["Subtarget->hasMMABlockScale()"]
             && selection.constraints.is_empty(),
         "{} imported dense f8f6f4 declaration or selection changed",
@@ -24177,7 +24452,7 @@ fn validate_register_mma_mxf8f6f4_policy(
     ensure!(
         declaration.classes == ["SDPatternOperator", "Intrinsic", "NVVM_MMA_BLOCK_SCALE"]
             && declaration.properties == ["IntrNoCallback", "IntrNoMem"]
-            && selection_matches_policy(policy, selection)
+            && selection_matches_policy(policy, selection)?
             && selection.predicates == ["Subtarget->hasMMABlockScale()"]
             && selection.constraints.is_empty(),
         "{} imported dense mxf8f6f4 declaration or selection changed",
@@ -24464,6 +24739,7 @@ fn expand_prmt_admission(admission: &PrmtAdmission) -> Result<Vec<OverlayIntrins
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -24825,6 +25101,7 @@ fn expand_cluster_barrier_admission(
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -25272,6 +25549,7 @@ fn expand_debug_control_admission(
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -25651,6 +25929,7 @@ fn expand_cluster_memory_admission(
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -25724,11 +26003,12 @@ fn validate_cluster_memory_policy(
                 "{} must retain the AS7-returning LLVM mapa record as identity only",
                 policy.id
             );
-            let selections = declaration
-                .selections
-                .iter()
-                .filter(|selection| selection_matches_policy(policy, selection))
-                .collect::<Vec<_>>();
+            let mut selections = Vec::new();
+            for selection in &declaration.selections {
+                if selection_matches_policy(policy, selection)? {
+                    selections.push(selection);
+                }
+            }
             ensure!(
                 selections.len() == 2
                     && selections
@@ -26482,6 +26762,7 @@ fn expand_mbarrier_extended_admission(
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -26742,6 +27023,7 @@ fn expand_wgmma_control_admission(
                 warp_shuffle: None,
                 dot_product: None,
                 packed_alu: None,
+                integer_minmax: None,
                 packed_conversion: None,
                 scalar_conversion: None,
                 scalar_arithmetic: None,
@@ -27020,6 +27302,254 @@ fn validate_movmatrix_policy(policy: &OverlayIntrinsic, source: &IntrinsicSource
     Ok(())
 }
 
+struct IntegerMinMaxRecipe {
+    id: &'static str,
+    abi_id: &'static str,
+    operation_key: &'static str,
+    rust_module: &'static str,
+    rust_name: &'static str,
+    /// Rust and PTX carrier type: `i32` for the scalar forms, `u32` for the
+    /// packed pairs.
+    scalar: &'static str,
+    dialect_op_type: &'static str,
+    dialect_op_name: &'static str,
+    ptx_mnemonic: &'static str,
+    modifiers: &'static [&'static str],
+}
+
+/// Returns the closed recipe for an extended integer min/max variant.
+///
+/// `None` means the combination is outside the family: `.relu` exists only
+/// for the signed formats, and the plain scalar forms are ordinary codegen
+/// (`min.s32`/`max.s32` from generic Rust min/max), not intrinsics.
+fn integer_minmax_recipe(
+    format: IntegerMinMaxFormat,
+    operation: IntegerMinMaxOperation,
+    relu: bool,
+) -> Option<IntegerMinMaxRecipe> {
+    use IntegerMinMaxFormat as Format;
+    use IntegerMinMaxOperation as Operation;
+    Some(match (format, operation, relu) {
+        (Format::S32, Operation::Min, true) => IntegerMinMaxRecipe {
+            id: "min_relu_s32",
+            abi_id: "i0987",
+            operation_key: "integer.minmax.s32.min.relu",
+            rust_module: "int",
+            rust_name: "min_relu_s32",
+            scalar: "i32",
+            dialect_op_type: "MinReluS32Op",
+            dialect_op_name: "nvvm.min_relu_s32",
+            ptx_mnemonic: "min.relu.s32",
+            modifiers: &["relu", "s32"],
+        },
+        (Format::S32, Operation::Max, true) => IntegerMinMaxRecipe {
+            id: "max_relu_s32",
+            abi_id: "i0988",
+            operation_key: "integer.minmax.s32.max.relu",
+            rust_module: "int",
+            rust_name: "max_relu_s32",
+            scalar: "i32",
+            dialect_op_type: "MaxReluS32Op",
+            dialect_op_name: "nvvm.max_relu_s32",
+            ptx_mnemonic: "max.relu.s32",
+            modifiers: &["relu", "s32"],
+        },
+        (Format::S16x2, Operation::Min, false) => IntegerMinMaxRecipe {
+            id: "min_s16x2",
+            abi_id: "i0989",
+            operation_key: "integer.minmax.s16x2.min",
+            rust_module: "i16x2",
+            rust_name: "min_s16x2",
+            scalar: "u32",
+            dialect_op_type: "MinS16x2Op",
+            dialect_op_name: "nvvm.min_s16x2",
+            ptx_mnemonic: "min.s16x2",
+            modifiers: &["s16x2"],
+        },
+        (Format::S16x2, Operation::Max, false) => IntegerMinMaxRecipe {
+            id: "max_s16x2",
+            abi_id: "i0990",
+            operation_key: "integer.minmax.s16x2.max",
+            rust_module: "i16x2",
+            rust_name: "max_s16x2",
+            scalar: "u32",
+            dialect_op_type: "MaxS16x2Op",
+            dialect_op_name: "nvvm.max_s16x2",
+            ptx_mnemonic: "max.s16x2",
+            modifiers: &["s16x2"],
+        },
+        (Format::U16x2, Operation::Min, false) => IntegerMinMaxRecipe {
+            id: "min_u16x2",
+            abi_id: "i0991",
+            operation_key: "integer.minmax.u16x2.min",
+            rust_module: "i16x2",
+            rust_name: "min_u16x2",
+            scalar: "u32",
+            dialect_op_type: "MinU16x2Op",
+            dialect_op_name: "nvvm.min_u16x2",
+            ptx_mnemonic: "min.u16x2",
+            modifiers: &["u16x2"],
+        },
+        (Format::U16x2, Operation::Max, false) => IntegerMinMaxRecipe {
+            id: "max_u16x2",
+            abi_id: "i0992",
+            operation_key: "integer.minmax.u16x2.max",
+            rust_module: "i16x2",
+            rust_name: "max_u16x2",
+            scalar: "u32",
+            dialect_op_type: "MaxU16x2Op",
+            dialect_op_name: "nvvm.max_u16x2",
+            ptx_mnemonic: "max.u16x2",
+            modifiers: &["u16x2"],
+        },
+        (Format::S16x2, Operation::Min, true) => IntegerMinMaxRecipe {
+            id: "min_relu_s16x2",
+            abi_id: "i0993",
+            operation_key: "integer.minmax.s16x2.min.relu",
+            rust_module: "i16x2",
+            rust_name: "min_relu_s16x2",
+            scalar: "u32",
+            dialect_op_type: "MinReluS16x2Op",
+            dialect_op_name: "nvvm.min_relu_s16x2",
+            ptx_mnemonic: "min.relu.s16x2",
+            modifiers: &["relu", "s16x2"],
+        },
+        (Format::S16x2, Operation::Max, true) => IntegerMinMaxRecipe {
+            id: "max_relu_s16x2",
+            abi_id: "i0994",
+            operation_key: "integer.minmax.s16x2.max.relu",
+            rust_module: "i16x2",
+            rust_name: "max_relu_s16x2",
+            scalar: "u32",
+            dialect_op_type: "MaxReluS16x2Op",
+            dialect_op_name: "nvvm.max_relu_s16x2",
+            ptx_mnemonic: "max.relu.s16x2",
+            modifiers: &["relu", "s16x2"],
+        },
+        (Format::S32, _, false) | (Format::U16x2, _, true) => return None,
+    })
+}
+
+fn integer_minmax_isa_reference(operation: IntegerMinMaxOperation) -> (&'static str, &'static str) {
+    match operation {
+        IntegerMinMaxOperation::Min => (
+            "9.7.1.13 Integer Arithmetic Instructions: min",
+            "https://docs.nvidia.com/cuda/parallel-thread-execution/#integer-arithmetic-instructions-min",
+        ),
+        IntegerMinMaxOperation::Max => (
+            "9.7.1.14 Integer Arithmetic Instructions: max",
+            "https://docs.nvidia.com/cuda/parallel-thread-execution/#integer-arithmetic-instructions-max",
+        ),
+    }
+}
+
+fn validate_integer_minmax_policy(
+    policy: &OverlayIntrinsic,
+    source: &IntrinsicSource,
+    declaration: Option<&ImportedIntrinsic>,
+) -> Result<()> {
+    let minmax = policy
+        .integer_minmax
+        .as_ref()
+        .with_context(|| format!("{} has no closed integer-min/max contract", policy.id))?;
+    let recipe = integer_minmax_recipe(minmax.format, minmax.operation, minmax.relu)
+        .with_context(|| format!("{} is outside the closed integer-min/max recipe", policy.id))?;
+    ensure!(
+        policy.id == recipe.id
+            && policy.abi_id == recipe.abi_id
+            && policy.operation_key == recipe.operation_key,
+        "{} integer-min/max identity does not match its closed operation recipe",
+        policy.id
+    );
+    ensure!(
+        policy.rust_module == recipe.rust_module
+            && policy.rust_name == recipe.rust_name
+            && policy.rust_arguments == [recipe.scalar, recipe.scalar]
+            && policy.rust_result == recipe.scalar
+            && policy.safe
+            && policy.must_use
+            && policy
+                .safe_allowlist_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty())
+            && policy.public_rust_path
+                == format!(
+                    "cuda_intrinsics::{}::{}",
+                    recipe.rust_module, recipe.rust_name
+                )
+            && policy.compatibility_rust_paths
+                == [format!(
+                    "cuda_device::{}::{}",
+                    recipe.rust_module, recipe.rust_name
+                )],
+        "{} must preserve its reviewed safe integer-min/max API",
+        policy.id
+    );
+    ensure!(
+        policy.dialect_op_type == recipe.dialect_op_type
+            && policy.dialect_op_name == recipe.dialect_op_name
+            && policy.dialect_operands == ["i32", "i32"]
+            && policy.dialect_results == ["i32"]
+            && policy.lowering == "generated_integer_minmax_inline_ptx",
+        "{} is outside the closed integer-min/max dialect and lowering recipe",
+        policy.id
+    );
+    ensure!(
+        policy.pure
+            && policy.memory == "none"
+            && !policy.convergent
+            && policy.execution_scope == "thread"
+            && policy.minimum_ptx == "8.0"
+            && policy.minimum_sm.as_deref() == Some("sm_90")
+            && policy.ptx_result == recipe.scalar
+            && policy.targets == "all"
+            && minmax.native_minimum_sm == 90,
+        "{} integer-min/max effects, carrier, or target floor disagree",
+        policy.id
+    );
+    let (isa_section, isa_url) = integer_minmax_isa_reference(minmax.operation);
+    ensure!(
+        policy.ptx_isa_version == "9.3"
+            && policy.ptx_isa_section == isa_section
+            && policy.ptx_isa_url == isa_url,
+        "{} integer-min/max PTX provenance does not match its reviewed instruction section",
+        policy.id
+    );
+    ensure!(
+        policy.expected_ptx.mnemonic
+            == recipe.ptx_mnemonic.split('.').next().expect("PTX mnemonic")
+            && policy.expected_ptx.modifiers == recipe.modifiers
+            && policy.expected_ptx.operands == vec![OperandPattern::Register; 3],
+        "{} expected PTX does not match its exact integer-min/max instruction",
+        policy.id
+    );
+    ensure!(
+        source
+            == &IntrinsicSource::PtxNative {
+                instruction: recipe.ptx_mnemonic.to_owned(),
+            }
+            && declaration.is_none(),
+        "{} integer-min/max source does not match its PTX-native recipe",
+        policy.id
+    );
+    ensure!(
+        policy.backend_lowerings.len() == 1
+            && policy.backend_lowerings[0].backend == IntrinsicBackend::LlvmNvptx
+            && policy.backend_lowerings[0].mechanism == BackendLoweringMechanism::InlinePtx
+            && policy.backend_lowerings[0].targets.is_none()
+            && policy.backend_lowerings[0].minimum_ptx.is_none()
+            && policy.backend_lowerings[0].minimum_sm.is_none()
+            && !policy.backend_lowerings[0]
+                .evidence_profile
+                .trim()
+                .is_empty(),
+        "{} integer-min/max backend route changed",
+        policy.id
+    );
+    ensure_no_other_family_contract(policy, "integer_minmax")?;
+    Ok(())
+}
+
 fn ensure_no_other_family_contract(policy: &OverlayIntrinsic, family: &str) -> Result<()> {
     ensure!(
         policy.packed_atomic.is_none()
@@ -27035,6 +27565,7 @@ fn ensure_no_other_family_contract(policy: &OverlayIntrinsic, family: &str) -> R
             && policy.ldmatrix_adapter.is_none()
             && (policy.family == "tma" || policy.selected_address_space.is_none())
             && (policy.family == "packed_alu") == policy.packed_alu.is_some()
+            && (policy.family == "integer_minmax") == policy.integer_minmax.is_some()
             && (policy.family == "packed_conversion") == policy.packed_conversion.is_some()
             && (policy.family == "scalar_conversion") == policy.scalar_conversion.is_some()
             && (policy.family == "scalar_arithmetic") == policy.scalar_arithmetic.is_some()
@@ -29199,22 +29730,26 @@ fn materialize_record(
     } else {
         policy.dialect_results.clone()
     };
+    let mut selections = Vec::new();
+    for selection in declaration
+        .into_iter()
+        .flat_map(|declaration| declaration.selections.iter())
+    {
+        if selection_matches_policy(policy, selection)? {
+            selections.push(CatalogSelection {
+                source_record: selection.source_record.clone(),
+                asm: selection.asm.clone(),
+                predicates: selection.predicates.clone(),
+                constraints: selection.constraints.clone(),
+            });
+        }
+    }
     Ok(CatalogIntrinsic {
         id: policy.id.clone(),
         operation_key: policy.operation_key.clone(),
         family: policy.family.clone(),
         source,
-        selections: declaration
-            .into_iter()
-            .flat_map(|declaration| declaration.selections.iter())
-            .filter(|selection| selection_matches_policy(policy, selection))
-            .map(|selection| CatalogSelection {
-                source_record: selection.source_record.clone(),
-                asm: selection.asm.clone(),
-                predicates: selection.predicates.clone(),
-                constraints: selection.constraints.clone(),
-            })
-            .collect(),
+        selections,
         rust: CatalogRust {
             abi_id: policy.abi_id.clone(),
             module: policy.rust_module.clone(),
@@ -29261,6 +29796,7 @@ fn materialize_record(
         warp_shuffle: policy.warp_shuffle.clone(),
         dot_product: policy.dot_product.clone(),
         packed_alu: policy.packed_alu.clone(),
+        integer_minmax: policy.integer_minmax.clone(),
         packed_conversion: policy.packed_conversion.clone(),
         scalar_conversion: policy.scalar_conversion.clone(),
         scalar_arithmetic: policy.scalar_arithmetic.clone(),
@@ -29334,6 +29870,78 @@ mod tests {
     use super::*;
     use crate::model::{ImportedSelection, ScalarConversionAdmissionVariant};
 
+    #[test]
+    fn f32_redux_recipes_match_pinned_llvm_records() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let imported: ImportedFile =
+            read_json(&repo_root.join("intrinsics/imported.json")).unwrap();
+        let declarations: BTreeMap<_, _> = imported
+            .intrinsics
+            .iter()
+            .map(|record| (record.source_record.as_str(), record))
+            .collect();
+        let cases = [
+            (
+                ReduxOperation::Fmin,
+                "redux.sync.min.f32 \t$dst, $src, $mask;",
+                &["sync", "min", "f32"][..],
+            ),
+            (
+                ReduxOperation::FminNan,
+                "redux.sync.min.NaN.f32 \t$dst, $src, $mask;",
+                &["sync", "min", "NaN", "f32"],
+            ),
+            (
+                ReduxOperation::FminAbs,
+                "redux.sync.min.abs.f32 \t$dst, $src, $mask;",
+                &["sync", "min", "abs", "f32"],
+            ),
+            (
+                ReduxOperation::FminAbsNan,
+                "redux.sync.min.abs.NaN.f32 \t$dst, $src, $mask;",
+                &["sync", "min", "abs", "NaN", "f32"],
+            ),
+            (
+                ReduxOperation::Fmax,
+                "redux.sync.max.f32 \t$dst, $src, $mask;",
+                &["sync", "max", "f32"],
+            ),
+            (
+                ReduxOperation::FmaxNan,
+                "redux.sync.max.NaN.f32 \t$dst, $src, $mask;",
+                &["sync", "max", "NaN", "f32"],
+            ),
+            (
+                ReduxOperation::FmaxAbs,
+                "redux.sync.max.abs.f32 \t$dst, $src, $mask;",
+                &["sync", "max", "abs", "f32"],
+            ),
+            (
+                ReduxOperation::FmaxAbsNan,
+                "redux.sync.max.abs.NaN.f32 \t$dst, $src, $mask;",
+                &["sync", "max", "abs", "NaN", "f32"],
+            ),
+        ];
+
+        for (operation, expected_asm, expected_modifiers) in cases {
+            let recipe = redux_recipe(operation);
+            let declaration = declarations[recipe.source_record];
+            assert_eq!(declaration.llvm_name, recipe.llvm_symbol);
+            assert_eq!(declaration.arguments, ["f32", "i32"]);
+            assert_eq!(declaration.results, ["f32"]);
+            assert_eq!(declaration.selections.len(), 1);
+            assert_eq!(declaration.selections[0].asm, expected_asm);
+            assert_eq!(
+                declaration.selections[0].predicates,
+                ["Subtarget->hasReduxSyncF32()"]
+            );
+            assert_eq!(recipe.ptx_modifiers, expected_modifiers);
+            assert_eq!(recipe.minimum_ptx, "8.6");
+            assert_eq!(recipe.minimum_sm, None);
+            assert_eq!(recipe.targets, REDUX_F32_TARGETS);
+        }
+    }
+
     fn sreg_pattern(special_register: &str) -> InstructionPattern {
         InstructionPattern::new(
             "mov",
@@ -29394,6 +30002,7 @@ mod tests {
             warp_shuffle: None,
             dot_product: None,
             packed_alu: None,
+            integer_minmax: None,
             packed_conversion: None,
             scalar_conversion: None,
             scalar_arithmetic: None,
@@ -29832,9 +30441,10 @@ mod tests {
         operation: PackedAluOperation,
     ) -> OverlayIntrinsic {
         let recipe = packed_alu_recipe(format, operation).expect("test recipe pair");
-        let rust_module = match format {
-            PackedAluFormat::Bf16x2 => "bf16x2",
-            PackedAluFormat::F16x2 => "f16x2",
+        let (rust_module, rust_type, dialect_type, adapter) = match format {
+            PackedAluFormat::Bf16x2 => ("bf16x2", "u32", "i32", PackedAluAdapter::DirectPackedU32),
+            PackedAluFormat::F16x2 => ("f16x2", "u32", "i32", PackedAluAdapter::DirectPackedU32),
+            PackedAluFormat::F32x2 => ("f32x2", "u64", "i64", PackedAluAdapter::DirectPackedU64),
         };
         let mut record = policy();
         record.id = recipe.id.into();
@@ -29870,8 +30480,8 @@ mod tests {
         }
         record.rust_module = rust_module.into();
         record.rust_name = recipe.rust_name.into();
-        record.rust_arguments = vec!["u32".into(); recipe.arity];
-        record.rust_result = "u32".into();
+        record.rust_arguments = vec![rust_type.into(); recipe.arity];
+        record.rust_result = rust_type.into();
         record.safe = true;
         record.must_use = recipe.must_use;
         record.safe_allowlist_reason = Some("the operation has no caller obligations".into());
@@ -29880,15 +30490,15 @@ mod tests {
             vec![format!("cuda_device::{rust_module}::{}", recipe.rust_name)];
         record.dialect_op_type = recipe.dialect_op_type.into();
         record.dialect_op_name = recipe.dialect_op_name.into();
-        record.dialect_operands = vec!["i32".into(); recipe.arity];
-        record.dialect_results = vec!["i32".into()];
+        record.dialect_operands = vec![dialect_type.into(); recipe.arity];
+        record.dialect_results = vec![dialect_type.into()];
         record.pure = true;
         record.memory = "none".into();
         record.convergent = false;
         record.execution_scope = "thread".into();
         record.minimum_ptx = recipe.minimum_ptx.into();
         record.minimum_sm = Some(recipe.minimum_sm.into());
-        record.ptx_result = "u32".into();
+        record.ptx_result = rust_type.into();
         record.ptx_isa_section = recipe.ptx_isa_section.into();
         record.ptx_isa_url = recipe.ptx_isa_url.into();
         record.lowering = "generated_packed_alu_inline_ptx".into();
@@ -29911,7 +30521,7 @@ mod tests {
             format,
             native_minimum_sm: recipe.native_minimum_sm,
             operation,
-            adapter: PackedAluAdapter::DirectPackedU32,
+            adapter,
         });
         record.expected_ptx = InstructionPattern::new(
             recipe.ptx_mnemonic.split('.').next().unwrap(),
@@ -30858,8 +31468,8 @@ mod tests {
         let (overlay, hash) =
             read_overlay(&repo_root, &repo_root.join("intrinsics/overlay.toml")).unwrap();
         assert_eq!(overlay.schema, OVERLAY_SCHEMA);
-        assert_eq!(overlay.shards.len(), 63);
-        assert_eq!(overlay.intrinsics.len(), 986);
+        assert_eq!(overlay.shards.len(), 64);
+        assert_eq!(overlay.intrinsics.len(), 1015);
         assert_eq!(
             overlay
                 .intrinsics
@@ -30906,7 +31516,7 @@ mod tests {
                 .iter()
                 .filter(|record| record.family == "packed_alu")
                 .count(),
-            22
+            30
         );
         assert_eq!(
             overlay
@@ -31498,6 +32108,16 @@ mod tests {
                 form,
                 alias,
             })
+            .chain(
+                TCGEN05_MMA_ALIASES
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, alias)| Tcgen05MmaAdmissionVariant {
+                        abi_id: format!("i{:04}", 1011 + index),
+                        form: Tcgen05MmaForm::Shared,
+                        alias: Some(alias),
+                    }),
+            )
             .collect();
         admission
     }
@@ -32380,7 +33000,7 @@ scope = "system"
                 declaration
                     .selections
                     .iter()
-                    .filter(|selection| selection_matches_policy(record, selection))
+                    .filter(|selection| selection_matches_policy(record, selection).unwrap())
                     .count(),
                 1
             );
@@ -33872,9 +34492,10 @@ scope = "system"
         reordered_reduction.reduce_variants.swap(0, 1);
         assert!(expand_tma_admission(&reordered_reduction).is_err());
 
-        let mut wrong_reduction_abi = test_tma_admission();
-        wrong_reduction_abi.reduce_variants[0].abi_id = "i9999".into();
-        assert!(expand_tma_admission(&wrong_reduction_abi).is_err());
+        let mut non_contiguous_reduction_abi = test_tma_admission();
+        non_contiguous_reduction_abi.reduce_variants[0].abi_id = "i9999".into();
+        let records = expand_tma_admission(&non_contiguous_reduction_abi).unwrap();
+        assert_eq!(records[TMA_OPERATIONS.len()].abi_id, "i9999");
 
         let mut executed = test_tma_admission();
         executed.runtime_validation = RuntimeValidation::Executed;
@@ -34041,13 +34662,13 @@ scope = "system"
             .unwrap();
         assert!(mma_f16.expected_ptx.matches(
             "tcgen05.mma.cta_group::1.kind::f16 [%r1], %rd1, %rd2, %r2, {%z, %z, %z, %z}, %enable_pred;"
-        ));
+        ).unwrap());
         assert!(!mma_f16.expected_ptx.matches(
             "tcgen05.mma.cta_group::1.kind::f16 [%r1], %rd1, %rd2, %r2, {%clock64, %z, %z, %z}, %enable_pred;"
-        ));
+        ).unwrap());
         assert!(!mma_f16.expected_ptx.matches(
             "tcgen05.mma.cta_group::1.kind::f16 [%r1], %rd1, %rd2, %r2, {%z, %z, %z, %z}, %other_pred;"
-        ));
+        ).unwrap());
 
         let mma_f16_cg2 = records
             .iter()
@@ -34055,7 +34676,7 @@ scope = "system"
             .unwrap();
         assert!(mma_f16_cg2.expected_ptx.matches(
             "tcgen05.mma.cta_group::2.kind::f16 [%r1], %rd1, %rd2, %r2, {%z, %z, %z, %z, %z, %z, %z, %z}, %enable_pred;"
-        ));
+        ).unwrap());
         assert!(
             !records
                 .iter()
@@ -34177,9 +34798,9 @@ scope = "system"
     #[test]
     fn compact_tcgen05_mma_admission_closes_sources_selectors_and_targets() {
         let records = expand_tcgen05_admission(&test_tcgen05_mma_admission()).unwrap();
-        assert_eq!(records.len(), 46);
+        assert_eq!(records.len(), 51);
         let mma = &records[27..];
-        assert_eq!(mma.len(), 19);
+        assert_eq!(mma.len(), 24);
         assert_eq!(
             mma.iter()
                 .map(|record| (record.abi_id.as_str(), record.id.as_str()))
@@ -34204,6 +34825,11 @@ scope = "system"
                 ("i0779", "tcgen05_mma_ws_e2m3"),
                 ("i0780", "tcgen05_mma_ws_e3m2"),
                 ("i0781", "tcgen05_mma_ws_e2m1"),
+                ("i1011", "tcgen05_mma_e4m3"),
+                ("i1012", "tcgen05_mma_e5m2"),
+                ("i1013", "tcgen05_mma_e2m3"),
+                ("i1014", "tcgen05_mma_e3m2"),
+                ("i1015", "tcgen05_mma_e2m1"),
             ]
         );
         assert!(mma.iter().all(|record| {
@@ -34255,19 +34881,22 @@ scope = "system"
         let dense = &mma[0];
         assert!(dense.expected_ptx.matches(
             "tcgen05.mma.cta_group::1.kind::f16.collector::a::discard [%r1], %rd1, %rd2, %r2, %enable_pred;"
-        ));
+        ).unwrap());
         assert!(!dense.expected_ptx.matches(
             "tcgen05.mma.cta_group::1.kind::f16.collector::a::discard [%r1], %rd1, %rd2, %r2, %clock64;"
-        ));
+        ).unwrap());
         assert!(mma[4].expected_ptx.matches(
             "tcgen05.mma.sp.cta_group::1.kind::f16.collector::a::discard [%r1], [%r2], %rd1, [%r3], %r4, %enable_pred;"
-        ));
+        ).unwrap());
         assert!(mma[7].expected_ptx.matches(
             "tcgen05.mma.ws.cta_group::1.kind::f16.collector::b0::discard [%r1], %rd1, %rd2, %r2, %enable_pred, %rd3;"
-        ));
+        ).unwrap());
         assert!(mma[14].expected_ptx.matches(
             "tcgen05.mma.ws.cta_group::1.kind::f8f6f4.collector::b0::discard [%r1], [%r2], %rd1, %r3, %enable_pred;"
-        ));
+        ).unwrap());
+        assert!(mma[19].expected_ptx.matches(
+            "tcgen05.mma.cta_group::1.kind::f8f6f4.collector::a::discard [%r1], %rd1, %rd2, %r2, %enable_pred;"
+        ).unwrap());
 
         let canonical = &mma[..14];
         assert_eq!(
@@ -34282,7 +34911,7 @@ scope = "system"
             declarations[record.source_record.as_deref().unwrap()]
                 .selections
                 .iter()
-                .filter(|selection| selection_matches_policy(record, selection))
+                .filter(|selection| selection_matches_policy(record, selection).unwrap())
                 .count()
         };
         let newly_matched = canonical
@@ -34293,7 +34922,7 @@ scope = "system"
         assert_eq!(newly_matched, 608);
         assert_eq!(selected_count(&canonical[12]), 64);
         assert_eq!(canonical.iter().map(selected_count).sum::<usize>(), 672);
-        assert_eq!(mma[14..].iter().map(selected_count).sum::<usize>(), 5);
+        assert_eq!(mma[14..].iter().map(selected_count).sum::<usize>(), 10);
         assert_eq!(
             [2, 5]
                 .into_iter()
@@ -34343,7 +34972,7 @@ scope = "system"
                 [6, 6, 2, 6]
             );
         }
-        for record in &mma[14..] {
+        for record in &mma[14..19] {
             assert_eq!(
                 record.compatibility_rust_paths,
                 [format!("cuda_device::tcgen05::{}", record.id)]
@@ -34361,6 +34990,34 @@ scope = "system"
                     b_buffer: 0,
                     b_usage: Tcgen05MmaBUsage::Discard,
                 })
+            );
+            let CatalogHardwareTarget::TargetMatrix { contracts } = &contract.llvm_target.hardware
+            else {
+                panic!("fixed LLVM tcgen05 MMA target must be a matrix")
+            };
+            assert_eq!(contracts.len(), 1);
+            assert_eq!(contracts[0].selectors[0].value, "f8f6f4");
+        }
+        for record in &mma[19..] {
+            assert_eq!(
+                record.compatibility_rust_paths,
+                [format!("cuda_device::tcgen05::{}", record.id)]
+            );
+            assert_eq!(record.rust_arguments, ["u32", "u64", "u64", "u32", "bool"]);
+            assert_eq!(record.dialect_operands, ["i32", "i64", "i64", "i32", "i1"]);
+            let contract = record.tcgen05.as_ref().unwrap().mma.as_ref().unwrap();
+            assert_eq!(contract.form, Tcgen05MmaForm::Shared);
+            assert_eq!(
+                contract.fixed_selectors,
+                Some(Tcgen05MmaFixedSelectors {
+                    kind: Tcgen05MmaKind::F8f6f4,
+                    b_buffer: 0,
+                    b_usage: Tcgen05MmaBUsage::Discard,
+                })
+            );
+            assert_eq!(
+                record.tcgen05.as_ref().unwrap().adapter,
+                Tcgen05Adapter::MmaDirectSelectors
             );
             let CatalogHardwareTarget::TargetMatrix { contracts } = &contract.llvm_target.hardware
             else {
@@ -34392,12 +35049,22 @@ scope = "system"
             .iter()
             .find(|record| record.id == "tcgen05_mma_ws_f16")
             .unwrap();
-        assert!(legacy_f16.expected_ptx.matches(
-            "tcgen05.mma.ws.cta_group::1.kind::f16 [%r1], [%r2], %rd1, %r3, %enable_pred;"
-        ));
-        assert!(!legacy_f16.expected_ptx.matches(
-            "tcgen05.mma.ws.cta_group::1.kind::f16 [%r1], [%r2], %rd1, %r3, %other_pred;"
-        ));
+        assert!(
+            legacy_f16
+                .expected_ptx
+                .matches(
+                    "tcgen05.mma.ws.cta_group::1.kind::f16 [%r1], [%r2], %rd1, %r3, %enable_pred;"
+                )
+                .unwrap()
+        );
+        assert!(
+            !legacy_f16
+                .expected_ptx
+                .matches(
+                    "tcgen05.mma.ws.cta_group::1.kind::f16 [%r1], [%r2], %rd1, %r3, %other_pred;"
+                )
+                .unwrap()
+        );
     }
 
     #[test]
@@ -34410,9 +35077,10 @@ scope = "system"
         reordered.mma_variants.swap(0, 1);
         assert!(expand_tcgen05_admission(&reordered).is_err());
 
-        let mut wrong_abi = test_tcgen05_mma_admission();
-        wrong_abi.mma_variants[0].abi_id = "i9999".into();
-        assert!(expand_tcgen05_admission(&wrong_abi).is_err());
+        let mut non_contiguous_abi = test_tcgen05_mma_admission();
+        non_contiguous_abi.mma_variants[0].abi_id = "i9999".into();
+        let records = expand_tcgen05_admission(&non_contiguous_abi).unwrap();
+        assert!(records.iter().any(|record| record.abi_id == "i9999"));
 
         let mut missing_target = test_tcgen05_mma_admission();
         missing_target.mma_llvm_target_contracts[0]
@@ -34572,9 +35240,10 @@ scope = "system"
         reordered.cp_variants.swap(0, 1);
         assert!(expand_tcgen05_admission(&reordered).is_err());
 
-        let mut wrong_abi = test_tcgen05_cp_admission();
-        wrong_abi.cp_variants[0].abi_id = "i9999".into();
-        assert!(expand_tcgen05_admission(&wrong_abi).is_err());
+        let mut non_contiguous_abi = test_tcgen05_cp_admission();
+        non_contiguous_abi.cp_variants[0].abi_id = "i9999".into();
+        let records = expand_tcgen05_admission(&non_contiguous_abi).unwrap();
+        assert!(records.iter().any(|record| record.abi_id == "i9999"));
 
         let mut missing_evidence = test_tcgen05_cp_admission();
         missing_evidence.cp_llvm_evidence_profile = None;
@@ -34682,11 +35351,13 @@ scope = "system"
             scalar_raw
                 .expected_ptx
                 .matches("tcgen05.ld.sync.aligned.16x64b.x1.b32 {%r1}, [%r2];")
+                .unwrap()
         );
         assert!(
             !scalar_raw
                 .expected_ptx
                 .matches("tcgen05.ld.sync.aligned.16x64b.x1.b32 %r1, [%r2];")
+                .unwrap()
         );
         let scalar_pack = &loads[1];
         assert_eq!(
@@ -34713,9 +35384,10 @@ scope = "system"
         reordered.ld_variants.swap(0, 1);
         assert!(expand_tcgen05_admission(&reordered).is_err());
 
-        let mut wrong_abi = test_tcgen05_ld_admission();
-        wrong_abi.ld_variants[0].abi_id = "i9999".into();
-        assert!(expand_tcgen05_admission(&wrong_abi).is_err());
+        let mut non_contiguous_abi = test_tcgen05_ld_admission();
+        non_contiguous_abi.ld_variants[0].abi_id = "i9999".into();
+        let records = expand_tcgen05_admission(&non_contiguous_abi).unwrap();
+        assert!(records.iter().any(|record| record.abi_id == "i9999"));
 
         let mut missing_evidence = test_tcgen05_ld_admission();
         missing_evidence.ld_llvm_evidence_profile = None;
@@ -34825,11 +35497,13 @@ scope = "system"
             scalar_raw
                 .expected_ptx
                 .matches("tcgen05.st.sync.aligned.16x64b.x1.b32 [%r1], {%r2};")
+                .unwrap()
         );
         assert!(
             !scalar_raw
                 .expected_ptx
                 .matches("tcgen05.st.sync.aligned.16x64b.x1.b32 [%r1], %r2;")
+                .unwrap()
         );
         assert_eq!(
             stores[1].expected_ptx.modifiers,
@@ -34863,9 +35537,10 @@ scope = "system"
         reordered.st_variants.swap(0, 1);
         assert!(expand_tcgen05_admission(&reordered).is_err());
 
-        let mut wrong_abi = test_tcgen05_st_admission();
-        wrong_abi.st_variants[0].abi_id = "i9999".into();
-        assert!(expand_tcgen05_admission(&wrong_abi).is_err());
+        let mut non_contiguous_abi = test_tcgen05_st_admission();
+        non_contiguous_abi.st_variants[0].abi_id = "i9999".into();
+        let records = expand_tcgen05_admission(&non_contiguous_abi).unwrap();
+        assert!(records.iter().any(|record| record.abi_id == "i9999"));
 
         let mut missing_evidence = test_tcgen05_st_admission();
         missing_evidence.st_llvm_evidence_profile = None;
@@ -35009,6 +35684,7 @@ scope = "system"
             scalar_pack
                 .expected_ptx
                 .matches("tcgen05.ld.sync.aligned.16x32bx2.x1.pack::16b.b32 {%r1}, [%r2], 16;")
+                .unwrap()
         );
 
         let scalar_unpack = &stores[1];
@@ -35024,6 +35700,7 @@ scope = "system"
             scalar_unpack
                 .expected_ptx
                 .matches("tcgen05.st.sync.aligned.16x32bx2.x1.unpack::16b.b32 [%r1], 16, {%r2};")
+                .unwrap()
         );
 
         let mut missing = test_tcgen05_offset_admission();
@@ -35034,9 +35711,10 @@ scope = "system"
         reordered.st_offset_variants.swap(0, 1);
         assert!(expand_tcgen05_admission(&reordered).is_err());
 
-        let mut wrong_abi = test_tcgen05_offset_admission();
-        wrong_abi.ld_offset_variants[0].abi_id = "i9999".into();
-        assert!(expand_tcgen05_admission(&wrong_abi).is_err());
+        let mut non_contiguous_abi = test_tcgen05_offset_admission();
+        non_contiguous_abi.ld_offset_variants[0].abi_id = "i9999".into();
+        let records = expand_tcgen05_admission(&non_contiguous_abi).unwrap();
+        assert!(records.iter().any(|record| record.abi_id == "i9999"));
 
         let mut missing_evidence = test_tcgen05_offset_admission();
         missing_evidence.offset_llvm_evidence_profile = None;
@@ -36240,7 +36918,7 @@ scope = "system"
             let declaration = declarations[policy.source_record.as_deref().unwrap()];
             assert_eq!(declaration.selections.len(), 1);
             assert!(
-                selection_matches_policy(policy, &declaration.selections[0]),
+                selection_matches_policy(policy, &declaration.selections[0]).unwrap(),
                 "{}",
                 policy.id
             );
@@ -36671,7 +37349,7 @@ scope = "system"
             let declaration = declarations[policy.source_record.as_deref().unwrap()];
             assert_eq!(declaration.selections.len(), 1);
             assert!(
-                selection_matches_policy(policy, &declaration.selections[0]),
+                selection_matches_policy(policy, &declaration.selections[0]).unwrap(),
                 "{}",
                 policy.id
             );
@@ -37594,7 +38272,7 @@ scope = "system"
             let selected: Vec<_> = declaration
                 .selections
                 .iter()
-                .filter(|selection| selection_matches_policy(&policy, selection))
+                .filter(|selection| selection_matches_policy(&policy, selection).unwrap())
                 .collect();
             assert_eq!(selected.len(), 2);
             assert!(selected.iter().any(|selection| {
@@ -37733,7 +38411,7 @@ scope = "system"
                 declaration
                     .selections
                     .iter()
-                    .filter(|selection| selection_matches_policy(&policy, selection))
+                    .filter(|selection| selection_matches_policy(&policy, selection).unwrap())
                     .count(),
                 8
             );
@@ -38172,13 +38850,13 @@ scope = "system"
         let selected: Vec<_> = declaration
             .selections
             .iter()
-            .filter(|selection| selection_matches_policy(&policy, selection))
+            .filter(|selection| selection_matches_policy(&policy, selection).unwrap())
             .collect();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].source_record, "BARRIER_CTA_SYNC_ALIGNED_ALL_i");
         assert_eq!(selected[0].asm, "bar.sync \t$i;");
-        assert!(policy.expected_ptx.matches("bar.sync 0;"));
-        assert!(!policy.expected_ptx.matches(&selected[0].asm));
+        assert!(policy.expected_ptx.matches("bar.sync 0;").unwrap());
+        assert!(!policy.expected_ptx.matches(&selected[0].asm).unwrap());
         assert_eq!(policy.minimum_ptx, "1.0");
         assert!(policy.minimum_sm.is_none());
         let llvm_route = policy
@@ -38328,7 +39006,7 @@ scope = "system"
         let selected: Vec<_> = declaration
             .selections
             .iter()
-            .filter(|selection| selection_matches_policy(&policy, selection))
+            .filter(|selection| selection_matches_policy(&policy, selection).unwrap())
             .collect();
         assert_eq!(selected.len(), 2);
         assert_eq!(
@@ -38447,7 +39125,7 @@ scope = "system"
     }
 
     #[test]
-    fn every_integer_redux_variant_matches_its_closed_recipe() {
+    fn every_redux_variant_matches_its_closed_recipe() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let (overlay, _) =
             read_overlay(&repo_root, &repo_root.join("intrinsics/overlay.toml")).unwrap();
@@ -38464,7 +39142,7 @@ scope = "system"
             .iter()
             .filter(|record| record.family == "redux")
             .collect();
-        assert_eq!(redux.len(), 8);
+        assert_eq!(redux.len(), 16);
 
         for policy in redux {
             let declaration = declarations
@@ -38552,7 +39230,7 @@ scope = "system"
             let selected: Vec<_> = declaration
                 .selections
                 .iter()
-                .filter(|selection| selection_matches_policy(policy, selection))
+                .filter(|selection| selection_matches_policy(policy, selection).unwrap())
                 .collect();
             assert_eq!(selected.len(), 1);
             if policy.id.starts_with("dp2a") {
@@ -39307,6 +39985,45 @@ scope = "system"
         conflicting
             .predicates
             .push("Subtarget->getPTXVersion() >= 86".into());
+        assert!(validate_selected_target_predicates(&record, &conflicting).is_err());
+    }
+
+    #[test]
+    fn f32_redux_predicate_requires_the_reviewed_exact_target_matrix() {
+        let mut record = policy();
+        record.family = "redux".into();
+        record.minimum_ptx = "8.6".into();
+        record.minimum_sm = None;
+        record.targets = REDUX_F32_TARGETS.into();
+        record.redux = Some(crate::model::Redux {
+            operation: ReduxOperation::Fmin,
+            participation:
+                ReduxParticipation::ExecutingLaneNamedAllNamedLanesSameInstructionAndMask,
+            adapter: ReduxAdapter::MaskValueToSourceMemberMask,
+        });
+        let selection = ImportedSelection {
+            source_record: "selection".into(),
+            asm: "redux.sync.min.f32 \t$dst, $src, $mask;".into(),
+            predicates: vec!["Subtarget->hasReduxSyncF32()".into()],
+            constraints: Default::default(),
+        };
+
+        validate_selected_target_predicates(&record, &selection).unwrap();
+
+        record.targets =
+            "sm_100a|sm_100f|sm_103a|sm_103f|sm_110a|sm_110f|sm_120a|sm_120f|sm_121a|sm_121f"
+                .into();
+        assert!(validate_selected_target_predicates(&record, &selection).is_err());
+
+        record.targets = REDUX_F32_TARGETS.into();
+        record.minimum_ptx = "8.8".into();
+        assert!(validate_selected_target_predicates(&record, &selection).is_err());
+
+        record.minimum_ptx = "8.6".into();
+        let mut conflicting = selection;
+        conflicting
+            .predicates
+            .push("Subtarget->getPTXVersion() >= 88".into());
         assert!(validate_selected_target_predicates(&record, &conflicting).is_err());
     }
 
@@ -40401,7 +41118,7 @@ scope = "system"
             .iter()
             .filter(|record| record.family == "packed_alu")
             .collect();
-        assert_eq!(packed.len(), 22);
+        assert_eq!(packed.len(), 30);
         for policy in packed {
             let source = resolve_policy_source(policy).unwrap();
             let declaration = policy
@@ -40553,7 +41270,7 @@ scope = "system"
 
         let mut wrong_compatibility = valid.clone();
         wrong_compatibility.compatibility_rust_paths =
-            vec!["cuda_device::convert::cvt_f32x2_bf16x2".into()];
+            vec!["cuda_device::tcgen05::cvt_f32x2_bf16x2".into()];
         reject(&wrong_compatibility, &declaration, "conversion API");
 
         let mut wrong_result = valid.clone();
@@ -40740,17 +41457,17 @@ scope = "system"
             variants: variants
                 .iter()
                 .copied()
-                .map(|variant| {
-                    let recipe = scalar_arithmetic_recipe(variant).unwrap();
-                    crate::model::ScalarArithmeticAdmissionVariant {
-                        abi_id: recipe.abi_id,
+                .enumerate()
+                .map(
+                    |(index, variant)| crate::model::ScalarArithmeticAdmissionVariant {
+                        abi_id: format!("i{:04}", 390 + index),
                         format: variant.0,
                         operation: variant.1,
                         rounding: variant.2,
                         subnormal: variant.3,
                         saturation: variant.4,
-                    }
-                })
+                    },
+                )
                 .collect(),
         };
         let records = expand_scalar_arithmetic_admission(&admission).unwrap();
@@ -40801,7 +41518,7 @@ scope = "system"
             let selected = declaration
                 .selections
                 .iter()
-                .filter(|selection| selection_matches_policy(record, selection))
+                .filter(|selection| selection_matches_policy(record, selection).unwrap())
                 .collect::<Vec<_>>();
             assert_eq!(selected.len(), 1, "{}", record.id);
             if declaration.selections.len() == 3 {
@@ -40831,6 +41548,12 @@ scope = "system"
             ["rn", "sat", "ftz", "f32"]
         );
 
+        let mut non_contiguous_abi = admission.clone();
+        non_contiguous_abi.variants[0].abi_id = "i9999".into();
+        let non_contiguous_records =
+            expand_scalar_arithmetic_admission(&non_contiguous_abi).unwrap();
+        assert_eq!(non_contiguous_records[0].abi_id, "i9999");
+
         let mut reordered = admission.clone();
         reordered.variants.swap(0, 1);
         assert!(
@@ -40852,6 +41575,49 @@ scope = "system"
     }
 
     #[test]
+    fn scalar_math_admission_keeps_semantic_order_but_accepts_non_contiguous_abi_ids() {
+        let variants = canonical_scalar_math_variants();
+        let admission = ScalarMathAdmission {
+            llvm_evidence_profile: "llvm-scalar-math".into(),
+            libnvvm_evidence_profile: "libnvvm-scalar-math".into(),
+            runtime_validation: RuntimeValidation::Unexecuted,
+            variants: variants
+                .iter()
+                .copied()
+                .enumerate()
+                .map(
+                    |(index, variant)| crate::model::ScalarMathAdmissionVariant {
+                        abi_id: format!("i{:04}", 782 + index),
+                        format: variant.0,
+                        operation: variant.1,
+                        precision: variant.2,
+                        subnormal: variant.3,
+                    },
+                )
+                .collect(),
+        };
+
+        let records = expand_scalar_math_admission(&admission).unwrap();
+        assert_eq!(records.len(), 40);
+        assert_eq!(records.first().unwrap().abi_id, "i0782");
+        assert_eq!(records.last().unwrap().abi_id, "i0821");
+
+        let mut non_contiguous_abi = admission.clone();
+        non_contiguous_abi.variants[39].abi_id = "i9999".into();
+        let records = expand_scalar_math_admission(&non_contiguous_abi).unwrap();
+        assert_eq!(records.last().unwrap().abi_id, "i9999");
+
+        let mut reordered = admission;
+        reordered.variants.swap(0, 1);
+        assert!(
+            expand_scalar_math_admission(&reordered)
+                .unwrap_err()
+                .to_string()
+                .contains("canonical 40 variants")
+        );
+    }
+
+    #[test]
     fn extended_minmax_admission_is_exact_and_fail_closed() {
         let variants = canonical_extended_minmax_variants();
         let admission = ExtendedMinMaxAdmission {
@@ -40861,17 +41627,21 @@ scope = "system"
             variants: variants
                 .iter()
                 .copied()
-                .map(|variant| {
-                    let recipe = extended_minmax_recipe(variant).unwrap();
-                    crate::model::ExtendedMinMaxAdmissionVariant {
-                        abi_id: recipe.abi_id,
+                .enumerate()
+                .map(
+                    |(index, variant)| crate::model::ExtendedMinMaxAdmissionVariant {
+                        abi_id: if index < 28 {
+                            format!("i{:04}", 550 + index)
+                        } else {
+                            format!("i{:04}", 830 + index - 28)
+                        },
                         format: variant.0,
                         operation: variant.1,
                         subnormal: variant.2,
                         nan: variant.3,
                         xorsign_abs: variant.4,
-                    }
-                })
+                    },
+                )
                 .collect(),
         };
         let records = expand_extended_minmax_admission(&admission).unwrap();
@@ -40925,7 +41695,7 @@ scope = "system"
                 declaration
                     .selections
                     .iter()
-                    .filter(|selection| selection_matches_policy(record, selection))
+                    .filter(|selection| selection_matches_policy(record, selection).unwrap())
                     .count(),
                 1,
                 "{}",
@@ -40977,6 +41747,11 @@ scope = "system"
             );
             assert!(records.iter().all(|record| record.id != id));
         }
+
+        let mut non_contiguous_abi = admission.clone();
+        non_contiguous_abi.variants[0].abi_id = "i9999".into();
+        let non_contiguous_records = expand_extended_minmax_admission(&non_contiguous_abi).unwrap();
+        assert_eq!(non_contiguous_records[0].abi_id, "i9999");
 
         let mut reordered = admission.clone();
         reordered.variants.swap(0, 1);

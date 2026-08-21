@@ -98,6 +98,7 @@ use llvm_export::ops::{
     DebugInlinedScope, DebugSourcePosition, DebugSourceScope, DebugSourceScopeLocation,
     DebugSourceScopeMap,
 };
+use rustc_middle::ty::layout::{LayoutCx, LayoutOf};
 use rustc_middle::ty::{EarlyBinder, InstanceKind, TypingEnv};
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 use rustc_session::config::DebugInfo;
@@ -115,8 +116,11 @@ enum DeviceExternTypePosition {
 /// Convert a Rust device-extern type to the LLVM type supported at the
 /// external function boundary.
 ///
-/// Raw-pointer pointees are preserved recursively. Unsupported C ABI types
-/// return an error instead of being treated as an arbitrary pointer.
+/// Raw-pointer pointees are preserved recursively. Rustc-proven
+/// `#[repr(transparent)]` wrappers are recursively peeled to their ABI-relevant
+/// field before classification, so scalar and pointer wrappers preserve the
+/// same external ABI as their underlying value. Unsupported C ABI types return
+/// an error instead of being treated as an arbitrary pointer.
 ///
 /// Integer types smaller than 32 bits keep their NARROW IR type (`i8`,
 /// `i16`, `i1` for `bool`) and carry a `signext`/`zeroext` ABI attribute,
@@ -197,6 +201,28 @@ fn rustc_ty_to_device_extern_type<'tcx>(
                 Err("f128 device externs are not supported".to_string())
             }
         },
+        TyKind::Adt(adt_def, _) if adt_def.repr().transparent() => {
+            // Do not infer the transparent field from source syntax here.
+            // Rustc's layout engine already knows which field is ABI-relevant,
+            // including nested wrappers and 1-ZST marker fields.
+            let layout_cx = LayoutCx::new(tcx, TypingEnv::fully_monomorphized());
+            let layout = layout_cx.layout_of(ty).map_err(|err| {
+                format!(
+                    "failed to compute layout for repr(transparent) device-extern type `{ty}`: {err:?}"
+                )
+            })?;
+            let peeled = layout.peel_transparent_wrappers(&layout_cx);
+
+            // A transparent type with no peelable non-1ZST field is not a
+            // scalar/pointer wrapper that this device-extern ABI can represent.
+            if peeled.ty == ty {
+                return Err(format!(
+                    "`{ty}` is repr(transparent) but has no ABI-relevant field supported by device externs"
+                ));
+            }
+
+            rustc_ty_to_device_extern_type(tcx, peeled.ty, position)
+        }
         TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => {
             let pointee = if matches!(pointee.kind(), TyKind::Tuple(fields) if fields.is_empty()) {
                 // Rust's `*mut ()` is its common spelling for a void pointer.
@@ -253,12 +279,28 @@ fn rustc_ty_to_device_extern_type<'tcx>(
 ///
 /// Contains paths to generated artifacts and the payload selected for
 /// embedding in the host binary.
+///
+/// `ptx_path`, `ll_path` and `ptx_content` are written by
+/// `generate_device_code` and never read back inside this crate: they record
+/// what codegen produced, which is what the module diagram above documents.
+/// Nothing links this crate as a library (it is a `dylib` rustc loads through
+/// `-Zcodegen-backend`), so `pub` does not make them reachable either. Those
+/// three fields carry their own suppressions below; the remaining fields are
+/// read in `lib.rs` and stay lint-checked.
 pub struct DeviceCodegenResult {
     /// Path to generated PTX assembly file.
     ///
     /// In NVVM IR modes this is the would-be PTX path and may not exist.
+    #[expect(
+        dead_code,
+        reason = "recorded codegen output, kept for future diagnostics"
+    )]
     pub ptx_path: PathBuf,
     /// Path to generated LLVM IR file.
+    #[expect(
+        dead_code,
+        reason = "recorded codegen output, kept for future diagnostics"
+    )]
     pub ll_path: PathBuf,
     /// GPU target architecture used (e.g., "sm_80", "sm_90a", "sm_100a").
     ///
@@ -268,6 +310,10 @@ pub struct DeviceCodegenResult {
     /// PTX content as a string, ready for embedding in the host binary.
     ///
     /// NVVM IR / LTOIR flows intentionally skip PTX generation.
+    #[expect(
+        dead_code,
+        reason = "recorded codegen output, kept for future diagnostics"
+    )]
     pub ptx_content: Option<String>,
     /// Device artifact payload selected for embedding.
     pub artifact: Option<DeviceCodegenArtifact>,
@@ -407,6 +453,12 @@ fn debug_position_from_span(tcx: TyCtxt<'_>, span: Span) -> Option<DebugSourcePo
 }
 
 /// Errors that can occur during device code generation.
+///
+/// `Translation` is part of the taxonomy and has a `Display` arm, but nothing
+/// constructs it today: translation failures arrive as
+/// `cuda_oxide_codegen::PipelineError` and are reported through that. Kept so
+/// the variant set still mirrors the pipeline's, rather than deleted and
+/// re-added the next time it is needed.
 #[derive(Debug)]
 pub enum DeviceCodegenError {
     /// No kernels were found to compile.
@@ -414,6 +466,10 @@ pub enum DeviceCodegenError {
     /// Failed to enter or exit stable_mir context.
     StableMirError(String),
     /// MIR to Pliron IR translation failed.
+    #[expect(
+        dead_code,
+        reason = "mirrors PipelineError's taxonomy, not constructed here"
+    )]
     Translation(String),
     /// PTX generation (llc invocation) failed.
     PtxGeneration(String),

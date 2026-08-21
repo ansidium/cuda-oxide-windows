@@ -50,8 +50,9 @@
 
 use crate::context::{DeviceGlobalsMap, DynamicSmemAlignmentMap, SharedGlobalsMap};
 use crate::convert::types::{
-    StructLayoutInfo, build_struct_slot_map, convert_type, get_type_size, mir_type_abi_align,
-    validate_initialized_global_layout,
+    StructLayoutInfo, build_struct_slot_map, convert_type, get_type_size,
+    llvm_packed_struct_contains_pointer_in_address_space, mir_type_abi_align,
+    validate_initialized_global_layout, validate_relocated_initialized_global_layout,
 };
 use crate::helpers;
 use dialect_mir::types::{MirPtrType, MirStructType};
@@ -59,7 +60,7 @@ use llvm_export::attributes::IntegerOverflowFlagsAttr;
 use llvm_export::op_interfaces::IntBinArithOpWithOverflowFlag;
 use llvm_export::ops as llvm;
 use llvm_export::ops::GlobalOpExt;
-use llvm_export::types::{ArrayType, FuncType, StructType, VoidType};
+use llvm_export::types::{ArrayType, FuncType, StructLayout, StructType, VoidType};
 use pliron::attribute::AttrObj;
 use pliron::builtin::attributes::IntegerAttr;
 use pliron::builtin::op_interfaces::CallOpCallable;
@@ -106,12 +107,14 @@ pub(crate) fn convert_store(
         }
     };
 
-    // A whole-value store of a layout-divergent (repr(packed)) struct would
-    // write the natural LLVM image: fields at natural offsets, natural total
-    // size. Both disagree with rustc's layout for the bytes behind `ptr`, so
-    // refuse rather than corrupt. Same rule as `convert_load` and
-    // `convert_construct_struct`.
-    fail_on_divergent_aggregate(ctx, value_mir_type(ctx, operands_info, val), "storing")?;
+    // Packed whole-value stores are byte-faithful now that divergent rustc
+    // layouts lower to LLVM packed structs. Keep the target-dependent AS3 case
+    // fail-closed because its physical pointer width is selected only later.
+    fail_on_target_dependent_packed_aggregate(
+        ctx,
+        value_mir_type(ctx, operands_info, val),
+        "storing",
+    )?;
 
     let llvm_store = llvm::StoreOp::new(ctx, val, ptr);
     if dialect_mir::ops::MirStoreOp::new(op).is_volatile(ctx) {
@@ -135,6 +138,7 @@ pub(crate) fn convert_store(
     if let Some(align) = align {
         llvm_export::ops::set_op_alignment(ctx, llvm_store.get_operation(), align as u32);
     }
+    crate::convert::preserve_location(ctx, op, llvm_store.get_operation());
     rewriter.insert_operation(ctx, llvm_store.get_operation());
     rewriter.erase_operation(ctx, op);
     Ok(())
@@ -176,26 +180,48 @@ fn value_mir_type(ctx: &Context, operands_info: &OperandsInfo, value: Value) -> 
         .unwrap_or(current)
 }
 
-/// Refuse a whole-value move of a struct whose rustc layout the natural LLVM
-/// struct type cannot express (`StructSlotMap::layout_diverges`, i.e.
-/// repr(packed)). Field ADDRESSES for such structs use rustc's byte offsets,
-/// so a natural-layout value image would silently read or write the wrong
-/// bytes; `verb` names the operation for the diagnostic.
-fn fail_on_divergent_aggregate(ctx: &mut Context, ty: TypeHandle, verb: &str) -> Result<()> {
-    let layout = {
-        let ty_ref = ty.deref(ctx);
-        match ty_ref.downcast_ref::<MirStructType>() {
-            Some(s) => StructLayoutInfo::of_struct(s),
-            None => return Ok(()),
+/// Refuse only packed by-value images whose physical bytes depend on the
+/// selected NVPTX mode.
+///
+/// Shared-memory pointers are 32-bit in modern NVVM p3:32 but 64-bit in the
+/// PTX/legacy layouts. Lowering runs before that target mode is selected, so a
+/// packed aggregate containing AS3 cannot safely be loaded or stored as one
+/// physical value. Pointer-free packed aggregates and packed aggregates whose
+/// pointers use target-stable address spaces are allowed.
+fn fail_on_target_dependent_packed_aggregate(
+    ctx: &mut Context,
+    ty: TypeHandle,
+    verb: &str,
+) -> Result<()> {
+    let llvm_ty = {
+        let layout = {
+            let ty_ref = ty.deref(ctx);
+            ty_ref
+                .downcast_ref::<MirStructType>()
+                .map(StructLayoutInfo::of_struct)
+        };
+        if let Some(layout) = layout {
+            let map = build_struct_slot_map(ctx, &layout).map_err(anyhow_to_pliron)?;
+            if !map.by_value_layout_faithful {
+                return pliron::input_err_noloc!(
+                    "{} a struct whose rustc layout cannot be represented by an LLVM \
+                     struct value is not supported",
+                    verb
+                );
+            }
+            map.llvm_struct_ty
+        } else {
+            convert_type(ctx, ty).map_err(anyhow_to_pliron)?
         }
     };
-    let map = build_struct_slot_map(ctx, &layout).map_err(anyhow_to_pliron)?;
-    if map.layout_diverges {
+    if llvm_packed_struct_contains_pointer_in_address_space(
+        ctx,
+        llvm_ty,
+        llvm_export::types::address_space::SHARED,
+    ) {
         return pliron::input_err_noloc!(
-            "{} a struct whose rustc layout diverges from the natural LLVM layout \
-             (repr(packed)) by value is not supported; keep the value behind a \
-             pointer and access fields with addr_of! plus \
-             read_unaligned/write_unaligned",
+            "{} a packed aggregate containing a shared-memory pointer by value is \
+             target-mode dependent and is not yet supported",
             verb
         );
     }
@@ -206,6 +232,14 @@ fn copy_debug_local_variable(ctx: &mut Context, mir_op: Ptr<Operation>, llvm_op:
     if let Some(info) = llvm_export::ops::debug_local_variable(ctx, mir_op) {
         llvm_export::ops::set_debug_local_variable(ctx, llvm_op, info);
     }
+    let projected = llvm_export::ops::debug_projected_variables(ctx, mir_op);
+    if !projected.is_empty() {
+        llvm_export::ops::set_debug_projected_variables(ctx, llvm_op, &projected);
+    }
+    let fragments = llvm_export::ops::debug_fragment_variables(ctx, mir_op);
+    if !fragments.is_empty() {
+        llvm_export::ops::set_debug_fragment_variables(ctx, llvm_op, &fragments);
+    }
     if let Some(scope) = llvm_export::ops::debug_local_source_scope(ctx, mir_op) {
         llvm_export::ops::set_debug_local_source_scope(ctx, llvm_op, scope);
     }
@@ -213,6 +247,9 @@ fn copy_debug_local_variable(ctx: &mut Context, mir_op: Ptr<Operation>, llvm_op:
         llvm_export::ops::set_debug_local_declaration_location(
             ctx, llvm_op, file, pos.line, pos.column,
         );
+    }
+    if let Some(expression) = llvm_export::ops::debug_value_expression(ctx, mir_op) {
+        llvm_export::ops::set_debug_value_expression(ctx, llvm_op, &expression);
     }
 }
 
@@ -402,6 +439,7 @@ fn convert_mem_transfer(
         func_ty,
         vec![dst, src, bytes, volatile_val],
     );
+    crate::convert::preserve_location(ctx, op, call.get_operation());
     rewriter.insert_operation(ctx, call.get_operation());
     rewriter.erase_operation(ctx, op);
     Ok(())
@@ -444,12 +482,10 @@ pub(crate) fn convert_load(
     let ptr = op.deref(ctx).get_operand(0);
     let result_ty = op.deref(ctx).get_result(0).get_type(ctx);
 
-    // A whole-value load of a layout-divergent (repr(packed)) struct would
-    // read the natural LLVM image: fields at natural offsets, natural total
-    // size. Both disagree with rustc's layout of the bytes behind `ptr`, so
-    // refuse rather than fabricate. Same rule as `convert_store` and
-    // `convert_construct_struct`.
-    fail_on_divergent_aggregate(ctx, result_ty, "loading")?;
+    // Packed whole-value loads are byte-faithful now that divergent rustc
+    // layouts lower to LLVM packed structs. Keep only the target-dependent AS3
+    // physical-image case fail-closed.
+    fail_on_target_dependent_packed_aggregate(ctx, result_ty, "loading")?;
 
     let llvm_ty = convert_type(ctx, result_ty).map_err(anyhow_to_pliron)?;
 
@@ -494,6 +530,33 @@ pub(crate) fn convert_dbg_value(
     let value = op.deref(ctx).get_operand(0);
     let loc = op.deref(ctx).loc().clone();
     let llvm_dbg_value = llvm::DebugValueOp::new(ctx, value);
+    llvm_dbg_value.get_operation().deref_mut(ctx).set_loc(loc);
+    copy_debug_local_variable(ctx, op, llvm_dbg_value.get_operation());
+    rewriter.insert_operation(ctx, llvm_dbg_value.get_operation());
+    rewriter.erase_operation(ctx, op);
+    Ok(())
+}
+
+/// Convert `mir.dbg_value_list` to the LLVM-export multi-value debug marker.
+///
+/// The ordered operands become a `DIArgList` during textual export. The typed
+/// location recipe is carried as generic metadata and copied unchanged here.
+pub(crate) fn convert_dbg_value_list(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let values: Vec<_> = op.deref(ctx).operands().collect();
+    if values.len() < 2 {
+        return pliron::input_err_noloc!("mir.dbg_value_list requires at least two operands");
+    }
+    if llvm_export::ops::debug_value_expression(ctx, op).is_none() {
+        return pliron::input_err_noloc!("mir.dbg_value_list is missing its debug expression");
+    }
+
+    let loc = op.deref(ctx).loc().clone();
+    let llvm_dbg_value = llvm::DebugValueListOp::new(ctx, values);
     llvm_dbg_value.get_operation().deref_mut(ctx).set_loc(loc);
     copy_debug_local_variable(ctx, op, llvm_dbg_value.get_operation());
     rewriter.insert_operation(ctx, llvm_dbg_value.get_operation());
@@ -960,13 +1023,19 @@ fn create_device_global(
                 "device global initializer is missing its evaluated Rust allocation alignment"
             )));
         }
-        validate_initialized_global_layout(ctx, spec.mir_type, byte_count, spec.alignment)
-            .map_err(anyhow_to_pliron)?;
-
         let storage_type = if let Some(encoded) = spec.initializer_relocations {
+            validate_relocated_initialized_global_layout(
+                ctx,
+                spec.mir_type,
+                byte_count,
+                spec.alignment,
+            )
+            .map_err(anyhow_to_pliron)?;
             relocated_initializer_storage_type(ctx, byte_count, spec.alignment, encoded)
                 .map_err(anyhow_to_pliron)?
         } else {
+            validate_initialized_global_layout(ctx, spec.mir_type, byte_count, spec.alignment)
+                .map_err(anyhow_to_pliron)?;
             let i8_ty = IntegerType::get(ctx, 8, Signedness::Signless);
             ArrayType::get(ctx, i8_ty.into(), byte_count).into()
         };
@@ -1047,6 +1116,7 @@ fn relocated_initializer_storage_type(
 
     let mut cursor = 0u64;
     let mut fields = Vec::with_capacity(relocations.len() * 2 + 1);
+    let mut requires_packed_storage = false;
     let i8_ty = IntegerType::get(ctx, 8, Signedness::Signless);
 
     for (index, relocation) in relocations.iter().enumerate() {
@@ -1067,20 +1137,8 @@ fn relocated_initializer_storage_type(
         }
 
         let width = u64::from(relocation.width_bytes);
-        if relocation.source_offset % width != 0 {
-            anyhow::bail!(
-                "device global relocation {index} starts at unaligned byte offset {} for a {}-byte pointer",
-                relocation.source_offset,
-                relocation.width_bytes
-            );
-        }
-        if allocation_alignment < width {
-            anyhow::bail!(
-                "device global relocation {index} requires {}-byte alignment but the Rust allocation alignment is {}",
-                relocation.width_bytes,
-                allocation_alignment
-            );
-        }
+        requires_packed_storage |=
+            allocation_alignment < width || !relocation.source_offset.is_multiple_of(width);
         if relocation.source_offset < cursor {
             anyhow::bail!(
                 "device global relocation {index} overlaps the previous relocation or literal span"
@@ -1111,7 +1169,12 @@ fn relocated_initializer_storage_type(
         fields.push(ArrayType::get(ctx, i8_ty.into(), byte_count - cursor).into());
     }
 
-    let storage: TypeHandle = StructType::get_unnamed(ctx, fields).into();
+    let layout = if requires_packed_storage {
+        StructLayout::Packed
+    } else {
+        StructLayout::Unpacked
+    };
+    let storage: TypeHandle = StructType::get_unnamed(ctx, (fields, layout)).into();
     let lowered_size = get_type_size(ctx, storage);
     if lowered_size != byte_count {
         anyhow::bail!(
@@ -1662,12 +1725,10 @@ mod tests {
         );
     }
 
-    /// A `#[repr(C, packed)]`-style layout the natural LLVM struct cannot
-    /// express: field addresses use rustc's byte offsets, so a whole-value
-    /// load of the natural image would read different bytes. It must fail to
-    /// lower, not fabricate a value.
+    /// Whole-value loads of pointer-free packed structs use the packed LLVM
+    /// representation, preserving rustc's byte size and field offsets.
     #[test]
-    fn packed_struct_whole_value_load_fails_closed() {
+    fn packed_struct_whole_value_load_uses_packed_layout() {
         let mut ctx = make_ctx();
         let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
         let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
@@ -1698,18 +1759,75 @@ mod tests {
         load_op.insert_at_back(block, &ctx);
         append_mir_return(&mut ctx, block, vec![]);
 
-        let err = crate::lower_mir_to_llvm(&mut ctx, module_ptr)
-            .expect_err("whole-value load of a packed struct must fail to lower");
-        assert!(
-            format!("{err:?}").contains("diverges from the natural LLVM layout"),
-            "the refusal must name the layout divergence: {err:?}"
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect("whole-value load of a pointer-free packed struct must lower");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let load = find_first::<llvm::LoadOp>(&ctx, &body).expect("expected packed llvm.load");
+        let result_ty = load
+            .get_operation()
+            .deref(&ctx)
+            .get_result(0)
+            .get_type(&ctx);
+        let result_ty_ref = result_ty.deref(&ctx);
+        let struct_ty = result_ty_ref
+            .downcast_ref::<StructType>()
+            .expect("packed load result must be an LLVM struct");
+        assert_eq!(struct_ty.layout(), StructLayout::Packed);
+        assert_eq!(
+            crate::convert::types::llvm_type_size_align(&ctx, result_ty),
+            Some((5, 1))
+        );
+        assert_eq!(
+            llvm_export::ops::op_alignment(&ctx, load.get_operation()),
+            Some(1)
         );
     }
 
-    /// The store-side twin of the test above: a whole-value store would write
-    /// the natural image (wrong offsets, wrong size) over rustc-layout bytes.
     #[test]
-    fn packed_struct_whole_value_store_fails_closed() {
+    fn packed_struct_whole_value_load_with_shared_pointer_fails_closed() {
+        let mut ctx = make_ctx();
+        let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let pointee: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let shared_ty: TypeHandle = MirPtrType::get_shared(&mut ctx, pointee, false).into();
+        let packed_ty: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PackedShared".into(),
+            vec!["tag".into(), "ptr".into()],
+            vec![u8_ty, shared_ty],
+            vec![0, 1],
+            vec![0, 1],
+            9,
+            1,
+        )
+        .into();
+        let ptr_ty = MirPtrType::get_generic(&mut ctx, packed_ty, false);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![ptr_ty.into()], vec![]);
+        let ptr_val = block.deref(&ctx).get_argument(0);
+        let load_op = Operation::new(
+            &mut ctx,
+            mir::MirLoadOp::get_concrete_op_info(),
+            vec![packed_ty],
+            vec![ptr_val],
+            vec![],
+            0,
+        );
+        load_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        let err = crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect_err("packed whole-value load containing AS3 must remain fail-closed");
+        assert!(
+            format!("{err:?}").contains("target-mode dependent"),
+            "the refusal must identify the target-dependent packed AS3 image: {err:?}"
+        );
+    }
+
+    /// Whole-value stores use the same packed representation as construction
+    /// and loads, while preserving the MIR aggregate's proved ABI alignment.
+    #[test]
+    fn packed_struct_whole_value_store_uses_packed_layout() {
         let mut ctx = make_ctx();
         let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
         let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
@@ -1741,11 +1859,28 @@ mod tests {
         store_op.insert_at_back(block, &ctx);
         append_mir_return(&mut ctx, block, vec![]);
 
-        let err = crate::lower_mir_to_llvm(&mut ctx, module_ptr)
-            .expect_err("whole-value store of a packed struct must fail to lower");
-        assert!(
-            format!("{err:?}").contains("diverges from the natural LLVM layout"),
-            "the refusal must name the layout divergence: {err:?}"
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect("whole-value store of a pointer-free packed struct must lower");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let store = find_first::<llvm::StoreOp>(&ctx, &body).expect("expected packed llvm.store");
+        let value_ty = store
+            .get_operation()
+            .deref(&ctx)
+            .get_operand(0)
+            .get_type(&ctx);
+        let value_ty_ref = value_ty.deref(&ctx);
+        let struct_ty = value_ty_ref
+            .downcast_ref::<StructType>()
+            .expect("packed store value must be an LLVM struct");
+        assert_eq!(struct_ty.layout(), StructLayout::Packed);
+        assert_eq!(
+            crate::convert::types::llvm_type_size_align(&ctx, value_ty),
+            Some((5, 1))
+        );
+        assert_eq!(
+            llvm_export::ops::op_alignment(&ctx, store.get_operation()),
+            Some(1)
         );
     }
 
@@ -2374,6 +2509,36 @@ mod tests {
             },
         );
         llvm::set_debug_local_source_scope(&mut ctx, dbg_op.get_operation(), 42);
+        llvm::set_debug_fragment_variables(
+            &mut ctx,
+            dbg_op.get_operation(),
+            &[llvm::DebugFragmentVariableInfo {
+                variable: llvm::DebugLocalVariableInfo {
+                    name: "pair".to_string(),
+                    argument_index: None,
+                    ty: llvm::DebugLocalTypeKind::Array {
+                        name: "[u32; 2]".to_string(),
+                        size_bits: 64,
+                        element: Box::new(llvm::DebugLocalTypeKind::Basic {
+                            name: "u32".to_string(),
+                            size_bits: 32,
+                            encoding: "DW_ATE_unsigned",
+                        }),
+                        count: 2,
+                    },
+                },
+                fragment: llvm::DebugFragment {
+                    offset_bits: 32,
+                    size_bits: 32,
+                },
+                source_scope: Some(42),
+                declaration: Some(llvm::DebugSourcePosition {
+                    file: PathBuf::from("decl.rs"),
+                    line: 7,
+                    column: 3,
+                }),
+            }],
+        );
         llvm::set_debug_local_declaration_location(
             &mut ctx,
             dbg_op.get_operation(),
@@ -2417,6 +2582,61 @@ mod tests {
                 size_bits: 32,
                 encoding: "DW_ATE_signed",
             }
+        );
+        let fragments = llvm::debug_fragment_variables(&ctx, dbg_value.get_operation());
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].fragment.offset_bits, 32);
+        assert_eq!(fragments[0].fragment.size_bits, 32);
+        assert_eq!(fragments[0].variable.name, "pair");
+    }
+
+    #[test]
+    fn convert_dbg_value_list_preserves_operands_and_expression() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, false);
+        let i64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Signless).into();
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![ptr_ty.into(), i64_ty], vec![]);
+        let base = block.deref(&ctx).get_argument(0);
+        let index = block.deref(&ctx).get_argument(1);
+
+        let dbg_op = mir::MirDbgValueListOp::new(&mut ctx, vec![base, index]);
+        llvm::set_debug_local_variable(
+            &mut ctx,
+            dbg_op.get_operation(),
+            llvm::DebugLocalVariableInfo {
+                name: "item".to_string(),
+                argument_index: None,
+                ty: llvm::DebugLocalTypeKind::Basic {
+                    name: "u32".to_string(),
+                    size_bits: 32,
+                    encoding: "DW_ATE_unsigned",
+                },
+            },
+        );
+        let expression = llvm::DebugValueExpression::new(vec![
+            llvm::DebugValueExpressionOp::Arg(0),
+            llvm::DebugValueExpressionOp::Arg(1),
+            llvm::DebugValueExpressionOp::ConstU(4),
+            llvm::DebugValueExpressionOp::Mul,
+            llvm::DebugValueExpressionOp::Plus,
+            llvm::DebugValueExpressionOp::Deref,
+        ]);
+        llvm::set_debug_value_expression(&mut ctx, dbg_op.get_operation(), &expression);
+        dbg_op.get_operation().insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        assert_eq!(count_ops::<mir::MirDbgValueListOp>(&ctx, &body), 0);
+        let dbg_value = find_first::<llvm::DebugValueListOp>(&ctx, &body)
+            .expect("expected lowered llvm.dbg_value_list marker");
+        assert_eq!(dbg_value.values(&ctx), vec![base, index]);
+        assert_eq!(
+            llvm::debug_value_expression(&ctx, dbg_value.get_operation()),
+            Some(expression)
         );
     }
 
@@ -2540,6 +2760,96 @@ mod tests {
             decl_loc,
             "debug records for source-less promoted ops should fall back to the local declaration"
         );
+    }
+
+    #[test]
+    fn mem2reg_salvages_fragment_only_alloca_into_mir_dbg_value() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![i32_ty], vec![i32_ty]);
+        let arg = block.deref(&ctx).get_argument(0);
+
+        let alloca_op = Operation::new(
+            &mut ctx,
+            mir::MirAllocaOp::get_concrete_op_info(),
+            vec![mir_ptr_ty.into()],
+            vec![],
+            vec![],
+            0,
+        );
+        let alloca_loc = src_location(&mut ctx, "kernel.rs", 20, 9);
+        alloca_op.deref_mut(&ctx).set_loc(alloca_loc);
+        llvm::set_debug_fragment_variables(
+            &mut ctx,
+            alloca_op,
+            &[llvm::DebugFragmentVariableInfo {
+                variable: llvm::DebugLocalVariableInfo {
+                    name: "pair".to_string(),
+                    argument_index: None,
+                    ty: llvm::DebugLocalTypeKind::Array {
+                        name: "[u32; 2]".to_string(),
+                        size_bits: 64,
+                        element: Box::new(llvm::DebugLocalTypeKind::Basic {
+                            name: "u32".to_string(),
+                            size_bits: 32,
+                            encoding: "DW_ATE_unsigned",
+                        }),
+                        count: 2,
+                    },
+                },
+                fragment: llvm::DebugFragment {
+                    offset_bits: 32,
+                    size_bits: 32,
+                },
+                source_scope: Some(9),
+                declaration: Some(llvm::DebugSourcePosition {
+                    file: PathBuf::from("kernel.rs"),
+                    line: 20,
+                    column: 9,
+                }),
+            }],
+        );
+        alloca_op.insert_at_back(block, &ctx);
+        let slot = alloca_op.deref(&ctx).get_result(0);
+
+        let store_op = Operation::new(
+            &mut ctx,
+            mir::MirStoreOp::get_concrete_op_info(),
+            vec![],
+            vec![slot, arg],
+            vec![],
+            0,
+        );
+        store_op.insert_at_back(block, &ctx);
+
+        let load_op = Operation::new(
+            &mut ctx,
+            mir::MirLoadOp::get_concrete_op_info(),
+            vec![i32_ty],
+            vec![slot],
+            vec![],
+            0,
+        );
+        load_op.insert_at_back(block, &ctx);
+        let loaded = load_op.deref(&ctx).get_result(0);
+        append_mir_return(&mut ctx, block, vec![loaded]);
+
+        let mut analyses = pliron::pass::AnalysisManager::default();
+        pliron::opts::mem2reg::mem2reg(module_ptr, &mut ctx, &mut analyses)
+            .expect("mem2reg should promote fragment storage");
+
+        let dbg_values = find_all::<mir::MirDbgValueOp>(&ctx, &[block]);
+        assert!(
+            !dbg_values.is_empty(),
+            "fragment-only storage should still produce mir.dbg_value salvage"
+        );
+        let fragments = llvm::debug_fragment_variables(&ctx, dbg_values[0].get_operation());
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].variable.name, "pair");
+        assert_eq!(fragments[0].fragment.offset_bits, 32);
+        assert_eq!(fragments[0].fragment.size_bits, 32);
     }
 
     #[test]
@@ -3575,6 +3885,84 @@ mod tests {
             global.initializer_relocations(&ctx).as_deref(),
             Some(encoded.as_str())
         );
+    }
+
+    #[test]
+    fn relocated_global_uses_packed_storage_for_unaligned_pointer_slot() {
+        let mut ctx = make_ctx();
+        let encoded =
+            llvm::encode_global_initializer_relocations(&[llvm::GlobalInitializerRelocation {
+                source_offset: 1,
+                width_bytes: 8,
+                target_address_space: llvm_addr::GLOBAL,
+                target_addend: 0,
+                target_key: "target_static".to_string(),
+            }]);
+
+        let storage = relocated_initializer_storage_type(&mut ctx, 9, 1, &encoded)
+            .expect("unaligned relocation should use packed storage");
+        let storage_ref = storage.deref(&ctx);
+        let struct_ty = storage_ref
+            .downcast_ref::<StructType>()
+            .expect("relocated initializer must use struct storage");
+        assert_eq!(struct_ty.layout(), StructLayout::Packed);
+        assert_eq!(struct_ty.num_fields(), 2);
+        assert_eq!(get_type_size(&ctx, storage), 9);
+
+        let fields: Vec<_> = struct_ty.fields().collect();
+        let literal_ref = fields[0].deref(&ctx);
+        let literal = literal_ref
+            .downcast_ref::<ArrayType>()
+            .expect("leading literal span must be a byte array");
+        assert_eq!(literal.size(), 1);
+        let pointer_ref = fields[1].deref(&ctx);
+        let pointer = pointer_ref
+            .downcast_ref::<IntegerType>()
+            .expect("relocation slot must be an integer carrier");
+        assert_eq!(pointer.width(), 64);
+    }
+
+    #[test]
+    fn relocated_global_uses_packed_storage_for_underaligned_allocation() {
+        let mut ctx = make_ctx();
+        let encoded =
+            llvm::encode_global_initializer_relocations(&[llvm::GlobalInitializerRelocation {
+                source_offset: 0,
+                width_bytes: 8,
+                target_address_space: llvm_addr::GLOBAL,
+                target_addend: 0,
+                target_key: "target_static".to_string(),
+            }]);
+
+        let storage = relocated_initializer_storage_type(&mut ctx, 8, 1, &encoded)
+            .expect("underaligned allocation should use packed storage");
+        let storage_ref = storage.deref(&ctx);
+        let struct_ty = storage_ref
+            .downcast_ref::<StructType>()
+            .expect("relocated initializer must use struct storage");
+        assert_eq!(struct_ty.layout(), StructLayout::Packed);
+        assert_eq!(get_type_size(&ctx, storage), 8);
+    }
+
+    #[test]
+    fn relocated_global_keeps_naturally_aligned_storage_unpacked() {
+        let mut ctx = make_ctx();
+        let encoded =
+            llvm::encode_global_initializer_relocations(&[llvm::GlobalInitializerRelocation {
+                source_offset: 8,
+                width_bytes: 8,
+                target_address_space: llvm_addr::GLOBAL,
+                target_addend: 0,
+                target_key: "target_static".to_string(),
+            }]);
+
+        let storage = relocated_initializer_storage_type(&mut ctx, 16, 8, &encoded)
+            .expect("aligned relocation should keep ordinary storage");
+        let storage_ref = storage.deref(&ctx);
+        let struct_ty = storage_ref
+            .downcast_ref::<StructType>()
+            .expect("relocated initializer must use struct storage");
+        assert_eq!(struct_ty.layout(), StructLayout::Unpacked);
     }
 
     #[test]

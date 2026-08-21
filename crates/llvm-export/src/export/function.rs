@@ -33,15 +33,15 @@ use pliron::{
 use crate::{
     attributes::FPHalfAttr,
     ops::{self, FuncOp, GlobalOpExt},
-    types::{ArrayType, FuncType, PointerType, StructType},
+    types::{ArrayType, FuncType, PointerType, StructLayout, StructType},
 };
 
 use super::{
     literals::{format_float_literal, format_half_literal},
     names::{decode_intrinsic_identifier, has_device_prefix, strip_device_prefix},
     state::{
-        KernelBlockGeometry, KernelClusterConfig, KernelInfo, KernelLaunchBounds,
-        ModuleExportState, PredecessorMap,
+        FunctionAbiAlignment, KernelBlockGeometry, KernelClusterConfig, KernelInfo,
+        KernelLaunchBounds, ModuleExportState, PredecessorMap,
     },
 };
 
@@ -260,8 +260,12 @@ impl<'a> ModuleExportState<'a> {
         let mut field_index = 0usize;
         let mut cursor = 0u64;
         let mut first = true;
+        let (open, close) = match storage.layout() {
+            StructLayout::Packed => ("<{ ", " }>"),
+            StructLayout::Unpacked => ("{ ", " }"),
+        };
 
-        write!(output, "{{ ").unwrap();
+        write!(output, "{open}").unwrap();
         for (index, relocation) in relocations.iter().enumerate() {
             if relocation.width_bytes != 8 {
                 return Err(format!(
@@ -339,7 +343,7 @@ impl<'a> ModuleExportState<'a> {
                 fields.len()
             ));
         }
-        write!(output, " }}").unwrap();
+        write!(output, "{close}").unwrap();
         Ok(())
     }
 
@@ -510,15 +514,16 @@ impl<'a> ModuleExportState<'a> {
         output: &mut String,
     ) -> Result<(), String> {
         let func_name = func.get_symbol_name(self.ctx);
+        let func_name_str: &str = func_name.as_ref();
         // LLVM intrinsics (NVVM and standard, e.g. llvm.fptosi.sat) use dots in IR
         // but Pliron IR identifiers use underscores; convert for export.
-        let fixed_func_name = if func_name.starts_with("llvm_") {
-            decode_intrinsic_identifier(&func_name)
+        let fixed_func_name = if func_name_str.starts_with("llvm_") {
+            decode_intrinsic_identifier(func_name_str)
         } else {
             // Strip cuda_oxide_device_ prefix for clean export names.
             // Internal MIR translation uses prefixed names; we strip at the final
             // export layer so definitions and call targets are renamed consistently.
-            strip_device_prefix(&func_name)
+            strip_device_prefix(func_name_str)
         };
 
         // Check for kernel attribute
@@ -598,6 +603,68 @@ impl<'a> ModuleExportState<'a> {
 
         self.function_types.insert(fixed_func_name.clone(), ft);
 
+        // MIR lowering records source-language ABI alignments only when the
+        // direct LLVM aggregate type is naturally under-aligned. NVVM represents
+        // these contracts with the function-level `"align"` property rather than
+        // an ordinary LLVM parameter attribute. The low 16 bits are the byte
+        // alignment; the high 16 bits are the position (0 = return, arguments
+        // start at 1).
+        let read_abi_alignment = |key: &str| -> Result<Option<u16>, String> {
+            let key_id: pliron::identifier::Identifier = key
+                .try_into()
+                .map_err(|_| format!("invalid ABI alignment attribute name `{key}`"))?;
+            let Some(attribute) = attrs.get::<IntegerAttr>(&key_id) else {
+                return Ok(None);
+            };
+            let value = attribute.value();
+            if value.bw() > 64 {
+                return Err(format!(
+                    "ABI alignment attribute `{key}` is wider than 64 bits"
+                ));
+            }
+            let alignment = value.to_u64();
+            if alignment == 0 || !alignment.is_power_of_two() {
+                return Err(format!(
+                    "ABI alignment attribute `{key}` must be a non-zero power of two, found {alignment}"
+                ));
+            }
+            let alignment = u16::try_from(alignment).map_err(|_| {
+                format!(
+                    "ABI alignment attribute `{key}` exceeds NVVM's 16-bit alignment field: {alignment}"
+                )
+            })?;
+            Ok(Some(alignment))
+        };
+
+        let mut abi_alignments = Vec::new();
+        if let Some(alignment) = read_abi_alignment("cuda_oxide_return_abi_align")? {
+            abi_alignments.push(FunctionAbiAlignment {
+                name: fixed_func_name.clone(),
+                position: 0,
+                alignment,
+            });
+        }
+
+        if is_kernel {
+            for index in 0..func_ty.arg_types().len() {
+                let key = format!("cuda_oxide_param_abi_align_{index}");
+                let Some(alignment) = read_abi_alignment(&key)? else {
+                    continue;
+                };
+                let position = u16::try_from(index + 1).map_err(|_| {
+                    format!(
+                        "kernel `@{fixed_func_name}` parameter index {index} exceeds NVVM's 16-bit position field"
+                    )
+                })?;
+                abi_alignments.push(FunctionAbiAlignment {
+                    name: fixed_func_name.clone(),
+                    position,
+                    alignment,
+                });
+            }
+        }
+        self.function_abi_alignments.extend(abi_alignments);
+
         // Track every kernel as an external root. Backends independently decide
         // whether to emit annotations for all of them.
         if is_kernel {
@@ -608,7 +675,7 @@ impl<'a> ModuleExportState<'a> {
 
         // Track device function definitions (not declarations) for @llvm.used
         // preservation in standalone device-function compilation.
-        if !is_declaration && !is_kernel && has_device_prefix(&func_name) {
+        if !is_declaration && !is_kernel && has_device_prefix(func_name_str) {
             self.device_functions.push(fixed_func_name.clone());
         }
 

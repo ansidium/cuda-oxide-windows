@@ -21,12 +21,14 @@
 #   Every example depends on cuda-core/cuda-device/cuda-host by path, so each
 #   lock file re-lists the root workspace's own transitive crates.  Grouping the
 #   lock files by their exact set of third-party (name, version, source) triples
-#   collapses 187 lock files (186 example workspaces plus one nested
-#   sub-workspace) to 26 distinct sets and one cargo-deny run each.  That is an
-#   equivalence, not a sample: license, source and advisory verdicts are
-#   per-crate properties, so two workspaces resolving the identical crate set
-#   get the identical verdict.  `bans.multiple-versions` is a graph property,
-#   but deny.toml sets it to "warn", so it cannot change the exit status.
+#   collapses every example lock file (one per example directory, plus one per
+#   nested sub-workspace) to far fewer distinct sets, and one cargo-deny run
+#   each.  The run prints both counts, so this comment does not repeat them.
+#   The grouping is an equivalence, not a sample: license, source and advisory
+#   verdicts are per-crate properties, so two workspaces resolving the
+#   identical crate set get the identical verdict.  `bans.multiple-versions`
+#   is a graph property, but deny.toml sets it to "warn", so it cannot change
+#   the exit status.
 set -euo pipefail
 
 export LC_ALL=C
@@ -44,11 +46,17 @@ EXAMPLES_ROOT=crates/rustc-codegen-cuda/examples
 #   error[source-not-allowed]: detected 'git' source not explicitly allowed  (x7)
 #   error[unlicensed]: cuda-bindings = 0.1.0 is unlicensed
 #
-# The first needs cutile-rs added to `[sources] allow-git`, the second needs a
-# license field on a crate this repository does not own.  Both are policy calls
-# for a maintainer, and they are the open question in #663 -- the same reason
-# the example is already exempt from the inventory guard.  Delete the entry once
-# that is settled.
+# The first needs cutile-rs added to `[sources] allow-git`; `deny.toml`'s
+# allow-git still lists only pliron.  The second is not ours to fix: that
+# `cuda-bindings` is cutile-rs's own vendored copy at 0.1.0, not this
+# repository's crate of the same name (ours is 0.2.1 and inherits the workspace
+# license).  Both are policy calls for a maintainer.
+#
+# Tracked in #953.  (This comment used to cite #663, which is closed; that
+# issue's general gap was fixed by #664 and #681, but neither of these two
+# decisions was, so they moved to their own issue.)  The example is exempt from
+# the inventory guard for the same reason, so these crates are governed by
+# neither -- the one such hole in the tree.  Delete the entry once settled.
 #
 # Every name here is checked against the examples on disk below, so a typo or a
 # rename fails the run instead of quietly exempting nothing -- or everything.
@@ -80,46 +88,84 @@ def third_party(lock):
     different policy questions.
     """
     found = set()
-    seen = 0
+    parsed = 0
     for block in open(lock).read().split("[[package]]")[1:]:
-        seen += 1
         name = re.search(r"^name = \"([^\"]+)\"", block, re.M)
         version = re.search(r"^version = \"([^\"]+)\"", block, re.M)
         source = re.search(r"^source = \"([^\"]+)\"", block, re.M)
+        if name and version:
+            # Counted after the match, not per `[[package]]` split: every
+            # package carries a name and a version, so a regex that stops
+            # matching takes this to zero.  Counting the splits instead made
+            # the tally below blind to exactly the rot it guards against.
+            parsed += 1
         if name and version and source:
             found.add((name.group(1), version.group(1), source.group(1)))
-    return found, seen
+    return found, parsed
 
 locks = sorted(glob.glob(os.path.join(examples_root, "**", "Cargo.lock"), recursive=True))
-if len(locks) < 20:
-    sys.exit("parse self-test failed: found %d example lock files" % len(locks))
-
 on_disk = {os.path.relpath(lock, examples_root).split(os.sep)[0] for lock in locks}
+
+# Cross-check the glob against an independent enumeration rather than a fixed
+# floor.  Every example directory that carries a Cargo.toml carries a
+# Cargo.lock beside it, plus one per nested sub-workspace, so a name absent
+# here means the glob stopped reaching it.  A count cannot tell a narrowed
+# glob from a smaller tree: measured once, a glob narrowed to `[a-m]*` still
+# found 137 of the 217 locks then present, which clears any floor loose enough
+# not to fail on ordinary growth.  The floor this replaces was 20.
+expected = {
+    name
+    for name in os.listdir(examples_root)
+    if os.path.exists(os.path.join(examples_root, name, "Cargo.toml"))
+}
+missed = sorted(expected - on_disk)
+if missed:
+    sys.exit(
+        "found no Cargo.lock for %d example(s), so deny.toml cannot be "
+        "enforced over them: %s.  Commit the lock file, or fix the glob above "
+        "if it stopped reaching them." % (len(missed), ", ".join(missed[:5]))
+    )
+
 unknown = sorted(set(exempt) - on_disk)
 if unknown:
     sys.exit("POLICY_EXEMPT_EXAMPLES names no such example: " + ", ".join(unknown))
 
 groups = {}
-total_seen = 0
+total_parsed = 0
 for lock in locks:
     example = os.path.relpath(lock, examples_root).split(os.sep)[0]
-    crates, seen = third_party(lock)
-    total_seen += seen
+    crates, parsed = third_party(lock)
+    total_parsed += parsed
+    # Every example reaches crates.io through cuda-core/cuda-device/cuda-host,
+    # so a lock resolving no third-party crate at all means the parse failed,
+    # not that the example is dependency-free.  Measured range across the tree:
+    # 46 to 142 third-party crates per lock, so this has wide margin -- and it
+    # goes to zero for every lock the moment a regex rots, which is the case
+    # the tally below is meant to catch and could not.
+    if not crates:
+        sys.exit("parse self-test failed: no third-party crates in %s" % lock)
     if example in exempt:
         continue
     groups.setdefault(frozenset(crates), os.path.join(os.path.dirname(lock), "Cargo.toml"))
 
 # Mirrors the inventory guard: if the lock-file regexes silently rotted, the
 # groups would quietly collapse and a single run would vouch for everything.
-if total_seen < 100:
-    sys.exit("parse self-test failed: read %d packages from %d lock files" % (total_seen, len(locks)))
+# Scaled to the locks actually found rather than a fixed number, so it cannot
+# go stale as the tree grows: every lock yields dozens of parsed packages
+# against a floor of ten (measured once: about 64 per lock), and a regex rot
+# takes the tally to zero.
+if total_parsed < 10 * len(locks):
+    sys.exit("parse self-test failed: parsed %d packages from %d lock files"
+             % (total_parsed, len(locks)))
 
 for manifest in sorted(groups.values()):
     print(manifest)
 ' "${EXAMPLES_ROOT}" "${POLICY_EXEMPT_EXAMPLES[@]}")"
 
 total="$(printf '%s\n' "${representatives}" | grep -c .)"
-echo "Checking deny.toml over ${total} representative example workspaces."
+locks="$(find "${EXAMPLES_ROOT}" -name Cargo.lock | grep -c .)"
+echo "Checking deny.toml over ${total} representative example workspaces" \
+    "across ${locks} example lock files."
 
 # No --config: cargo-deny resolves the config by walking up from the manifest
 # directory, so every example workspace finds the repository-root deny.toml.

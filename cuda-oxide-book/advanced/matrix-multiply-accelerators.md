@@ -89,41 +89,70 @@ use cuda_device::wgmma::{
 let a_desc = unsafe { make_smem_desc(tile_a_ptr as *const u8) };
 let b_desc = unsafe { make_smem_desc(tile_b_ptr as *const u8) };
 
-// Accumulator (4 warps × 8 floats per row = 64×64 tile)
+// Accumulator (32 floats per thread = 64×64 tile across the warpgroup)
 let mut acc = [[0.0f32; 8]; 4];
 
-// Fence + issue WGMMA — all 128 threads in the warpgroup participate
 unsafe {
     wgmma_fence();
     wgmma_mma_m64n64k16_f32_bf16(&mut acc, a_desc, b_desc);
     wgmma_commit_group();
-    wgmma_wait_group::<0>(); // wait for all outstanding groups
+    wgmma_wait_group::<0>();
 }
 
-// Accumulator in `acc` is now valid — store, transform, or pass to next stage
+// `acc` is now safe to observe.
 ```
+
+The BF16 m64n128 full-drain variant uses the same synchronization contract but
+a 64-value per-thread accumulator:
+
+```rust
+use cuda_device::wgmma::wgmma_mma_m64n128k16_f32_bf16;
+
+let mut wide_acc = [[0.0f32; 8]; 8];
+unsafe {
+    wgmma_fence();
+    wgmma_mma_m64n128k16_f32_bf16(&mut wide_acc, a_desc, b_desc);
+    wgmma_commit_group();
+    wgmma_wait_group::<0>();
+}
+```
+
+For TF32, use `wgmma_mma_m64n64k8_f32_tf32`. The K=16 TF32
+compatibility entry point remains unsupported because Hopper's TF32 WGMMA
+hardware shape uses K=8.
 
 ### Current cuda-oxide WGMMA lowering
 
-The compiler currently supports
-`m64n64k16.f32.bf16.bf16` and selects among three conservative lowering
-shapes. In every case, the entire asynchronous accumulator lifetime stays
-inside one convergent inline-PTX statement so LLVM cannot insert a spill
-boundary while a WGMMA group is pending.
+The compiler supports `m64n64k16.f32.bf16.bf16` across three conservative
+lowering shapes, `m64n64k16.f32.f16.f16` for canonical linear full-drain and
+counted K-loop regions, `m64n64k8.f32.tf32.tf32` for canonical linear
+full-drain regions only, and `m64n128k16.f32.bf16.bf16` for canonical linear
+full-drain regions. In every accepted case, the entire asynchronous
+accumulator lifetime stays inside one convergent inline-PTX statement so LLVM
+cannot insert a spill boundary while a WGMMA group is pending.
 
-**Linear full drain.** A canonical `[[f32; 8]; 4]` accumulator is loaded into
-32 SSA `f32` values before the WGMMA region and stored once after the final
-`wait_group<0>`. Unsupported full-drain pointer shapes retain the original
-deferred pointer-form lowering.
+**m64n64 linear full drain.** A canonical `[[f32; 8]; 4]` accumulator is loaded
+into 32 SSA `f32` values before the WGMMA region and stored once after the final
+`wait_group<0>`. BF16, F16, and TF32 use this value-threaded carrier.
+Unsupported BF16 full-drain pointer shapes retain the original deferred
+pointer-form lowering; F16 and TF32 do not have a pointer-form fallback.
 
-**Canonical counted K-loop.** For a compile-time counted loop with one MMA per
-iteration and affine `u64` descriptor recurrences, cuda-oxide moves the loop
-control and descriptor arithmetic into the same convergent PTX region as the
-WGMMA instruction. The accumulator is therefore loaded once before the K-loop
-and stored once after its final wait rather than round-tripped every iteration.
+**m64n128 BF16 linear full drain.** A canonical `[[f32; 8]; 8]` accumulator is
+carried as 64 tied SSA `f32` values through one or more homogeneous
+`m64n128k16.f32.bf16.bf16` instructions, one commit, and a final
+`wait_group<0>`. Accumulator element addresses are recomputed after the fused
+inline-PTX scope instead of being kept live across it. This shape has no
+pointer-form fallback, counted-loop lowering, or partial-wait pipeline lowering.
 
-**Static partial-wait pipeline.** A `wait_group<N>` with `N > 0` uses
-`N + 1` independent accumulator slots. Groups are committed separately and
+**Canonical counted K-loop.** For a compile-time counted BF16 or F16 m64n64
+loop with one MMA per iteration and affine `u64` descriptor recurrences,
+cuda-oxide moves the loop control and descriptor arithmetic into the same
+convergent PTX region as the WGMMA instruction. The accumulator is therefore
+loaded once before the K-loop and stored once after its final wait rather than
+round-tripped every iteration.
+
+**Static partial-wait pipeline.** A BF16 m64n64 `wait_group<N>` with `N > 0`
+uses `N + 1` independent accumulator slots. Groups are committed separately and
 slots are reused round-robin only after the partial wait has made the oldest
 slot safe. For example, two groups can remain overlapped with:
 
@@ -142,8 +171,10 @@ accumulator. A final `wait_group<0>` is mandatory before any accumulator value
 escapes the fused region.
 
 Selection is intentionally fail-closed. Dynamic partial waits, unsupported
-control flow, malformed accumulator schedules, and the F16 and TF32 public
-compatibility entry points are rejected instead of exposing an in-flight
+control flow, malformed accumulator schedules, F16 partial-wait shapes, TF32
+counted-loop or partial-wait shapes, m64n128 counted-loop or partial-wait
+shapes, F16/TF32/m64n128 non-canonical accumulators, and the legacy K=16 TF32
+compatibility entry point are rejected instead of exposing an in-flight
 accumulator to LLVM.
 
 :::{tip}
@@ -271,8 +302,8 @@ memory (for a subsequent TMA store to global), you load from TMEM into
 registers and then use `stmatrix` to write to shared memory:
 
 ```rust
+use cuda_device::convert::cvt_bf16x2_f32;
 use cuda_device::tcgen05::{
-    cvt_f32x2_bf16x2,
     tcgen05_ld_16x256b_pure,
     tcgen05_load_wait,
     stmatrix_m8n8_x2,
@@ -285,8 +316,8 @@ unsafe {
     tcgen05_load_wait();
 
     // Convert four f32 accumulators into two registers of packed bf16 values.
-    let packed0 = cvt_f32x2_bf16x2(regs[0], regs[1]);
-    let packed1 = cvt_f32x2_bf16x2(regs[2], regs[3]);
+    let packed0 = cvt_bf16x2_f32(regs[0], regs[1]);
+    let packed1 = cvt_bf16x2_f32(regs[2], regs[3]);
 
     // Store two 8×8 matrices from registers (warp-collective).
     stmatrix_m8n8_x2(smem_ptr, packed0, packed1);

@@ -20,28 +20,40 @@ use sha2::Digest as _;
 
 const MATERIALIZE_ENV: &str = reserved_oxide_symbols::MATERIALIZE_CUBIN_ENV;
 const EXPECTED_PROVENANCE_ENV: &str = reserved_oxide_symbols::MATERIALIZER_PROVENANCE_ENV;
+const MATERIALIZER_HANDSHAKE_ENV: &str = reserved_oxide_symbols::MATERIALIZER_HANDSHAKE_ENV;
 const CODEGEN_FINGERPRINT_ENV: &str = reserved_oxide_symbols::CODEGEN_FINGERPRINT_ENV;
 const DEVICE_CODEGEN_CRATE_ENV: &str = reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV;
 const BACKEND_IDENTITY_CFG: &str = "cuda_oxide_internal_backend_identity";
 const LEGACY_CODEGEN_FINGERPRINT_CFG: &str = "cuda_oxide_internal_codegen_env";
 const LEGACY_MATERIALIZER_PROVENANCE_CFG: &str = "cuda_oxide_internal_materializer_provenance";
+const MATERIALIZER_HANDSHAKE_CACHE: &str = ".oxide-artifacts/materializer-handshake/v1.json";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct MaterializationMode {
-    provenance: Option<String>,
+    prepared: Option<PreparedMaterialization>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedMaterialization {
+    provenance_sha256_hex: String,
+    tool_identity_handshake_json: String,
 }
 
 impl MaterializationMode {
     fn enabled(&self) -> bool {
-        self.provenance.is_some()
+        self.prepared.is_some()
     }
 
     fn apply(&self, cmd: &mut Command) {
-        if let Some(provenance) = &self.provenance {
+        if let Some(prepared) = &self.prepared {
             // These override inherited/project values: they are a single
             // wrapper-generated handshake tied to this Cargo invocation.
             cmd.env(MATERIALIZE_ENV, "1")
-                .env(EXPECTED_PROVENANCE_ENV, provenance)
+                .env(EXPECTED_PROVENANCE_ENV, &prepared.provenance_sha256_hex)
+                .env(
+                    MATERIALIZER_HANDSHAKE_ENV,
+                    &prepared.tool_identity_handshake_json,
+                )
                 .env("CUDA_OXIDE_EMIT_NVVM_IR", "1");
         }
     }
@@ -196,15 +208,26 @@ fn prepare_materialization_result_with_env(
         .parse()
         .map_err(|error| format!("invalid materialization target {arch:?}: {error}"))?;
 
+    let handshake = discover_materializer_handshake(ctx)?;
+    let handshake_json = serde_json::to_string(&handshake)
+        .map_err(|error| format!("could not encode materializer handshake: {error}"))?;
     Ok(MaterializationMode {
-        provenance: Some(discover_materializer_provenance(ctx)?),
+        prepared: Some(PreparedMaterialization {
+            provenance_sha256_hex: digest_hex(&handshake.provenance_sha256),
+            tool_identity_handshake_json: handshake_json,
+        }),
     })
 }
 
-fn discover_materializer_provenance(ctx: &Context) -> Result<String, String> {
+fn discover_materializer_handshake(
+    ctx: &Context,
+) -> Result<cuda_artifact_finalizer::MaterializerHandshakeV1, String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("could not locate cargo-oxide executable: {error}"))?;
     let mut command = materializer_discovery_command(ctx, &executable);
+    if let Some(cached) = read_materializer_handshake_cache(ctx) {
+        command.env(MATERIALIZER_HANDSHAKE_ENV, cached);
+    }
     let output = command
         .output()
         .map_err(|error| format!("could not start CUDA materializer discovery: {error}"))?;
@@ -215,41 +238,92 @@ fn discover_materializer_provenance(ctx: &Context) -> Result<String, String> {
             stderr.trim()
         ));
     }
-    let provenance = String::from_utf8(output.stdout)
+    let handshake = String::from_utf8(output.stdout)
         .map_err(|_| "CUDA materializer discovery returned non-UTF-8 output".to_string())?;
-    let provenance = provenance.trim();
-    if provenance.len() != 64
-        || !provenance
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
+    let handshake: cuda_artifact_finalizer::MaterializerHandshakeV1 =
+        serde_json::from_str(handshake.trim()).map_err(|error| {
+            format!("CUDA materializer discovery returned an invalid v1 handshake: {error}")
+        })?;
+    if !handshake.has_consistent_provenance() {
         return Err(format!(
-            "CUDA materializer discovery returned an invalid provenance digest: {provenance:?}"
+            "CUDA materializer discovery returned an inconsistent handshake version {}",
+            handshake.version
         ));
     }
-    Ok(provenance.to_string())
+    write_materializer_handshake_cache(ctx, &handshake);
+    Ok(handshake)
 }
 
 fn materializer_discovery_command(ctx: &Context, executable: &Path) -> Command {
     let mut command = Command::new(executable);
-    command.arg("__materializer-provenance");
+    command.arg("__materializer-handshake");
     apply_config_env(&mut command, ctx);
     apply_loader_path(&mut command, ctx);
+    // Only the local cache explicitly installed by the caller may seed the
+    // helper; never consume an inherited or project-provided internal value.
+    command.env_remove(MATERIALIZER_HANDSHAKE_ENV);
     command
 }
 
-pub fn print_materializer_provenance() {
-    let finalizer = cuda_artifact_finalizer::Finalizer::discover().unwrap_or_else(|error| {
-        eprintln!("could not discover CUDA artifact finalizer: {error}");
-        std::process::exit(1);
-    });
-    let provenance = finalizer.provenance_digest().unwrap_or_else(|| {
+fn materializer_handshake_cache_path(ctx: &Context) -> PathBuf {
+    ctx.workspace_root.join(MATERIALIZER_HANDSHAKE_CACHE)
+}
+
+fn read_materializer_handshake_cache(ctx: &Context) -> Option<String> {
+    let json = fs::read_to_string(materializer_handshake_cache_path(ctx)).ok()?;
+    let handshake: cuda_artifact_finalizer::MaterializerHandshakeV1 =
+        serde_json::from_str(json.trim()).ok()?;
+    handshake.has_consistent_provenance().then_some(json)
+}
+
+fn write_materializer_handshake_cache(
+    ctx: &Context,
+    handshake: &cuda_artifact_finalizer::MaterializerHandshakeV1,
+) {
+    let path = materializer_handshake_cache_path(ctx);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(json) = serde_json::to_string(handshake) else {
+        return;
+    };
+    let temporary = parent.join(format!("v1.{}.tmp", std::process::id()));
+    if fs::write(&temporary, json).is_ok() {
+        let _ = fs::rename(&temporary, &path);
+    }
+}
+
+pub fn print_materializer_handshake() {
+    let cached = std::env::var(MATERIALIZER_HANDSHAKE_ENV)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .filter(cuda_artifact_finalizer::MaterializerHandshakeV1::has_consistent_provenance);
+    let finalizer = cached
+        .as_ref()
+        .map_or_else(
+            cuda_artifact_finalizer::Finalizer::discover,
+            cuda_artifact_finalizer::Finalizer::discover_with_handshake,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("could not discover CUDA artifact finalizer: {error}");
+            std::process::exit(1);
+        });
+    let handshake = finalizer.materializer_handshake().unwrap_or_else(|| {
         eprintln!(
             "the loaded libNVVM or nvJitLink library cannot be tied to an exact file; refusing materialization because Cargo could not fingerprint the compiler inputs"
         );
         std::process::exit(1);
     });
-    println!("{}", digest_hex(&provenance));
+    println!(
+        "{}",
+        serde_json::to_string(&handshake).unwrap_or_else(|error| {
+            eprintln!("could not encode CUDA materializer handshake: {error}");
+            std::process::exit(1);
+        })
+    );
 }
 
 fn parse_strict_bool(name: &str, value: &str) -> Result<bool, String> {
@@ -1630,14 +1704,19 @@ fn ptx_recorded_target(ptx_path: &Path) -> Result<String, String> {
             ptx_path.display()
         )
     })?;
-    text.lines()
-        .find_map(|line| {
-            let mut tokens = line.split_whitespace();
-            (tokens.next() == Some(".target"))
-                .then(|| tokens.next())
-                .flatten()
-        })
-        .map(|target| target.trim_end_matches(',').to_string())
+    let document = ptx_parse::Document::parse(&text).map_err(|error| {
+        format!(
+            "could not parse emitted PTX {} to read its target: {error}",
+            ptx_path.display()
+        )
+    })?;
+    document
+        .directives()
+        .iter()
+        .find(|directive| directive.name() == ".target")
+        .and_then(|directive| ptx_parse::split_top_level(directive.arguments()))
+        .and_then(|arguments| arguments.first().copied())
+        .map(str::to_string)
         .filter(|target| !target.is_empty())
         .ok_or_else(|| {
             format!(
@@ -3208,6 +3287,9 @@ fn passthrough_codegen_fingerprint_with_env(
     effective_env.remove(CODEGEN_FINGERPRINT_ENV);
     effective_env.remove(MATERIALIZE_ENV);
     effective_env.remove(EXPECTED_PROVENANCE_ENV);
+    // Descriptor identity only accelerates verification; artifact identity is
+    // already represented by the content-derived provenance above.
+    effective_env.remove(MATERIALIZER_HANDSHAKE_ENV);
 
     if opts.verbose {
         effective_env.insert("CUDA_OXIDE_VERBOSE".to_string(), b"1".to_vec());
@@ -3224,11 +3306,11 @@ fn passthrough_codegen_fingerprint_with_env(
     if opts.emit_nvvm_ir || materialization.enabled() {
         effective_env.insert("CUDA_OXIDE_EMIT_NVVM_IR".to_string(), b"1".to_vec());
     }
-    if let Some(provenance) = &materialization.provenance {
+    if let Some(prepared) = &materialization.prepared {
         effective_env.insert(MATERIALIZE_ENV.to_string(), b"1".to_vec());
         effective_env.insert(
             EXPECTED_PROVENANCE_ENV.to_string(),
-            provenance.as_bytes().to_vec(),
+            prepared.provenance_sha256_hex.as_bytes().to_vec(),
         );
     }
     if let Some(target_arch) = target_arch {
@@ -3944,11 +4026,16 @@ pub fn codegen_debug(
 // Fmt command
 // =============================================================================
 
-/// Format (or check formatting of) all crates in the workspace.
+/// Format (or check formatting of) every scope the `fmt` CI gate checks.
 ///
-/// Runs `cargo fmt --all` in three scopes: root workspace, codegen backend
-/// crate, and every example that has a `Cargo.toml`. In `check` mode,
-/// reports which files need formatting without modifying them.
+/// `.github/workflows/fmt.yml` checks four: the root workspace, the codegen
+/// backend crate, the cuda-macros device-only fixture, and every `Cargo.toml`
+/// under `examples/`, nested ones included. This mirrors that set on purpose --
+/// the reason CONTRIBUTING tells contributors to prefer this command over a
+/// bare `cargo fmt` is so the gate cannot fail on code they had no way to
+/// format, which only holds while the two cover the same ground.
+///
+/// In `check` mode, reports which files need formatting without modifying them.
 pub fn format_all(ctx: &Context, check: bool) {
     let mode = if check { "Checking" } else { "Formatting" };
     let mut failed = false;
@@ -3963,22 +4050,44 @@ pub fn format_all(ctx: &Context, check: bool) {
         failed = true;
     }
 
-    if let Ok(entries) = std::fs::read_dir(&ctx.examples_dir) {
-        let mut examples: Vec<_> = entries.flatten().filter(|e| e.path().is_dir()).collect();
-        examples.sort_by_key(|e| e.file_name());
+    // Its own `[workspace]`, so neither run above reaches it and the examples
+    // walk below never sees it either. The gate carries a dedicated step for
+    // exactly this reason.
+    let fixture = ctx
+        .workspace_root
+        .join("crates")
+        .join("cuda-macros")
+        .join("tests")
+        .join("device-only");
+    if fixture.join("Cargo.toml").is_file() {
+        println!("📦 {} cuda-macros device-only fixture...", mode);
+        if !run_cargo_fmt(&fixture, check) {
+            failed = true;
+        }
+    }
 
-        for entry in examples {
-            let example_name = entry.file_name();
-            let example_path = entry.path();
+    // One `--manifest-path` run per manifest found, rather than `cargo fmt
+    // --all` once per top-level example directory. Both reasons match the gate:
+    //
+    //   * `--all` stops at a nested `[workspace]` boundary, and two examples
+    //     declare one (`cutile_inter_kernel/simt`,
+    //     `interop_cubin_identity/device`), so neither was ever formatted here.
+    //   * `--all` also formats an example's path dependencies, which means
+    //     re-formatting the large shared workspaces once per example.
+    let mut manifests = Vec::new();
+    collect_example_manifests(&ctx.examples_dir, &mut manifests);
+    manifests.sort();
 
-            if !example_path.join("Cargo.toml").exists() {
-                continue;
-            }
-
-            println!("📦 {} example: {}...", mode, example_name.to_string_lossy());
-            if !run_cargo_fmt(&example_path, check) {
-                failed = true;
-            }
+    for manifest in &manifests {
+        let label = manifest
+            .parent()
+            .and_then(|dir| dir.strip_prefix(&ctx.examples_dir).ok())
+            .unwrap_or(Path::new("."))
+            .display()
+            .to_string();
+        println!("📦 {} example: {}...", mode, label);
+        if !run_cargo_fmt_manifest(manifest, check) {
+            failed = true;
         }
     }
 
@@ -4010,12 +4119,61 @@ fn run_cargo_fmt(dir: &Path, check: bool) -> bool {
         cmd.arg("--check");
     }
 
+    run_fmt_command(cmd)
+}
+
+/// Run `cargo fmt` for one manifest. Returns `true` on success.
+///
+/// No `--all`: the caller walks every manifest, so a workspace member is
+/// visited through its own manifest rather than through its parent's.
+fn run_cargo_fmt_manifest(manifest: &Path, check: bool) -> bool {
+    let mut cmd = Command::new("cargo");
+    cmd.arg("fmt").arg("--manifest-path").arg(manifest);
+
+    if check {
+        cmd.arg("--check");
+    }
+
+    run_fmt_command(cmd)
+}
+
+fn run_fmt_command(mut cmd: Command) -> bool {
     match cmd.status() {
         Ok(status) => status.success(),
         Err(e) => {
             eprintln!("  Failed to run cargo fmt: {}", e);
             false
         }
+    }
+}
+
+/// Collect every `Cargo.toml` under `dir`, recursively.
+///
+/// Mirrors the gate's `examples/**/Cargo.toml` glob, with one difference that
+/// only matters off CI: `target` directories are skipped. A fresh checkout has
+/// none, but a working tree does, and a packaged or vendored manifest under one
+/// is not a crate this repository formats.
+fn collect_example_manifests(dir: &Path, out: &mut Vec<PathBuf>) {
+    let manifest = dir.join("Cargo.toml");
+    if manifest.is_file() {
+        out.push(manifest);
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "target" || name.starts_with('.') {
+            continue;
+        }
+        collect_example_manifests(&path, out);
     }
 }
 
@@ -4560,9 +4718,12 @@ pub fn doctor(ctx: &Context) {
     // CI boxes are supported workflows (`build`/`pipeline` work fine), and
     // the examples-compile CI job is exactly that.
     print!("NVIDIA driver / GPU... ");
-    match query_gpu_name_and_compute_cap() {
-        Some((name, (major, minor))) => {
-            println!("✓ {} (compute capability {}.{})", name, major, minor);
+    match query_gpu_name_cap_and_driver() {
+        Some((name, (major, minor), driver)) => {
+            println!(
+                "✓ {} (compute capability {}.{}, driver {})",
+                name, major, minor, driver
+            );
         }
         None => {
             // Some containers mount the kernel driver without shipping
@@ -6228,25 +6389,37 @@ fn parse_compute_cap_field(field: &str) -> Option<(u32, u32)> {
     Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
-/// Query the name and compute capability of the first GPU via `nvidia-smi`,
-/// for doctor's driver / GPU report. Same trust rules as
-/// [`query_device_compute_cap`].
-fn query_gpu_name_and_compute_cap() -> Option<(String, (u32, u32))> {
+/// Query the name, compute capability, and driver version of the first GPU
+/// via `nvidia-smi`, for doctor's driver / GPU report. Same trust rules as
+/// [`query_device_compute_cap`]. The driver version matters for triage:
+/// PTX-JIT and driver-API compatibility bugs are driver-version-specific,
+/// and the bug-report template points reporters at this line.
+fn query_gpu_name_cap_and_driver() -> Option<(String, (u32, u32), String)> {
     let output = Command::new("nvidia-smi")
-        .args(["--query-gpu=name,compute_cap", "--format=csv,noheader"])
+        .args([
+            "--query-gpu=name,compute_cap,driver_version",
+            "--format=csv,noheader",
+        ])
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    parse_gpu_name_and_compute_cap(&String::from_utf8_lossy(&output.stdout))
+    parse_gpu_name_cap_and_driver(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Parse the first line of `nvidia-smi --query-gpu=name,compute_cap` output
-/// into the GPU name and `(major, minor)` pair. Splits on the LAST comma:
-/// GPU names may contain commas in principle, `compute_cap` never does.
-fn parse_gpu_name_and_compute_cap(stdout: &str) -> Option<(String, (u32, u32))> {
+/// Parse the first line of `nvidia-smi
+/// --query-gpu=name,compute_cap,driver_version` output into the GPU name,
+/// `(major, minor)` pair, and driver version. Splits on the LAST two commas:
+/// GPU names may contain commas in principle, `compute_cap` and
+/// `driver_version` never do.
+fn parse_gpu_name_cap_and_driver(stdout: &str) -> Option<(String, (u32, u32), String)> {
     let line = stdout.lines().next()?;
-    let (name, cap) = line.rsplit_once(',')?;
-    Some((name.trim().to_string(), parse_compute_cap_field(cap)?))
+    let (rest, driver) = line.rsplit_once(',')?;
+    let (name, cap) = rest.rsplit_once(',')?;
+    Some((
+        name.trim().to_string(),
+        parse_compute_cap_field(cap)?,
+        driver.trim().to_string(),
+    ))
 }
 
 /// Format a `(major, minor)` compute-capability tuple as the `sm_XX` /
@@ -7116,6 +7289,88 @@ mod tests {
         std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), unique))
     }
 
+    /// The examples walk backing `cargo oxide fmt` must reach nested manifests
+    /// and skip build directories.
+    ///
+    /// The gate's glob is `examples/**/Cargo.toml`, so a nested manifest is a
+    /// scope of its own; the loop this replaced read only the first level, which
+    /// is how `cutile_inter_kernel/simt` and `interop_cubin_identity/device`
+    /// went unformatted. `target` is skipped because a working tree has one and
+    /// a packaged manifest under it is not a crate this repository formats.
+    #[test]
+    fn collect_example_manifests_reaches_nested_and_skips_target() {
+        let root = unique_temp_dir("cargo_oxide_fmt_walk");
+        let write = |rel: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "[package]\nname = \"x\"\n").unwrap();
+        };
+
+        write("plain/Cargo.toml");
+        write("with_member/Cargo.toml");
+        write("with_member/kernel-lib/Cargo.toml");
+        write("own_workspace/Cargo.toml");
+        write("own_workspace/simt/Cargo.toml");
+        write("built/Cargo.toml");
+        write("built/target/package/vendored/Cargo.toml");
+        write(".hidden/Cargo.toml");
+        std::fs::create_dir_all(root.join("no_manifest_here")).unwrap();
+
+        let mut found = Vec::new();
+        collect_example_manifests(&root, &mut found);
+        let mut got: Vec<String> = found
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/")
+            })
+            .collect();
+        got.sort();
+
+        assert_eq!(
+            got,
+            vec![
+                // `built` itself is a real example; only the manifest inside
+                // its `target/` is skipped.
+                "built/Cargo.toml",
+                "own_workspace/Cargo.toml",
+                "own_workspace/simt/Cargo.toml",
+                "plain/Cargo.toml",
+                "with_member/Cargo.toml",
+                "with_member/kernel-lib/Cargo.toml",
+            ],
+            "expected both nested manifests, and neither the one under target/ \
+             nor the one in a dot directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn test_materializer_handshake() -> cuda_artifact_finalizer::MaterializerHandshakeV1 {
+        let file = cuda_artifact_finalizer::ToolFileIdentity {
+            length: 123,
+            modified_seconds: 456,
+            modified_nanoseconds: 789,
+            device: Some(10),
+            inode: Some(11),
+            change_time_seconds: Some(12),
+            change_time_nanoseconds: Some(13),
+        };
+        cuda_artifact_finalizer::MaterializerHandshakeV1::new(
+            cuda_artifact_finalizer::PinnedToolProvenance {
+                sha256: [1; 32],
+                file,
+            },
+            cuda_artifact_finalizer::PinnedToolProvenance {
+                sha256: [2; 32],
+                file,
+            },
+            [3; 32],
+        )
+    }
+
     #[test]
     fn strict_materialization_boolean_rejects_presence_only_values() {
         for value in ["1", "true", " YES ", "on"] {
@@ -7160,6 +7415,10 @@ mod tests {
                     "LD_LIBRARY_PATH".to_string(),
                     "/configured/cuda/lib64".to_string(),
                 ),
+                (
+                    MATERIALIZER_HANDSHAKE_ENV.to_string(),
+                    "ambient-handshake-must-not-be-used".to_string(),
+                ),
             ],
             ..OxideConfig::default()
         });
@@ -7191,6 +7450,35 @@ mod tests {
                 Some(configured_libdevice)
             );
         }
+        assert_eq!(command_env(&discovery, MATERIALIZER_HANDSHAKE_ENV), None);
+    }
+
+    #[test]
+    fn materializer_handshake_cache_accepts_only_consistent_v1_records() {
+        let root = unique_temp_dir("cargo_oxide_materializer_handshake");
+        fs::create_dir(&root).unwrap();
+        let mut ctx = test_context(OxideConfig::default());
+        ctx.workspace_root = root.clone();
+        let handshake = test_materializer_handshake();
+
+        write_materializer_handshake_cache(&ctx, &handshake);
+        let cached = read_materializer_handshake_cache(&ctx).unwrap();
+        assert_eq!(
+            serde_json::from_str::<cuda_artifact_finalizer::MaterializerHandshakeV1>(&cached)
+                .unwrap(),
+            handshake,
+        );
+
+        let mut inconsistent = handshake;
+        inconsistent.libnvvm.sha256[0] ^= 1;
+        fs::write(
+            materializer_handshake_cache_path(&ctx),
+            serde_json::to_string(&inconsistent).unwrap(),
+        )
+        .unwrap();
+        assert!(read_materializer_handshake_cache(&ctx).is_none());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -9219,7 +9507,10 @@ device-owner = { path = "../device-owner" }
             )
         );
         let materialized = MaterializationMode {
-            provenance: Some("ab".repeat(32)),
+            prepared: Some(PreparedMaterialization {
+                provenance_sha256_hex: "ab".repeat(32),
+                tool_identity_handshake_json: "{\"version\":1}".to_string(),
+            }),
         };
         assert_ne!(
             base_hash,
@@ -9446,7 +9737,10 @@ device-owner = { path = "../device-owner" }
     fn materialization_forces_nvvm_ir_and_exact_provenance_handshake() {
         let mut cmd = Command::new("cargo");
         let materialization = MaterializationMode {
-            provenance: Some("42".repeat(32)),
+            prepared: Some(PreparedMaterialization {
+                provenance_sha256_hex: "42".repeat(32),
+                tool_identity_handshake_json: "{\"version\":1}".to_string(),
+            }),
         };
 
         apply_output_mode(&mut cmd, false, Some("sm_90"), &materialization);
@@ -9456,6 +9750,10 @@ device-owner = { path = "../device-owner" }
             Some("1")
         );
         assert_eq!(command_env(&cmd, MATERIALIZE_ENV).as_deref(), Some("1"));
+        assert_eq!(
+            command_env(&cmd, MATERIALIZER_HANDSHAKE_ENV).as_deref(),
+            Some("{\"version\":1}")
+        );
         assert_eq!(
             command_env(&cmd, EXPECTED_PROVENANCE_ENV).as_deref(),
             Some("4242424242424242424242424242424242424242424242424242424242424242")
@@ -9583,17 +9881,21 @@ device-owner = { path = "../device-owner" }
     }
 
     #[test]
-    fn parse_gpu_name_and_compute_cap_splits_on_last_comma() {
+    fn parse_gpu_name_cap_and_driver_splits_on_last_two_commas() {
         assert_eq!(
-            parse_gpu_name_and_compute_cap("NVIDIA GeForce RTX 5090, 12.0\n"),
-            Some(("NVIDIA GeForce RTX 5090".to_string(), (12, 0)))
+            parse_gpu_name_cap_and_driver("NVIDIA GeForce RTX 5090, 12.0, 580.65.06\n"),
+            Some((
+                "NVIDIA GeForce RTX 5090".to_string(),
+                (12, 0),
+                "580.65.06".to_string()
+            ))
         );
-        // Failure banner: no comma-separated cc field.
+        // Failure banner: no comma-separated cc/driver fields.
         assert_eq!(
-            parse_gpu_name_and_compute_cap("NVIDIA-SMI has failed.\n"),
+            parse_gpu_name_cap_and_driver("NVIDIA-SMI has failed.\n"),
             None
         );
-        assert_eq!(parse_gpu_name_and_compute_cap(""), None);
+        assert_eq!(parse_gpu_name_cap_and_driver(""), None);
     }
 
     #[test]

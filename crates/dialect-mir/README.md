@@ -8,7 +8,7 @@ rustc MIR ──► mir-importer ──► dialect-mir ──► mir-lower ─�
 
 ## Types
 
-The dialect defines seven types that preserve Rust-level semantics:
+The dialect defines nine types that preserve Rust-level semantics:
 
 | Type                  | Description                                        | Example                               |
 |-----------------------|----------------------------------------------------|---------------------------------------|
@@ -17,8 +17,10 @@ The dialect defines seven types that preserve Rust-level semantics:
 | `MirSliceType`        | Fat pointers (`&[T]` = ptr + len)                  | `mir.slice<f32, addrspace: 1>`        |
 | `MirDisjointSliceType`| `DisjointSlice<T>` -- per-thread unique access     | `mir.disjoint_slice<f32, ...>`        |
 | `MirStructType`       | Named structs with layout metadata                 | `mir.struct<"Point", [f32, f32]>`     |
+| `MirUnionType`        | Rust unions -- each field a view of the same bytes | `mir.union<"Repr", [a, b], [i32, f32], 4, 4>` |
 | `MirEnumType`         | Rust enums with their exact rustc layout           | `mir.enum<"Ordering", i8, ...>`       |
 | `MirArrayType`        | Fixed-size arrays                                  | `mir.array<f32, 256>`                 |
+| `MirFP16Type`         | IEEE 754 binary16 -- Rust's `f16`                  | `mir.fp16`                            |
 
 `MirEnumType` records the enum's layout the way rustc computed it: Direct,
 Niche, Single, or Empty; the physical integer/pointer carrier and absolute
@@ -60,21 +62,22 @@ Pointers and slices carry an NVPTX address space:
 
 ## Operations
 
-55 operations across 11 modules:
+62 operations across 12 modules, one row per file in `src/ops/`:
 
-| Module         | Ops | Description                                                                             |
-|----------------|-----|-----------------------------------------------------------------------------------------|
-| `function`     | 1   | `MirFuncOp` -- function definition                                                      |
-| `control_flow` | 5   | return, goto, cond_branch, assert, unreachable                                          |
-| `memory`       | 9   | alloca, load, store, ref, assign, ptr_offset, shared_alloc, global_alloc, extern_shared |
-| `constants`    | 3   | integer, float, and undef constants                                                     |
-| `arithmetic`   | 15  | add/sub/mul/div/rem, checked variants, bitwise, shifts                                  |
-| `comparison`   | 6   | lt, le, gt, ge, eq, ne                                                                  |
-| `aggregate`    | 8   | construct/extract/insert for structs, tuples, and arrays; field and element address     |
-| `enum_ops`     | 4   | construct_enum, get_discriminant, set_discriminant, enum_payload                        |
-| `cast`         | 1   | type conversions (kind tracked via `MirCastKindAttr`)                                   |
-| `storage`      | 2   | storage_live, storage_dead (lifetime markers)                                           |
-| `call`         | 1   | function calls                                                                          |
+| Module         | Ops | Description                                                                                              |
+|----------------|-----|----------------------------------------------------------------------------------------------------------|
+| `function`     | 1   | `MirFuncOp` -- function definition                                                                       |
+| `control_flow` | 6   | return, goto, cond_branch, assert, unreachable, unroll_hint                                              |
+| `memory`       | 11  | alloca, load, store, ref, assign, ptr_offset, memcpy, memmove, shared_alloc, global_alloc, extern_shared |
+| `constants`    | 3   | integer, float, and undef constants                                                                      |
+| `arithmetic`   | 15  | add/sub/mul/div/rem, checked variants, bitwise, shifts                                                   |
+| `comparison`   | 7   | lt, le, gt, ge, eq, ne, cmp                                                                              |
+| `aggregate`    | 10  | construct/extract/insert for structs, tuples, arrays, slices and disjoint slices; field and element address |
+| `enum_ops`     | 4   | construct_enum, get_discriminant, set_discriminant, enum_payload                                          |
+| `cast`         | 1   | type conversions (kind tracked via `MirCastKindAttr`)                                                    |
+| `storage`      | 2   | storage_live, storage_dead (lifetime markers)                                                            |
+| `call`         | 1   | function calls                                                                                           |
+| `debug`        | 1   | dbg_value -- binds a value to a source-level variable                                                    |
 
 `MirAllocaOp` implements `PromotableAllocationInterface` and `MirLoadOp` / `MirStoreOp` implement `PromotableOpInterface`, so pliron's `mem2reg` pass can promote scalar stack slots back into SSA. `MirUndefOp` is the default reaching definition the pass materialises when a load is not dominated by any store.
 
@@ -99,14 +102,17 @@ This catches mismatches immediately after `mir-importer` translates from rustc, 
 
 ## Attributes
 
-The dialect defines four domain-specific attribute types (following the pliron best practice of avoiding overloaded `IntegerAttr`):
+The dialect defines seven domain-specific attribute types (following the pliron best practice of avoiding overloaded `IntegerAttr`), one row per `#[pliron_attr(...)]` in `src/attributes.rs`:
 
-| Attribute           | Rust Type          | Description                                                                                                          |
-|---------------------|--------------------|----------------------------------------------------------------------------------------------------------------------|
-| `mir.cast_kind`     | `MirCastKindAttr`  | Preserves Rust cast intent (e.g. `IntToFloat`, `PtrToPtr`, `Transmute`) so lowering picks the right LLVM instruction |
-| `mir.mutability`    | `MutabilityAttr`   | Boolean: `&` vs `&mut` for `mir.ref`                                                                                 |
-| `mir.field_index`   | `FieldIndexAttr`   | Structural field index for `extract_field`, `insert_field`, `field_addr`, `enum_payload`                             |
-| `mir.variant_index` | `VariantIndexAttr` | Enum variant index for `construct_enum`, `enum_payload`                                                              |
+| Attribute                     | Rust Type                   | Description                                                                                                          |
+|-------------------------------|-----------------------------|----------------------------------------------------------------------------------------------------------------------|
+| `mir.cast_kind`               | `MirCastKindAttr`           | Preserves Rust cast intent (e.g. `IntToFloat`, `PtrToPtr`, `Transmute`) so lowering picks the right LLVM instruction |
+| `mir.mutability`              | `MutabilityAttr`            | Boolean: `&` vs `&mut` for `mir.ref`                                                                                 |
+| `mir.field_index`             | `FieldIndexAttr`            | Structural field index for `extract_field`, `insert_field`, `field_addr`, `enum_payload`                             |
+| `mir.variant_index`           | `VariantIndexAttr`          | Enum variant index for `construct_enum`, `enum_payload`                                                              |
+| `mir.fp16_attr`               | `MirFP16Attr`               | IEEE 754 binary16 value for `f16` constants, paired with `MirFP16Type`                                               |
+| `mir.unroll`                  | `UnrollAttr`                | Unroll factor carried by `mir.unroll_hint` -- `0` means full unroll, `n >= 2` means `n` body copies per trip          |
+| `mir.compiler_result_bundle`  | `CompilerResultBundleAttr`  | Marks an aggregate that exists only to adapt a compiler-owned multi-result op to a Rust aggregate return ABI          |
 
 ## Registration
 
@@ -123,19 +129,23 @@ register(&mut ctx);  // Registers all ops, types, and attributes
 ```text
 src/
 ├── lib.rs                       # Dialect registration
-├── types.rs                     # 7 MIR types + address_space constants
-├── attributes.rs                # 4 domain-specific attributes
+├── types.rs                     # 9 MIR types + address_space constants
+├── attributes.rs                # 7 domain-specific attributes
+├── const_fold.rs                # Constant folding over dialect-mir ops
+├── rust_intrinsics.rs           # Recognised core/std intrinsic calls
+├── side_effects.rs              # Per-op side-effect classification
 ├── ops/
 │   ├── mod.rs                   # Op module registry + re-exports
 │   ├── function.rs              # MirFuncOp
-│   ├── control_flow.rs          # Terminators and branches
-│   ├── memory.rs                # Load, store, alloc, shared memory
+│   ├── control_flow.rs          # Terminators, branches, unroll hints
+│   ├── memory.rs                # Load, store, alloc, memcpy, shared memory
 │   ├── constants.rs             # Integer and float literals
 │   ├── arithmetic.rs            # Math, bitwise, shifts, checked ops
 │   ├── comparison.rs            # Relational and equality
-│   ├── aggregate.rs             # Struct, tuple, array manipulation
+│   ├── aggregate.rs             # Struct, tuple, array, slice manipulation
 │   ├── enum_ops.rs              # Enum construction and inspection
 │   ├── cast.rs                  # Type conversions
+│   ├── debug.rs                 # dbg_value source-variable bindings
 │   ├── storage.rs               # Lifetime markers
 │   └── call.rs                  # Function calls
 ```

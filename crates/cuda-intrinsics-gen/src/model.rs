@@ -989,6 +989,8 @@ pub struct OverlayIntrinsic {
     #[serde(default)]
     pub packed_alu: Option<PackedAlu>,
     #[serde(default)]
+    pub integer_minmax: Option<IntegerMinMax>,
+    #[serde(default)]
     pub packed_conversion: Option<PackedConversion>,
     #[serde(default)]
     pub scalar_conversion: Option<ScalarConversion>,
@@ -2354,8 +2356,8 @@ pub enum LdmatrixAdapter {
     MultipleResultsToArray,
 }
 
-/// Closed semantic and lowering contract for the generated integer
-/// `redux.sync` family.
+/// Closed semantic and lowering contract for the generated `redux.sync`
+/// family.
 ///
 /// The Rust and NVVM dialect APIs intentionally put the participation mask
 /// first, while LLVM's NVVM intrinsic puts the lane value first. Keeping that
@@ -2380,6 +2382,14 @@ pub enum ReduxOperation {
     And,
     Or,
     Xor,
+    Fmin,
+    FminNan,
+    FminAbs,
+    FminAbsNan,
+    Fmax,
+    FmaxNan,
+    FmaxAbs,
+    FmaxAbsNan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2655,14 +2665,49 @@ pub struct PackedAlu {
 pub enum PackedAluFormat {
     Bf16x2,
     F16x2,
+    F32x2,
+}
+
+/// Closed identity and carrier contract for extended integer min/max ops.
+///
+/// Covers the PTX ISA 8.0 integer min/max extensions: the `.relu` saturation
+/// qualifier on `s32` and `s16x2`, plus the packed `s16x2`/`u16x2` forms.
+/// These are the DPX-adjacent shapes ptxas fuses into `VIMNMX`-family SASS.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegerMinMax {
+    pub format: IntegerMinMaxFormat,
+    /// Hardware floor of the native PTX instruction, independent of the
+    /// target floor admitted by cuda-oxide.
+    pub native_minimum_sm: u16,
+    pub operation: IntegerMinMaxOperation,
+    pub relu: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegerMinMaxFormat {
+    S32,
+    S16x2,
+    U16x2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegerMinMaxOperation {
+    Min,
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackedAluOperation {
     Add,
+    AddFtz,
     Sub,
+    SubFtz,
     Mul,
+    MulFtz,
     Fma,
     FmaFtz,
     FmaSat,
@@ -2679,6 +2724,7 @@ pub enum PackedAluOperation {
 #[serde(rename_all = "snake_case")]
 pub enum PackedAluAdapter {
     DirectPackedU32,
+    DirectPackedU64,
 }
 
 /// Closed contract for scalar floating-point arithmetic.
@@ -3446,6 +3492,8 @@ pub struct CatalogIntrinsic {
     pub dot_product: Option<DotProduct>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packed_alu: Option<PackedAlu>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integer_minmax: Option<IntegerMinMax>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packed_conversion: Option<PackedConversion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

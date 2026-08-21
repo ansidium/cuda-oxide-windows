@@ -45,8 +45,16 @@ test -s "${CSV}"
 # Column 1 is the package name: always a bare crate name, never quoted and
 # never containing a comma, so a plain field split is safe.  Later columns do
 # use quoting (descriptions contain commas), which is why only column 1 is
-# read this way.  The file uses CRLF, hence the `tr -d '\r'`.
-recorded="$(tail -n +2 "${CSV}" | cut -d, -f1 | tr -d '\r' | LC_ALL=C sort -u)"
+# read this way.
+#
+# No CR handling is needed on this path, and the comment here used to claim
+# otherwise. Two reasons: the committed file is LF-only since 8eb0dcf2 (#917)
+# normalized it (111 CR bytes -> 0) while touching it for something else; and
+# even on a CRLF checkout the CR sits before the newline, which puts it in the
+# *last* field, never in the `cut -d, -f1` we read. Verified both ways -- CSV
+# converted to CRLF, with and without a `tr -d '\r'` here, all four
+# combinations agree.
+recorded="$(tail -n +2 "${CSV}" | cut -d, -f1 | LC_ALL=C sort -u)"
 
 # Self-test.  The failure mode a guard like this has to survive is "quietly
 # stops seeing anything", so prove the CSV still parses into a plausible set
@@ -86,16 +94,32 @@ print("\n".join(sorted(names)))
 '
 }
 
-# Both first-party workspaces, not just the root one.  crates/rustc-codegen-cuda
-# carries its own `[workspace]` for the rustc-private dylibs, so `-p` from the
-# root cannot reach it and the root `cargo metadata` above stops at that
-# boundary -- which is how the backend crate itself, the largest first-party
-# crate in the tree, sat unrecorded while every other member had a row.  This is
-# the second pass asked for in the #662 review.
+# Every first-party workspace root, not just the root one.  `cargo metadata`
+# stops at a `[workspace]` boundary, so one pass per root is the only way to
+# reach them all, and the tree has three under version control outside
+# `examples/` (the second half below covers those):
+#
+#   1. Cargo.toml -- the root workspace.
+#   2. crates/rustc-codegen-cuda/Cargo.toml -- its own `[workspace]` for the
+#      rustc-private dylibs, so `-p` from the root cannot reach it and the root
+#      `cargo metadata` stops at that boundary.  That is how the backend crate
+#      itself, the largest first-party crate in the tree, sat unrecorded while
+#      every other member had a row.  This is the second pass asked for in the
+#      #662 review.
+#   3. crates/cuda-macros/tests/device-only/Cargo.toml -- the fixture for
+#      scripts/check-device-only-build.sh.  It declares `[workspace]` on
+#      purpose: the point is a graph that does *not* contain `cuda-host`
+#      (#701/#702), so it must resolve independently rather than share the root
+#      lock.  That same boundary put it outside both passes above, and its
+#      member `device-only-kernels` had no row.  #1043 closed the identical gap
+#      for `cargo deny check` -- which judges the license *policy* -- and this
+#      guard covers the other half, that the human-readable inventory does not
+#      fall behind what a workspace declares.  Both halves need all three roots.
 required="$(
     {
         declared_crates Cargo.toml
         declared_crates crates/rustc-codegen-cuda/Cargo.toml
+        declared_crates crates/cuda-macros/tests/device-only/Cargo.toml
     } | LC_ALL=C sort -u
 )"
 
@@ -141,10 +165,18 @@ echo "OK: ${CSV} records all $(printf '%s\n' "${required}" | grep -c .) declared
 # Examples whose third-party dependencies are deliberately out of inventory
 # scope.  cutile_inter_kernel links cutile-rs by git, which resolves a further
 # ~60 crates (wasm-bindgen, wit-bindgen, wasmparser, windows-targets) that exist
-# in this tree only to build one interop example.  Whether those belong in the
-# inventory is the open question in #663; until it is settled the example is
-# listed here rather than left silently uncovered.  Delete the entry to require
-# the rows.
+# in this tree only to build one interop example.
+#
+# Be clear about what this withholds: the same example is also on
+# check-example-license-policy.sh's POLICY_EXEMPT_EXAMPLES, so those crates get
+# neither a CSV row nor a `cargo deny check`.  Every other example workspace is
+# covered by both since #664 and #681.  This one is the single hole, and it is
+# open deliberately -- see that script for the two blockers.
+#
+# Tracked in #953.  (This comment used to cite #663, which is closed; the
+# general gap it tracked was fixed, but the decisions keeping this example
+# exempt were not, so they moved to their own issue.)  Delete the entry to
+# require the rows.
 #
 # Every name here is checked against the examples on disk below, so a typo or a
 # rename fails the run instead of quietly exempting nothing -- or everything.

@@ -4,10 +4,10 @@
  */
 
 use crate::diagnostics::{KernelResourceUsage, parse_ptxas_resource_usage};
-use crate::nvvm::{loaded_tool_digest, report_changed_tool};
+use crate::nvvm::{loaded_tool_digest_with_expected, report_changed_tool};
 use crate::options::{FinalizationOptions, FinalizerOutput, NamedInput};
 use crate::provenance::{
-    StableDigest, digest_file_handle, linker_provenance_digest, recipe_digest,
+    PinnedToolProvenance, StableDigest, linker_provenance_digest, recipe_digest,
     with_revalidated_tool_identity,
 };
 use crate::validation::is_valid_cubin;
@@ -28,7 +28,7 @@ static LINKER_TOOL_LOAD: OnceLock<Mutex<()>> = OnceLock::new();
 pub struct LinkReport {
     /// Complete cubin or PTX image.
     pub image: Vec<u8>,
-    /// Raw nvJitLink informational output, when available.
+    /// Compiler or linker informational output, when requested and available.
     pub info_log: Option<String>,
     /// Per-kernel ptxas resource usage parsed from the informational output.
     pub resource_usage: Vec<KernelResourceUsage>,
@@ -43,8 +43,23 @@ pub struct LtoLinker {
 impl LtoLinker {
     /// Discover and pin nvJitLink without loading libNVVM or the CUDA Driver.
     pub fn discover() -> Result<Self, FinalizerError> {
+        Self::discover_with_expected(None)
+    }
+
+    pub(crate) fn discover_with_expected(
+        expected: Option<&PinnedToolProvenance>,
+    ) -> Result<Self, FinalizerError> {
         Ok(Self {
-            tool: load_linker_tool()?,
+            tool: load_linker_tool(expected)?,
+        })
+    }
+
+    pub(crate) fn pinned_tool_provenance(&self) -> Option<PinnedToolProvenance> {
+        let sha256 = self.tool.digest?;
+        let file = self.tool.library.loaded_file_if_unchanged()?;
+        Some(PinnedToolProvenance {
+            sha256,
+            file: crate::provenance::ToolFileIdentity::capture(file)?,
         })
     }
 
@@ -255,8 +270,8 @@ impl LtoLinker {
 }
 
 fn current_linker_tool_digest(tool: &LoadedLinkerTool) -> Option<[u8; 32]> {
-    let file = tool.library.loaded_file_if_unchanged()?;
-    digest_file_handle(file).ok()
+    tool.library.loaded_file_if_unchanged()?;
+    tool.digest
 }
 
 fn validate_inputs(inputs: &[NamedInput<'_>]) -> Result<(), FinalizerError> {
@@ -279,7 +294,7 @@ fn validate_inputs(inputs: &[NamedInput<'_>]) -> Result<(), FinalizerError> {
 /// nvjitlink-sys owns the PTX C-string rule (strip the single optional
 /// trailing NUL, reject any other NUL); this wrapper only adds the
 /// finalizer's non-empty-input policy and error vocabulary on top.
-fn logical_ptx(input: NamedInput<'_>) -> Result<&[u8], FinalizerError> {
+pub(crate) fn logical_ptx(input: NamedInput<'_>) -> Result<&[u8], FinalizerError> {
     let logical =
         nvjitlink_sys::logical_ptx(input.bytes, input.name).map_err(|error| match error {
             NvJitLinkError::InteriorNulPtx { name, .. } => FinalizerError::InteriorNulPtx { name },
@@ -293,7 +308,9 @@ fn logical_ptx(input: NamedInput<'_>) -> Result<&[u8], FinalizerError> {
     Ok(logical)
 }
 
-fn load_linker_tool() -> Result<Arc<LoadedLinkerTool>, FinalizerError> {
+fn load_linker_tool(
+    expected: Option<&PinnedToolProvenance>,
+) -> Result<Arc<LoadedLinkerTool>, FinalizerError> {
     if let Some(loaded) = LINKER_TOOL.get() {
         return Ok(Arc::clone(loaded));
     }
@@ -306,7 +323,8 @@ fn load_linker_tool() -> Result<Arc<LoadedLinkerTool>, FinalizerError> {
     }
 
     let library = LibNvJitLink::load_for_cache()?;
-    let digest = loaded_tool_digest("nvJitLink", library.loaded_file_if_unchanged());
+    let digest =
+        loaded_tool_digest_with_expected("nvJitLink", library.loaded_file_if_unchanged(), expected);
     let digest = if digest.is_some() && library.loaded_file_if_unchanged().is_none() {
         report_changed_tool("nvJitLink");
         None

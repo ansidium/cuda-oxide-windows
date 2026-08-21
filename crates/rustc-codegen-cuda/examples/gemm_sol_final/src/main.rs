@@ -31,11 +31,12 @@ use cuda_device::clc::{
     clc_query_get_first_ctaid_x, clc_query_is_canceled, clc_try_cancel_multicast,
 };
 use cuda_device::cluster;
+use cuda_device::convert::cvt_bf16x2_f32;
 use cuda_device::shared::{SharedArray, cvta_generic_to_shared_offset};
 use cuda_device::tcgen05::{
     Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-    cvt_f32x2_bf16x2, stmatrix_m8n8_x2, tcgen05_alloc_cg2, tcgen05_commit_multicast_cg2,
-    tcgen05_dealloc_cg2, tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_mma_f16_cg2,
+    stmatrix_m8n8_x2, tcgen05_alloc_cg2, tcgen05_commit_multicast_cg2, tcgen05_dealloc_cg2,
+    tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_mma_f16_cg2,
     tcgen05_relinquish_alloc_permit_cg2,
 };
 use cuda_device::tma::{TmaDescriptor, cp_async_bulk_tensor_2d_g2s_multicast_cg2};
@@ -522,36 +523,29 @@ fn can_execute_tcgen05_ptx(major: i32, minor: i32) -> bool {
 
 fn verify_tcgen05_ptx_contract(ptx: &str) -> Result<(), String> {
     const TARGETS: [&str; 8] = [
-        ".target sm_100a",
-        ".target sm_101a",
-        ".target sm_103a",
-        ".target sm_110a",
-        ".target sm_100f",
-        ".target sm_101f",
-        ".target sm_103f",
-        ".target sm_110f",
+        "sm_100a", "sm_101a", "sm_103a", "sm_110a", "sm_100f", "sm_101f", "sm_103f", "sm_110f",
     ];
     const ENTRIES: [&str; 2] = [
-        ".visible .entry gemm_sol_clc_multicast_4_stage_pipeline(",
-        ".visible .entry gemm_sol_clc_multicast_4_stage_pipeline_large(",
+        "gemm_sol_clc_multicast_4_stage_pipeline",
+        "gemm_sol_clc_multicast_4_stage_pipeline_large",
     ];
 
-    let has_target = ptx.lines().map(str::trim).any(|line| {
-        TARGETS.iter().any(|target| {
-            line == *target
-                || line
-                    .strip_prefix(target)
-                    .is_some_and(|suffix| suffix.starts_with(','))
-        })
+    let document = ptx_parse::Document::parse(ptx).map_err(|error| error.to_string())?;
+    let has_target = document.directives().iter().any(|directive| {
+        directive.name() == ".target"
+            && directive
+                .arguments()
+                .split(',')
+                .next()
+                .is_some_and(|target| TARGETS.contains(&target.trim()))
     });
     if !has_target {
         return Err("missing a supported datacenter tcgen05 target".to_string());
     }
     for entry in ENTRIES {
-        if !ptx
-            .lines()
-            .map(str::trim_start)
-            .any(|line| line.starts_with(entry))
+        if !document
+            .callables_named(entry)
+            .any(|callable| callable.kind() == ptx_parse::CallableKind::Entry)
         {
             return Err(format!("missing expected kernel entry `{entry}`"));
         }

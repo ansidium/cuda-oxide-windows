@@ -22,6 +22,19 @@ require_shape() {
     fi
 }
 
+require_shape_count() {
+    local description="$1"
+    local expected="$2"
+    local pattern="$3"
+    local actual
+
+    actual="$(grep -Ec "${pattern}" "${llvm_ir}" || true)"
+    if [[ "${actual}" -ne "${expected}" ]]; then
+        echo "error: expected ${expected} ${description} in ${llvm_ir}, found ${actual}" >&2
+        exit 1
+    fi
+}
+
 symbol_body() {
     local artifact="$1"
     local format="$2"
@@ -96,16 +109,74 @@ require_shape \
 # struct constants. `PaddedStruct` is `#[repr(C)] { u8, u32 }`, so the lowered
 # element contains an explicit three-byte padding slot before the u32.
 padded_struct_symbol='array_constants__kernels__padded_struct_array_value'
+padded_struct_ref_symbol='array_constants__kernels__padded_struct_ref_value'
+padded_struct_initializer='addrspace\(1\) constant \[16 x i8\] c"\\A5\\00\\00\\00\\44\\33\\22\\11\\5A\\00\\00\\00\\CC\\BB\\AA\\99"'
 require_symbol_shape "${llvm_ir}" llvm "${padded_struct_symbol}" \
     "padded bare-struct array storage" \
     'alloca \[2 x \{ i8, \[3 x i8\], i32 \}\]'
+require_shape \
+    "padded struct array immutable-global byte image" \
+    "${padded_struct_initializer}"
+require_symbol_shape "${llvm_ir}" llvm "${padded_struct_symbol}" \
+    "padded struct array filled from a read-only global" \
+    'llvm\.memcpy\.p0\.p1\.i64\(ptr %[A-Za-z0-9_.]+, ptr addrspace\(1\) @'
+reject_symbol_shape "${llvm_ir}" llvm "${padded_struct_ref_symbol}" \
+    "local padded struct table copy in pointer-to-array path" \
+    'alloca \[2 x \{ i8, \[3 x i8\], i32 \}\]'
+require_shape_count \
+    "padded struct immutable-global initializer" \
+    1 \
+    "${padded_struct_initializer}"
+
+# Packed struct arrays use the byte-faithful packed LLVM representation selected
+# by the struct lowerer. The rustc image has two five-byte elements with no
+# natural-alignment padding: `{ 0xa5, 0x11223344 }, { 0x5a, 0x99aabbcc }`.
+# The bare value path copies from one immutable global; the reference form must
+# point at that same deduplicated initializer without rebuilding a local table.
+packed_struct_symbol='array_constants__kernels__packed_struct_array_value'
+packed_struct_ref_symbol='array_constants__kernels__packed_struct_ref_value'
+packed_struct_initializer='addrspace\(1\) constant \[10 x i8\] c"\\A5\\44\\33\\22\\11\\5A\\CC\\BB\\AA\\99"'
+require_symbol_shape "${llvm_ir}" llvm "${packed_struct_symbol}" \
+    "packed bare-struct array storage" \
+    'alloca \[2 x <\{ i8, i32 \}>\]'
+reject_symbol_shape "${llvm_ir}" llvm "${packed_struct_symbol}" \
+    "natural-layout storage for packed struct array" \
+    'alloca \[2 x \{ i8, \[3 x i8\], i32 \}\]'
+require_shape \
+    "packed struct array immutable-global byte image" \
+    "${packed_struct_initializer}"
+require_symbol_shape "${llvm_ir}" llvm "${packed_struct_symbol}" \
+    "packed struct array filled from a read-only global" \
+    'llvm\.memcpy\.p0\.p1\.i64\(ptr %[A-Za-z0-9_.]+, ptr addrspace\(1\) @'
+reject_symbol_shape "${llvm_ir}" llvm "${packed_struct_ref_symbol}" \
+    "local packed struct table copy in pointer-to-array path" \
+    'alloca \[2 x <\{ i8, i32 \}>\]'
+require_shape_count \
+    "packed struct immutable-global initializer shared by value and reference forms" \
+    1 \
+    "${packed_struct_initializer}"
 
 # Recursive aggregate decoding must preserve the inner struct's padding while
 # placing the following u64 at its `#[repr(C)]` offset.
 nested_struct_symbol='array_constants__kernels__nested_struct_array_value'
+nested_struct_ref_symbol='array_constants__kernels__nested_struct_ref_value'
+nested_struct_initializer='addrspace\(1\) constant \[32 x i8\] c"\\33\\00\\00\\00\\04\\03\\02\\01\\18\\17\\16\\15\\14\\13\\12\\11\\CC\\00\\00\\00\\A4\\A3\\A2\\A1\\88\\87\\86\\85\\84\\83\\82\\81"'
 require_symbol_shape "${llvm_ir}" llvm "${nested_struct_symbol}" \
     "nested bare-struct array storage" \
     'alloca \[2 x \{ \{ i8, \[3 x i8\], i32 \}, i64 \}\]'
+require_shape \
+    "nested struct array immutable-global byte image" \
+    "${nested_struct_initializer}"
+require_symbol_shape "${llvm_ir}" llvm "${nested_struct_symbol}" \
+    "nested struct array filled from a read-only global" \
+    'llvm\.memcpy\.p0\.p1\.i64\(ptr %[A-Za-z0-9_.]+, ptr addrspace\(1\) @'
+reject_symbol_shape "${llvm_ir}" llvm "${nested_struct_ref_symbol}" \
+    "local nested struct table copy in pointer-to-array path" \
+    'alloca \[2 x \{ \{ i8, \[3 x i8\], i32 \}, i64 \}\]'
+require_shape_count \
+    "nested struct immutable-global initializer" \
+    1 \
+    "${nested_struct_initializer}"
 
 # The standalone over-aligned ZST struct array has no data bytes to pin in LLVM
 # IR. Runtime coverage in `array_constants` checks that indexing it still
@@ -164,6 +235,10 @@ require_symbol_shape "${llvm_ir}" llvm "${bare_enum_symbol}" \
     "runtime enum-array element load" \
     'load \{ i32 \},'
 
+pointer_union_array_symbol='array_constants__kernels__pointer_union_array_value'
+direct_pointer_union_symbol='array_constants__kernels__direct_pointer_union_value'
+pointer_integer_union_array_symbol='array_constants__kernels__pointer_integer_union_array_value'
+direct_pointer_integer_union_symbol='array_constants__kernels__direct_pointer_integer_union_value'
 union_array_symbol='array_constants__kernels__union_array_value'
 direct_union_symbol='array_constants__kernels__direct_union_value'
 union_tuple_symbol='array_constants__kernels__union_tuple_value'
@@ -171,6 +246,44 @@ union_struct_symbol='array_constants__kernels__union_struct_value'
 partial_union_symbol='array_constants__kernels__partial_union_value'
 maybe_uninit_symbol='array_constants__kernels__maybe_uninit_array_value'
 union_storage='\{ \[0 x i32\], i32 \}'
+
+# Pointer-only union constants must keep a real pointer carrier. The second
+# table element is initialized through the `*const u8` view at POINTER_VALUES[2],
+# so its relocation carries an eight-byte addend even though the importer is
+# free to choose either compatible pointer field as the physical union carrier.
+require_symbol_shape "${llvm_ir}" llvm "${pointer_union_array_symbol}" \
+    "pointer-bearing union array storage with a provenance-carrying pointer slot" \
+    'alloca \[2 x \{[^}]*ptr[^}]*\}\]'
+require_symbol_shape "${llvm_ir}" llvm "${pointer_union_array_symbol}" \
+    "eight-byte pointer-union device-static subobject projection" \
+    'getelementptr( inbounds)? i8,.*i64 8([^0-9]|$)'
+reject_symbol_shape "${llvm_ir}" llvm "${pointer_union_array_symbol}" \
+    "placeholder-byte inttoptr reconstruction for pointer unions" \
+    'inttoptr'
+reject_symbol_shape "${llvm_ir}" llvm "${pointer_union_array_symbol}" \
+    "raw eight-byte image materialization for pointer unions" \
+    'alloca \[8 x i8\]'
+reject_symbol_shape "${llvm_ir}" llvm "${direct_pointer_union_symbol}" \
+    "placeholder-byte inttoptr reconstruction for direct pointer unions" \
+    'inttoptr'
+reject_symbol_shape "${llvm_ir}" llvm "${direct_pointer_union_symbol}" \
+    "raw eight-byte image materialization for direct pointer unions" \
+    'alloca \[8 x i8\]'
+
+# A pointer/integer union initialized through its integer view has no relocation
+# provenance to preserve. The importer must therefore use the exact evaluated
+# byte image instead of inventing a pointer carrier. Both direct and array forms
+# pin the new path; neither may reconstruct a pointer with inttoptr.
+for symbol in \
+    "${direct_pointer_integer_union_symbol}" \
+    "${pointer_integer_union_array_symbol}"; do
+    require_symbol_shape "${llvm_ir}" llvm "${symbol}" \
+        "relocation-free pointer/integer union byte-image materialization" \
+        'alloca \[8 x i8\]'
+    reject_symbol_shape "${llvm_ir}" llvm "${symbol}" \
+        "inttoptr reconstruction for relocation-free pointer/integer unions" \
+        'inttoptr'
+done
 
 # Initialized union constants are deliberately materialized element-wise instead
 # of taking the promoted-global fast path. rustc gives the importer a byte image
@@ -211,17 +324,30 @@ require_symbol_shape "${llvm_ir}" llvm "${maybe_uninit_symbol}" \
 
 pointer_tuple_symbol='array_constants__kernels__pointer_tuple_array_value'
 
-# Device globals use backend-generated internal symbols, so source-level static
-# names are not stable in LLVM IR. Runtime coverage checks the zero-addend
-# whole-static case. This assertion pins the non-zero interior-static
-# projection and ensures provenance is not reconstructed from placeholder bytes.
+# Pointer-bearing tuple tables now take the same immutable-global promotion as
+# pointer-free tables. The source local is filled from addrspace(1) constant
+# storage before optimization; `opt` then removes the depot. The initializer
+# keeps both pointer identities as symbolic relocations, including the
+# POINTER_VALUES[2] eight-byte addend.
 require_symbol_shape "${llvm_ir}" llvm "${pointer_tuple_symbol}" \
-    "eight-byte device-static subobject projection" \
-    'getelementptr( inbounds)? i8,.*i64 8([^0-9]|$)'
+    "pointer tuple table filled from a relocation-aware read-only global" \
+    'llvm\.memcpy\.p0\.p1\.i64\(ptr %[A-Za-z0-9_.]+, ptr addrspace\(1\) @'
+
+require_shape \
+    "relocation-aware immutable pointer-table initializer" \
+    'addrspace\(1\) constant .*ptrtoint.*ptrtoint'
+
+require_shape \
+    "non-zero promoted pointer-table relocation addend" \
+    'addrspace\(1\) constant .*ptrtoint.*getelementptr.*i64 8'
 
 reject_symbol_shape "${llvm_ir}" llvm "${pointer_tuple_symbol}" \
     "placeholder-byte inttoptr reconstruction" \
     'inttoptr'
+
+reject_symbol_shape "${optimized_llvm_ir}" llvm "${pointer_tuple_symbol}" \
+    "per-thread pointer tuple table depot after optimization" \
+    'alloca \[2 x '
 
 # A non-empty tuple made entirely of ZST fields must still be decoded by the
 # tuple path. Its stripped LLVM representation leaves the outer u32 intact.
@@ -302,15 +428,13 @@ require_symbol_shape "${optimized_llvm_ir}" llvm "${optimized_symbol}" \
 require_symbol_shape "${optimized_llvm_ir}" llvm "${optimized_symbol}" \
     "align-32 scalarized load in optimized LLVM" \
     'load i8, .* align 32'
-reject_symbol_shape "${optimized_llvm_ir}" llvm "${optimized_symbol}" \
-    "under-aligned memory operation in optimized LLVM" \
-    '(^|, )align 1($|[^0-9])'
 
+# Internalization can inline unrelated helpers into the kernel. In particular,
+# byte-faithful `repr(packed)` values legitimately carry align 1, so a function-
+# wide align-1 rejection would conflate those accesses with this align-32 spill.
+# The positive alloca/store/load checks above pin the intended spill directly.
 require_symbol_shape "${ptx}" ptx "${ptx_symbol}" \
     "32-byte-aligned PTX local depot" \
     '\.local \.align 32 \.b8'
-reject_symbol_shape "${ptx}" ptx "${ptx_symbol}" \
-    "align-1 PTX local depot" \
-    '\.local \.align 1 \.b8'
 
 echo "array_constants code shape: PASS"

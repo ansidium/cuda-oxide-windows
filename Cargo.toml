@@ -4,6 +4,9 @@ members = [
     # Core crates
     "crates/cuda-intrinsics",
     "crates/cuda-intrinsics-gen",
+    "crates/ptx-parse",
+    "crates/ptx-schedule",
+    "crates/dialect-ptx",
     "crates/cuda-device",
     "crates/cuda-artifact-finalizer",
     "crates/cuda-host",
@@ -45,16 +48,14 @@ repository = "https://github.com/NVlabs/cuda-oxide.git"
 # Examples are in: crates/rustc-codegen-cuda/examples/
 
 [workspace.dependencies]
-# Pliron MLIR framework, pinned to upstream master. The additions cuda-oxide
-# needs (address spaces, atomics, inline asm, FP16, stronger verification) landed
-# upstream in pliron via #94 (which absorbed #116), so we track master directly.
+# Pliron MLIR framework, pinned to the upstream revision containing explicit LLVM struct layouts (#232).
 # pliron-llvm uses default-features = false to keep llvm-sys (LLVM 22) out:
 # cuda-oxide consumes the dialect modeling only, not the FFI bridge.
 # `crates/rustc-codegen-cuda/Cargo.toml` MUST stay on this same rev, or pliron
 # resolves to two distinct crates and types stop unifying.
-pliron = { git = "https://github.com/pliron-org/pliron", rev = "0d3f25df6d0e76b6c6f23d6e17172142b50c715c" }
-pliron-derive = { git = "https://github.com/pliron-org/pliron", rev = "0d3f25df6d0e76b6c6f23d6e17172142b50c715c" }
-pliron-llvm = { git = "https://github.com/pliron-org/pliron", rev = "0d3f25df6d0e76b6c6f23d6e17172142b50c715c", default-features = false, features = [
+pliron = { git = "https://github.com/pliron-org/pliron", rev = "8447aa426e2f090dc8b7b9383c5035db7bc70b62" }
+pliron-derive = { git = "https://github.com/pliron-org/pliron", rev = "8447aa426e2f090dc8b7b9383c5035db7bc70b62" }
+pliron-llvm = { git = "https://github.com/pliron-org/pliron", rev = "8447aa426e2f090dc8b7b9383c5035db7bc70b62", default-features = false, features = [
     "std",
 ] }
 
@@ -62,6 +63,7 @@ pliron-llvm = { git = "https://github.com/pliron-org/pliron", rev = "0d3f25df6d0
 llvm-export = { path = "crates/llvm-export" }
 dialect-mir = { path = "crates/dialect-mir" }
 dialect-iket = { path = "crates/dialect-iket" }
+dialect-ptx = { path = "crates/dialect-ptx" }
 dialect-nvvm = { path = "crates/dialect-nvvm" }
 mir-lower = { path = "crates/mir-lower" }
 iket-lower = { path = "crates/iket-lower" }
@@ -86,6 +88,8 @@ cuda-toolkit-discovery = { path = "crates/cuda-toolkit-discovery" }
 reserved-oxide-symbols = { path = "crates/reserved-oxide-symbols" }
 fuzzer = { path = "crates/fuzzer" }
 oxide-artifacts = { path = "crates/oxide-artifacts" }
+ptx-parse = { path = "crates/ptx-parse" }
+ptx-schedule = { path = "crates/ptx-schedule" }
 
 # Common dependencies
 futures = "0.3"

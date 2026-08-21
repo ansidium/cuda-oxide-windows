@@ -321,6 +321,7 @@ cargo oxide run gemm_sol_final
 | `cuda-async`        | Async execution layer (`DeviceOperation`, `DeviceFuture`, `DeviceBox<T>`) |
 | `libnvvm-sys`       | `dlopen` bindings to libNVVM (used by `cuda-host::ltoir`)                 |
 | `nvjitlink-sys`     | `dlopen` bindings to nvJitLink (used by `cuda-host::ltoir`)               |
+| `ptx-parse`         | Lossless structural views over PTX source text                            |
 
 ### Compiler Crates
 
@@ -334,6 +335,7 @@ cargo oxide run gemm_sol_final
 | `iket-lower`         | `dialect-iket` profiles + instrumentation lowering    |
 | `llvm-export`        | pliron-llvm shim + textual `.ll` exporter             |
 | `dialect-nvvm`       | pliron dialect modelling NVVM intrinsics              |
+| `dialect-ptx`        | pliron dialect modelling structured PTX               |
 | `mir-transforms`     | Optimization passes over the MIR dialect (loop unroll, ...) |
 | `nvvm-transforms`    | Target-aware LLVM dialect legalization for NVVM      |
 | `cuda-oxide-codegen` | Experimental rustc-independent PTX backend           |
@@ -344,11 +346,12 @@ cargo oxide run gemm_sol_final
 |---------------------------|----------------------------------------------------------------|
 | `cargo-oxide`             | Cargo subcommand (`cargo oxide run`, etc.)                     |
 | `cuda-intrinsics-gen`     | Extractor and deterministic source generator for the intrinsics |
-| `cuda-artifact-finalizer` | Driver-independent NVVM IR and LTOIR finalization              |
+| `cuda-artifact-finalizer` | Driver-independent NVVM IR, LTOIR, and PTX finalization         |
 | `cuda-toolkit-discovery`  | Workspace-private CUDA Toolkit path discovery                   |
 | `oxide-artifacts`         | Architecture-neutral embedded device artifact metadata         |
 | `reserved-oxide-symbols`  | Workspace-private `cuda_oxide_*` symbol-name contract          |
 | `fuzzer`                  | Differential codegen fuzzer support (rustlantis adapter)       |
+| `ptx-schedule`            | PTX schedule-perturbation fuzzing (nanosleep injection campaigns) |
 
 ### Documentation
 

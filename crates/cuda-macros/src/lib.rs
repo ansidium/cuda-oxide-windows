@@ -116,7 +116,7 @@ pub fn gpu_printf(input: TokenStream) -> TokenStream {
 /// Literal PTX registers that begin with `%` must be escaped as `%%`, matching
 /// CUDA C++ inline PTX. Literal `$` labels can be written normally.
 ///
-/// The surface supports up to 16 output operands across `out` and `inout`,
+/// The surface supports up to 64 output operands across `out` and `inout`,
 /// up to 16 explicit `in` operands, `clobber("memory")`,
 /// `options(register_only)`, and the explicit
 /// `options(register_only, may_diverge)` opt-in. `out` constraints use an `=`
@@ -2458,8 +2458,8 @@ fn render_requires_expr(expr: &Expr) -> String {
 ///
 /// Every operand is widened to `u64` and every `+`/`-`/`*` goes through the
 /// corresponding checked operation, so a relation whose arithmetic leaves the
-/// `u64` range fails with [`SizeRequirementOverflow`] instead of wrapping. A
-/// relation that evaluates to false fails with [`SizeRequirementViolated`]
+/// `u64` range fails with `LaunchContractError::SizeRequirementOverflow` instead of wrapping. A
+/// relation that evaluates to false fails with `LaunchContractError::SizeRequirementViolated`
 /// carrying the relation's source text and both evaluated sides.
 fn generate_requires_checks(
     kernel: &CudaModuleKernel,
@@ -4650,7 +4650,7 @@ fn is_thread_index_path(path: &Path, name: &str) -> bool {
 /// import as unused. Instead, we splice `__internal` in front of the
 /// last segment and keep everything before it intact:
 ///
-/// ```ignore
+/// ```text
 /// thread::index_1d()                   →  thread::__internal::index_1d(&scope)
 /// cuda_device::thread::index_1d()      →  cuda_device::thread::__internal::index_1d(&scope)
 /// ::cuda_device::thread::index_1d()    →  ::cuda_device::thread::__internal::index_1d(&scope)
@@ -4661,7 +4661,7 @@ fn is_thread_index_path(path: &Path, name: &str) -> bool {
 /// anything to import; see the bare-ident case in `is_thread_index_path`'s
 /// doc-comment for why we still rewrite those):
 ///
-/// ```ignore
+/// ```text
 /// index_1d()                           →  ::cuda_device::thread::__internal::index_1d(&scope)
 /// ```
 fn internal_thread_path(user_path: &Path, name: &str, arguments: syn::PathArguments) -> Path {
@@ -6928,6 +6928,22 @@ fn generate_device_extern_block(mut input: ItemForeignMod) -> TokenStream {
                 return err;
             }
 
+            // `...` is purely syntactic, so it can be refused here rather than
+            // in device codegen. That gives the user a span on the offending
+            // tokens instead of a signature-less error at final-binary codegen,
+            // and it also catches a variadic extern that is declared but never
+            // called -- the collector only registers externs reached from
+            // kernel MIR, so that one used to compile clean.
+            //
+            // The codegen rejection stays: the collector recognises device
+            // externs by their reserved name prefix, so a hand-written extern
+            // block never passes through this macro at all.
+            if let Some(variadic) = &foreign_fn.sig.variadic {
+                return syn::Error::new_spanned(variadic, "#[device] externs cannot be variadic")
+                    .to_compile_error()
+                    .into();
+            }
+
             // Save original info for wrapper generation
             let original_name = foreign_fn.sig.ident.clone();
             let original_attrs = foreign_fn.attrs.clone();
@@ -7661,14 +7677,14 @@ fn expand_cuda_launch(input: CudaLaunchInput) -> TokenStream2 {
 /// Parsed input for the [`cuda_launch_async!`] macro.
 ///
 /// Unlike [`CudaLaunchInput`], this struct has no `stream` field. The stream
-/// is assigned later by the [`SchedulingPolicy`] when the returned
-/// [`AsyncKernelLaunch`] is `.sync()`'d or `.await`'d.
+/// is assigned later by the `SchedulingPolicy` when the returned
+/// `AsyncKernelLaunch` is `.sync()`'d or `.await`'d.
 struct CudaLaunchAsyncInput {
     /// Path to the `#[kernel]` function, possibly with generic arguments.
     kernel: syn::Path,
     /// Expression resolving to an `Arc<CudaModule>` that contains the compiled PTX.
     module: syn::Expr,
-    /// Expression resolving to a [`LaunchConfig`] (grid/block dims, shared mem).
+    /// Expression resolving to a [`LaunchConfig`](https://docs.rs/cuda-core/latest/cuda_core/struct.LaunchConfig.html) (grid/block dims, shared mem).
     config: syn::Expr,
     /// Kernel arguments: `slice(x)`, `slice_mut(x)`, direct values, or closures.
     args: Vec<CudaLaunchArg>,

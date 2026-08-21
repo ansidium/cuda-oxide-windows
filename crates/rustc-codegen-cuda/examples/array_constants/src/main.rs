@@ -15,12 +15,15 @@
 //! - tuple arrays whose fields rustc reorders in memory,
 //! - tuple arrays containing an over-aligned zero-sized field,
 //! - bare arrays of padded and nested struct constants,
+//! - immutable promotion of packed struct arrays and references,
 //! - bare arrays of over-aligned zero-sized struct constants,
 //! - direct padded tuple constants,
-//! - pointer-to-array constants (`&[T; N]`), which predate bare-array support,
+//! - pointer-to-array constants (`&[T; N]`), including padded and nested structs,
 //! - tuple arrays containing pointers to device statics,
 //! - tuple-array pointer relocations with non-zero static addends,
 //! - initialized union constants, including `[U; N]` runtime indexing,
+//! - thin-pointer-only union constants that preserve device-static provenance,
+//! - relocation-free pointer/integer union constants materialized as byte images,
 //! - unions nested inside tuple and struct constants,
 //! - `MaybeUninit<T>` array constants.
 //!
@@ -81,6 +84,26 @@ const PADDED_STRUCT_TABLE: [PaddedStruct; 2] = [
         value: 0x99aa_bbcc,
     },
 ];
+const PADDED_STRUCT_REF: &[PaddedStruct; 2] = &PADDED_STRUCT_TABLE;
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct PackedStruct {
+    tag: u8,
+    value: u32,
+}
+
+const PACKED_STRUCT_TABLE: [PackedStruct; 2] = [
+    PackedStruct {
+        tag: 0xa5,
+        value: 0x1122_3344,
+    },
+    PackedStruct {
+        tag: 0x5a,
+        value: 0x99aa_bbcc,
+    },
+];
+const PACKED_STRUCT_REF: &[PackedStruct; 2] = &PACKED_STRUCT_TABLE;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -105,6 +128,7 @@ const NESTED_STRUCT_TABLE: [NestedStruct; 2] = [
         wide: 0x8182_8384_8586_8788,
     },
 ];
+const NESTED_STRUCT_REF: &[NestedStruct; 2] = &NESTED_STRUCT_TABLE;
 
 #[derive(Clone, Copy)]
 #[repr(align(32))]
@@ -124,6 +148,48 @@ static POINTER_VALUES: [u32; 3] = [11, 17, 23];
 
 const POINTER_TUPLE_TABLE: [(&u32, bool); 2] =
     [(&FIRST_POINTER_VALUE, false), (&POINTER_VALUES[2], true)];
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+#[repr(C)]
+union PointerBits {
+    word: *const u32,
+    bytes: *const u8,
+}
+
+const DIRECT_POINTER_UNION: PointerBits = PointerBits {
+    word: &FIRST_POINTER_VALUE as *const u32,
+};
+const POINTER_UNION_TABLE: [PointerBits; 2] = [
+    PointerBits {
+        word: &POINTER_VALUES[0] as *const u32,
+    },
+    PointerBits {
+        // Initialize through the other union view and keep a non-zero addend.
+        // Import must preserve the relocation rather than the placeholder bytes.
+        bytes: &POINTER_VALUES[2] as *const u32 as *const u8,
+    },
+];
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+#[repr(C)]
+union PointerOrBits {
+    pointer: *const u32,
+    bits: u64,
+}
+
+const DIRECT_POINTER_INTEGER_UNION: PointerOrBits = PointerOrBits {
+    bits: 0x1122_3344_5566_7788,
+};
+const POINTER_INTEGER_UNION_TABLE: [PointerOrBits; 2] = [
+    PointerOrBits {
+        bits: 0x0123_4567_89ab_cdef,
+    },
+    PointerOrBits {
+        bits: 0xfedc_ba98_7654_3210,
+    },
+];
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
@@ -264,6 +330,42 @@ mod kernels {
     }
 
     #[inline(never)]
+    fn padded_struct_ref_value(i: usize) -> u32 {
+        let idx = i & 1;
+        (PADDED_STRUCT_REF[idx].tag as u32)
+            .wrapping_mul(257)
+            .wrapping_add(PADDED_STRUCT_REF[idx].value)
+    }
+
+    #[inline(never)]
+    fn packed_struct_array_value(i: usize) -> u32 {
+        let value = PACKED_STRUCT_TABLE[i & 1];
+        (value.tag as u32)
+            .wrapping_mul(257)
+            .wrapping_add(value.value)
+    }
+
+    #[inline(never)]
+    fn packed_struct_ref_value(i: usize) -> u32 {
+        let value = PACKED_STRUCT_REF[i & 1];
+        (value.tag as u32)
+            .wrapping_mul(257)
+            .wrapping_add(value.value)
+    }
+
+    #[inline(never)]
+    fn nested_struct_ref_value(i: usize) -> u32 {
+        let idx = i & 1;
+        (NESTED_STRUCT_REF[idx].inner.tag as u32)
+            .wrapping_mul(257)
+            .wrapping_add(NESTED_STRUCT_REF[idx].inner.value)
+            .wrapping_mul(257)
+            .wrapping_add(NESTED_STRUCT_REF[idx].wide as u32)
+            .wrapping_mul(257)
+            .wrapping_add((NESTED_STRUCT_REF[idx].wide >> 32) as u32)
+    }
+
+    #[inline(never)]
     fn zst_struct_array_value(i: usize) -> u32 {
         let value = ZST_STRUCT_TABLE[i & 1];
         ((&value as *const ZstStruct as usize) & 31) as u32
@@ -278,6 +380,39 @@ mod kernels {
     fn pointer_tuple_array_value(i: usize) -> u32 {
         let (pointer, flag) = POINTER_TUPLE_TABLE[i & 1];
         *pointer + flag as u32
+    }
+
+    #[inline(never)]
+    fn read_pointer_union(value: PointerBits) -> u32 {
+        unsafe { *value.word }
+    }
+
+    #[inline(never)]
+    fn direct_pointer_union_value() -> u32 {
+        read_pointer_union(DIRECT_POINTER_UNION)
+    }
+
+    #[inline(never)]
+    fn pointer_union_array_value(i: usize) -> u32 {
+        read_pointer_union(POINTER_UNION_TABLE[i & 1])
+    }
+
+    #[inline(never)]
+    fn fold_pointer_integer_union(value: PointerOrBits) -> u32 {
+        let bits = unsafe { value.bits };
+        (bits as u32)
+            .wrapping_mul(257)
+            .wrapping_add((bits >> 32) as u32)
+    }
+
+    #[inline(never)]
+    fn direct_pointer_integer_union_value() -> u32 {
+        fold_pointer_integer_union(DIRECT_POINTER_INTEGER_UNION)
+    }
+
+    #[inline(never)]
+    fn pointer_integer_union_array_value(i: usize) -> u32 {
+        fold_pointer_integer_union(POINTER_INTEGER_UNION_TABLE[i & 1])
     }
 
     #[inline(never)]
@@ -334,7 +469,15 @@ mod kernels {
 
     #[inline(never)]
     fn initialized_union_constants_value(i: usize) -> u32 {
-        direct_union_value()
+        direct_pointer_union_value()
+            .wrapping_mul(257)
+            .wrapping_add(pointer_union_array_value(i))
+            .wrapping_mul(257)
+            .wrapping_add(direct_pointer_integer_union_value())
+            .wrapping_mul(257)
+            .wrapping_add(pointer_integer_union_array_value(i))
+            .wrapping_mul(257)
+            .wrapping_add(direct_union_value())
             .wrapping_mul(257)
             .wrapping_add(union_array_value(i))
             .wrapping_mul(257)
@@ -375,6 +518,10 @@ mod kernels {
             let overaligned_zst = overaligned_zst_tuple_array_value(i);
             let padded_struct = padded_struct_array_value(i);
             let nested_struct = nested_struct_array_value(i);
+            let padded_struct_ref = padded_struct_ref_value(i);
+            let nested_struct_ref = nested_struct_ref_value(i);
+            let packed_struct = packed_struct_array_value(i);
+            let packed_struct_ref = packed_struct_ref_value(i);
             let zst_struct = zst_struct_array_value(i);
 
             *slot = nested
@@ -399,6 +546,14 @@ mod kernels {
                 .wrapping_mul(257)
                 .wrapping_add(nested_struct)
                 .wrapping_mul(257)
+                .wrapping_add(padded_struct_ref)
+                .wrapping_mul(257)
+                .wrapping_add(nested_struct_ref)
+                .wrapping_mul(257)
+                .wrapping_add(packed_struct)
+                .wrapping_mul(257)
+                .wrapping_add(packed_struct_ref)
+                .wrapping_mul(257)
                 .wrapping_add(zst_struct);
         }
 
@@ -414,11 +569,27 @@ mod kernels {
     }
 }
 
+fn fold_u64_for_union_test(bits: u64) -> u32 {
+    (bits as u32)
+        .wrapping_mul(257)
+        .wrapping_add((bits >> 32) as u32)
+}
+
 fn expected_union(i: usize) -> u32 {
+    let pointer = [11u32, 23][i & 1];
+    let pointer_integer = [0x0123_4567_89ab_cdefu64, 0xfedc_ba98_7654_3210][i & 1];
     let table = [0x1122_3344u32, 0x5566_7788, 0x99aa_bbcc, 0xdead_beef][i & 3];
     let maybe = [0x1357_9bdfu32, 0x2468_ace0][i & 1];
 
-    0x1122_3344u32
+    11u32
+        .wrapping_mul(257)
+        .wrapping_add(pointer)
+        .wrapping_mul(257)
+        .wrapping_add(fold_u64_for_union_test(0x1122_3344_5566_7788))
+        .wrapping_mul(257)
+        .wrapping_add(fold_u64_for_union_test(pointer_integer))
+        .wrapping_mul(257)
+        .wrapping_add(0x1122_3344)
         .wrapping_mul(257)
         .wrapping_add(table)
         .wrapping_mul(257)
@@ -480,6 +651,15 @@ fn expected_u32(i: usize) -> u32 {
         .wrapping_mul(257)
         .wrapping_add((nested_value.wide >> 32) as u32);
 
+    let padded_struct_ref = padded_struct;
+    let nested_struct_ref = nested_struct;
+
+    let packed_value = PACKED_STRUCT_TABLE[i & 1];
+    let packed_struct = (packed_value.tag as u32)
+        .wrapping_mul(257)
+        .wrapping_add(packed_value.value);
+    let packed_struct_ref = packed_struct;
+
     let zst_value = ZST_STRUCT_TABLE[i & 1];
     let zst_struct = ((&zst_value as *const ZstStruct as usize) & 31) as u32;
 
@@ -504,6 +684,14 @@ fn expected_u32(i: usize) -> u32 {
         .wrapping_add(padded_struct)
         .wrapping_mul(257)
         .wrapping_add(nested_struct)
+        .wrapping_mul(257)
+        .wrapping_add(padded_struct_ref)
+        .wrapping_mul(257)
+        .wrapping_add(nested_struct_ref)
+        .wrapping_mul(257)
+        .wrapping_add(packed_struct)
+        .wrapping_mul(257)
+        .wrapping_add(packed_struct_ref)
         .wrapping_mul(257)
         .wrapping_add(zst_struct)
 }
@@ -580,7 +768,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if failures == 0 {
         println!(
-            "array_constants: PASS ({N} threads; primitive, enum, initialized union/MaybeUninit, padded/reordered/over-aligned tuple, nested/equal-offset ZST tuple, padded/nested/ZST struct, pointer-to-array, and tuple-array static-pointer constants)"
+            "array_constants: PASS ({N} threads; primitive, enum, initialized union/MaybeUninit, pointer-union provenance, relocation-free pointer/integer unions, padded/reordered/over-aligned tuple, nested/equal-offset ZST tuple, padded/nested/packed/ZST struct, pointer-to-array including packed struct references, and tuple-array static-pointer constants)"
         );
         Ok(())
     } else {

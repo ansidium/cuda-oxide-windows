@@ -10,6 +10,7 @@ use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface, SymbolOpIn
 use pliron::builtin::ops::ModuleOp;
 use pliron::context::Context;
 use pliron::linked_list::ContainsLinkedList;
+use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
 
@@ -67,6 +68,14 @@ fn test_intrinsic_insertion() -> Result<(), anyhow::Error> {
         0,
     );
     let tid_op = nvvm::ReadPtxSregTidXOp::new(tid_op_ptr);
+    let expected_location = Location::Named {
+        name: "source-tid-x".to_string(),
+        child_loc: Box::new(Location::Unknown),
+    };
+    tid_op
+        .get_operation()
+        .deref_mut(&ctx)
+        .set_loc(expected_location.clone());
     tid_op.get_operation().insert_at_back(block, &ctx);
 
     // Add Return
@@ -91,6 +100,7 @@ fn test_intrinsic_insertion() -> Result<(), anyhow::Error> {
 
     // Verify result
     let mut found_intrinsic = false;
+    let mut found_intrinsic_call = false;
     let mut found_kernel = false;
 
     let module_op = module_ptr.deref(&ctx);
@@ -130,11 +140,28 @@ fn test_intrinsic_insertion() -> Result<(), anyhow::Error> {
                         .next()
                         .is_some()
                 );
+                let kernel_region = func_op.get_operation().deref(&ctx).get_region(0);
+                for kernel_block in kernel_region.deref(&ctx).iter(&ctx) {
+                    for body_op in kernel_block.deref(&ctx).iter(&ctx) {
+                        let Some(call) = Operation::get_op::<llvm::CallOp>(body_op, &ctx) else {
+                            continue;
+                        };
+                        if matches!(
+                            call.callee(&ctx),
+                            CallOpCallable::Direct(symbol)
+                                if symbol.to_string() == "llvm_nvvm_read_ptx_sreg_tid_x"
+                        ) {
+                            found_intrinsic_call = true;
+                            assert_eq!(call.get_operation().deref(&ctx).loc(), expected_location);
+                        }
+                    }
+                }
             }
         }
     }
 
     assert!(found_intrinsic, "Intrinsic function declaration not found");
+    assert!(found_intrinsic_call, "Intrinsic call not found in kernel");
     assert!(found_kernel, "Kernel function not found");
 
     Ok(())
@@ -1581,6 +1608,10 @@ fn addrspace_coercion_inserts_addrspacecast_at_call_site() -> Result<(), anyhow:
     let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
     let shared_ptr_ty = MirPtrType::get_shared(&mut ctx, i32_ty.into(), true);
     let generic_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), true);
+    let expected_call_location = Location::Named {
+        name: "source-device-call".to_string(),
+        child_loc: Box::new(Location::Unknown),
+    };
 
     // Callee: takes a *mut i32 in addrspace(3), returns ().
     let callee_func_ty = FunctionType::get(&ctx, vec![shared_ptr_ty.into()], vec![]);
@@ -1651,6 +1682,9 @@ fn addrspace_coercion_inserts_addrspacecast_at_call_site() -> Result<(), anyhow:
         );
         let call_op = mir::MirCallOp::new(call_op_ptr);
         call_op.set_attr_callee(&ctx, StringAttr::new("callee".to_string()));
+        call_op_ptr
+            .deref_mut(&ctx)
+            .set_loc(expected_call_location.clone());
         call_op_ptr.insert_at_back(block, &ctx);
 
         let ret_op = Operation::new(
@@ -1670,6 +1704,7 @@ fn addrspace_coercion_inserts_addrspacecast_at_call_site() -> Result<(), anyhow:
     mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr).map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let mut found_addrspace_cast = false;
+    let mut found_call = false;
     let module_op = module_ptr.deref(&ctx);
     let region = module_op.get_region(0);
     let block = region.deref(&ctx).iter(&ctx).next().unwrap();
@@ -1686,6 +1721,18 @@ fn addrspace_coercion_inserts_addrspacecast_at_call_site() -> Result<(), anyhow:
                 if Operation::get_op::<AddrSpaceCastOp>(body_op, &ctx).is_some() {
                     found_addrspace_cast = true;
                 }
+                if let Some(call) = Operation::get_op::<llvm::CallOp>(body_op, &ctx)
+                    && matches!(
+                        call.callee(&ctx),
+                        CallOpCallable::Direct(symbol) if symbol.to_string() == "callee"
+                    )
+                {
+                    found_call = true;
+                    assert_eq!(
+                        call.get_operation().deref(&ctx).loc(),
+                        expected_call_location
+                    );
+                }
             }
         }
     }
@@ -1694,6 +1741,7 @@ fn addrspace_coercion_inserts_addrspacecast_at_call_site() -> Result<(), anyhow:
         found_addrspace_cast,
         "caller body must contain llvm.addrspacecast for the addrspace(0) -> (3) coercion at the call site",
     );
+    assert!(found_call, "caller body must contain the lowered call");
     Ok(())
 }
 
@@ -2883,6 +2931,13 @@ fn test_multi_result_inline_ptx_lowers_to_struct_asm_and_extractvalues() -> Resu
         true,
         false,
     );
+    let expected_location = Location::Named {
+        name: "source-inline-ptx".to_string(),
+        child_loc: Box::new(Location::Unknown),
+    };
+    inline_ptx
+        .deref_mut(&ctx)
+        .set_loc(expected_location.clone());
     inline_ptx.insert_at_back(entry, &ctx);
     append_return(&mut ctx, entry);
 
@@ -2892,6 +2947,10 @@ fn test_multi_result_inline_ptx_lowers_to_struct_asm_and_extractvalues() -> Resu
     let mut extract_indices = Vec::new();
     for op in lowered_kernel_body(&ctx, module_ptr) {
         if let Some(inline_asm) = Operation::get_op::<llvm::InlineAsmOp>(op, &ctx) {
+            assert_eq!(
+                inline_asm.get_operation().deref(&ctx).loc(),
+                expected_location
+            );
             assert_eq!(
                 inline_asm
                     .get_attr_inline_asm_template(&ctx)
@@ -2926,6 +2985,7 @@ fn test_multi_result_inline_ptx_lowers_to_struct_asm_and_extractvalues() -> Resu
             }
             asm_result = Some(result);
         } else if let Some(extract) = Operation::get_op::<llvm::ExtractValueOp>(op, &ctx) {
+            assert_eq!(extract.get_operation().deref(&ctx).loc(), expected_location);
             let aggregate = extract.get_operation().deref(&ctx).get_operand(0);
             assert_eq!(
                 Some(aggregate),
@@ -4756,6 +4816,138 @@ fn test_generated_packed_arithmetic_lowers_to_exact_pure_inline_asm() -> Result<
 }
 
 #[test]
+fn test_generated_integer_minmax_lowers_to_exact_pure_inline_asm() -> Result<(), anyhow::Error> {
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let (module_ptr, entry) = build_test_kernel(&mut ctx, vec![i32_ty.into(), i32_ty.into()]);
+
+    type OpInfo = (
+        fn(pliron::context::Ptr<Operation>) -> pliron::op::OpObj,
+        std::any::TypeId,
+    );
+    let cases: [(OpInfo, &str); 8] = [
+        (
+            nvvm::MinReluS32Op::get_concrete_op_info(),
+            "min.relu.s32 $0, $1, $2;",
+        ),
+        (
+            nvvm::MaxReluS32Op::get_concrete_op_info(),
+            "max.relu.s32 $0, $1, $2;",
+        ),
+        (
+            nvvm::MinS16x2Op::get_concrete_op_info(),
+            "min.s16x2 $0, $1, $2;",
+        ),
+        (
+            nvvm::MaxS16x2Op::get_concrete_op_info(),
+            "max.s16x2 $0, $1, $2;",
+        ),
+        (
+            nvvm::MinU16x2Op::get_concrete_op_info(),
+            "min.u16x2 $0, $1, $2;",
+        ),
+        (
+            nvvm::MaxU16x2Op::get_concrete_op_info(),
+            "max.u16x2 $0, $1, $2;",
+        ),
+        (
+            nvvm::MinReluS16x2Op::get_concrete_op_info(),
+            "min.relu.s16x2 $0, $1, $2;",
+        ),
+        (
+            nvvm::MaxReluS16x2Op::get_concrete_op_info(),
+            "max.relu.s16x2 $0, $1, $2;",
+        ),
+    ];
+
+    let operands = [
+        entry.deref(&ctx).get_argument(0),
+        entry.deref(&ctx).get_argument(1),
+    ];
+    for &(op_info, _) in &cases {
+        let op = Operation::new(
+            &mut ctx,
+            op_info,
+            vec![i32_ty.into()],
+            operands.to_vec(),
+            vec![],
+            0,
+        );
+        op.insert_at_back(entry, &ctx);
+    }
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let mut lowered = Vec::new();
+    let module_op = module_ptr.deref(&ctx);
+    let region = module_op.get_region(0);
+    let block = region.deref(&ctx).iter(&ctx).next().unwrap();
+    for op in block.deref(&ctx).iter(&ctx) {
+        let Some(func_op) = Operation::get_op::<llvm::FuncOp>(op, &ctx) else {
+            continue;
+        };
+        if func_op.get_symbol_name(&ctx).to_string() != "kernel_func" {
+            continue;
+        }
+        let func_region = func_op.get_operation().deref(&ctx).get_region(0);
+        for func_block in func_region.deref(&ctx).iter(&ctx) {
+            for body_op in func_block.deref(&ctx).iter(&ctx) {
+                let Some(inline_asm) = Operation::get_op::<llvm::InlineAsmOp>(body_op, &ctx) else {
+                    continue;
+                };
+                let inline_asm_op = inline_asm.get_operation();
+                let operand_count = inline_asm_op.deref(&ctx).operands().count();
+                let result_count = inline_asm_op.deref(&ctx).get_num_results();
+                lowered.push((
+                    inline_asm
+                        .get_attr_inline_asm_template(&ctx)
+                        .map(|s| String::from((*s).clone()))
+                        .expect("integer min/max inline asm must have a template"),
+                    inline_asm
+                        .get_attr_inline_asm_constraints(&ctx)
+                        .map(|s| String::from((*s).clone()))
+                        .expect("integer min/max inline asm must have constraints"),
+                    llvm::asm_kind_opt(&ctx, &inline_asm),
+                    inline_asm
+                        .get_attr_inline_asm_convergent(&ctx)
+                        .map(|b| bool::from((*b).clone())),
+                    operand_count,
+                    result_count,
+                ));
+            }
+        }
+    }
+
+    assert_eq!(
+        lowered.len(),
+        cases.len(),
+        "each integer min/max operation must lower to exactly one inline-asm op"
+    );
+    for &(_, expected_template) in &cases {
+        let matches: Vec<_> = lowered
+            .iter()
+            .filter(|(template, _, _, _, _, _)| template == expected_template)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one exact `{expected_template}` lowering"
+        );
+        let (_, constraints, kind, convergent, operand_count, result_count) = matches[0];
+        assert_eq!(constraints, "=r,r,r", "{expected_template}");
+        assert_eq!(*kind, Some(llvm::AsmKind::Pure), "{expected_template}");
+        assert_eq!(*convergent, Some(false), "{expected_template}");
+        assert_eq!(*operand_count, 2, "{expected_template} input arity");
+        assert_eq!(*result_count, 1, "{expected_template} result arity");
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_generated_packed_conversions_lower_to_exact_pure_inline_asm() -> Result<(), anyhow::Error> {
     use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
 
@@ -4985,7 +5177,7 @@ fn test_fp8_conversions_libnvvm_use_exact_pure_inline_ptx() -> Result<(), anyhow
             && let CallOpCallable::Direct(callee) = call.callee(&ctx)
         {
             assert!(
-                !FP8_CONVERSION_INTRINSICS.contains(&callee.to_string().as_str()),
+                !FP8_CONVERSION_INTRINSICS.contains(&callee.as_ref()),
                 "libNVVM FP8 conversions must not use typed intrinsics"
             );
         }
@@ -5220,7 +5412,7 @@ fn test_scalar_conversions_libnvvm_use_exact_pure_inline_ptx() -> Result<(), any
             && let CallOpCallable::Direct(callee) = call.callee(&ctx)
         {
             assert!(
-                !SCALAR_CONVERSION_INTRINSICS.contains(&callee.to_string().as_str()),
+                !SCALAR_CONVERSION_INTRINSICS.contains(&callee.as_ref()),
                 "libNVVM scalar conversions must not use typed intrinsics"
             );
         }
@@ -5387,7 +5579,7 @@ fn test_scalar_arithmetic_llvm_uses_inline_ptx_only_for_saturation() -> Result<(
     for op in lowered_kernel_body(&ctx, module_ptr) {
         if let Some(call) = Operation::get_op::<llvm::CallOp>(op, &ctx)
             && let CallOpCallable::Direct(callee) = call.callee(&ctx)
-            && is_representative_scalar_arithmetic_intrinsic(&callee.to_string())
+            && is_representative_scalar_arithmetic_intrinsic(callee.as_ref())
         {
             calls.push(callee.to_string());
         }
@@ -5446,7 +5638,7 @@ fn test_scalar_arithmetic_libnvvm_uses_exact_inline_ptx() -> Result<(), anyhow::
     for op in lowered_kernel_body(&ctx, module_ptr) {
         if let Some(call) = Operation::get_op::<llvm::CallOp>(op, &ctx)
             && let CallOpCallable::Direct(callee) = call.callee(&ctx)
-            && is_representative_scalar_arithmetic_intrinsic(&callee.to_string())
+            && is_representative_scalar_arithmetic_intrinsic(callee.as_ref())
         {
             calls.push(callee.to_string());
         }
@@ -5623,7 +5815,7 @@ fn test_stmatrix_libnvvm_uses_exact_convergent_memory_asm() -> Result<(), anyhow
             && let CallOpCallable::Direct(callee) = call.callee(&ctx)
         {
             assert!(
-                !STMATRIX_TYPED_INTRINSICS.contains(&callee.to_string().as_str()),
+                !STMATRIX_TYPED_INTRINSICS.contains(&callee.as_ref()),
                 "libNVVM stmatrix lowering must not emit typed intrinsic calls"
             );
         }
@@ -8102,8 +8294,9 @@ fn build_wgmma_pointer_test_kernel(
     )
 }
 
-fn build_wgmma_canonical_pointer_test_kernel(
+fn build_wgmma_canonical_pointer_test_kernel_with_rows(
     ctx: &mut Context,
+    accumulator_rows: u64,
     accumulator_count: usize,
     descriptor_count: usize,
 ) -> (
@@ -8117,7 +8310,7 @@ fn build_wgmma_canonical_pointer_test_kernel(
 
     let f32_ty = FP32Type::get(ctx);
     let row_ty = MirArrayType::get(ctx, f32_ty.into(), 8);
-    let accumulator_ty = MirArrayType::get(ctx, row_ty.into(), 4);
+    let accumulator_ty = MirArrayType::get(ctx, row_ty.into(), accumulator_rows);
     let accumulator_ptr_ty = MirPtrType::get_generic(ctx, accumulator_ty.into(), true);
     let u64_ty = IntegerType::get(ctx, 64, Signedness::Unsigned);
 
@@ -8137,6 +8330,32 @@ fn build_wgmma_canonical_pointer_test_kernel(
     (module_ptr, entry, accumulators, descriptors)
 }
 
+fn build_wgmma_canonical_pointer_test_kernel(
+    ctx: &mut Context,
+    accumulator_count: usize,
+    descriptor_count: usize,
+) -> (
+    pliron::context::Ptr<Operation>,
+    pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+    Vec<pliron::value::Value>,
+    Vec<pliron::value::Value>,
+) {
+    build_wgmma_canonical_pointer_test_kernel_with_rows(ctx, 4, accumulator_count, descriptor_count)
+}
+
+fn build_wgmma_m64n128_canonical_pointer_test_kernel(
+    ctx: &mut Context,
+    accumulator_count: usize,
+    descriptor_count: usize,
+) -> (
+    pliron::context::Ptr<Operation>,
+    pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+    Vec<pliron::value::Value>,
+    Vec<pliron::value::Value>,
+) {
+    build_wgmma_canonical_pointer_test_kernel_with_rows(ctx, 8, accumulator_count, descriptor_count)
+}
+
 fn append_pointer_wgmma_mma(
     ctx: &mut Context,
     block: pliron::context::Ptr<pliron::basic_block::BasicBlock>,
@@ -8147,6 +8366,60 @@ fn append_pointer_wgmma_mma(
     Operation::new(
         ctx,
         nvvm::WgmmaMmaM64N64K16F32Bf16Op::get_concrete_op_info(),
+        vec![],
+        vec![accumulator, desc_a, desc_b],
+        vec![],
+        0,
+    )
+    .insert_at_back(block, ctx);
+}
+
+fn append_pointer_wgmma_mma_m64n128(
+    ctx: &mut Context,
+    block: pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+    accumulator: pliron::value::Value,
+    desc_a: pliron::value::Value,
+    desc_b: pliron::value::Value,
+) {
+    Operation::new(
+        ctx,
+        nvvm::WgmmaMmaM64N128K16F32Bf16Op::get_concrete_op_info(),
+        vec![],
+        vec![accumulator, desc_a, desc_b],
+        vec![],
+        0,
+    )
+    .insert_at_back(block, ctx);
+}
+
+fn append_pointer_wgmma_mma_f16(
+    ctx: &mut Context,
+    block: pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+    accumulator: pliron::value::Value,
+    desc_a: pliron::value::Value,
+    desc_b: pliron::value::Value,
+) {
+    Operation::new(
+        ctx,
+        nvvm::WgmmaMmaM64N64K16F32F16Op::get_concrete_op_info(),
+        vec![],
+        vec![accumulator, desc_a, desc_b],
+        vec![],
+        0,
+    )
+    .insert_at_back(block, ctx);
+}
+
+fn append_pointer_wgmma_mma_tf32(
+    ctx: &mut Context,
+    block: pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+    accumulator: pliron::value::Value,
+    desc_a: pliron::value::Value,
+    desc_b: pliron::value::Value,
+) {
+    Operation::new(
+        ctx,
+        nvvm::WgmmaMmaM64N64K8F32Tf32Op::get_concrete_op_info(),
         vec![],
         vec![accumulator, desc_a, desc_b],
         vec![],
@@ -9008,6 +9281,249 @@ fn test_value_form_wgmma_group_lowers_to_tied_register_inline_ptx() -> Result<()
 }
 
 #[test]
+fn test_value_form_m64n128_bf16_wgmma_group_lowers_to_sixty_four_tied_registers()
+-> Result<(), anyhow::Error> {
+    use llvm_export::types as llvm_types;
+    use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+    use pliron::r#type::Typed;
+
+    const ACCUMULATOR_LEN: usize = 64;
+    const DESCRIPTOR_COUNT: usize = 4;
+
+    let mut ctx = make_test_ctx();
+    let f32_ty = FP32Type::get(&ctx);
+    let u64_ty = IntegerType::get(&ctx, 64, Signedness::Unsigned);
+    let argument_types = (0..ACCUMULATOR_LEN)
+        .map(|_| f32_ty.into())
+        .chain((0..DESCRIPTOR_COUNT).map(|_| u64_ty.into()))
+        .collect::<Vec<pliron::r#type::TypeHandle>>();
+    let (module_ptr, entry) = build_test_kernel(&mut ctx, argument_types);
+
+    let accumulators = (0..ACCUMULATOR_LEN)
+        .map(|index| entry.deref(&ctx).get_argument(index))
+        .collect::<Vec<_>>();
+    let descriptors = (0..DESCRIPTOR_COUNT)
+        .map(|index| entry.deref(&ctx).get_argument(ACCUMULATOR_LEN + index))
+        .collect::<Vec<_>>();
+
+    nvvm::WgmmaMmaGroupValuesM64N128K16F32Bf16Op::build(&mut ctx, accumulators, descriptors)
+        .insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let matching = lowered_kernel_body(&ctx, module_ptr)
+        .into_iter()
+        .filter_map(|operation| Operation::get_op::<llvm::InlineAsmOp>(operation, &ctx))
+        .filter(|asm| {
+            asm.get_attr_inline_asm_template(&ctx)
+                .map(|value| String::from((*value).clone()))
+                .is_some_and(|template| template.contains("m64n128k16.f32.bf16.bf16"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1);
+
+    let asm = &matching[0];
+    let template = asm
+        .get_attr_inline_asm_template(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("m64n128 value-form WGMMA template");
+    assert_eq!(template.matches("wgmma.mma_async").count(), 2);
+    assert!(template.contains("m64n128k16.f32.bf16.bf16"));
+    assert!(template.contains("$128, $129"));
+    assert!(template.contains("$130, $131"));
+    assert!(!template.contains("ld.f32"));
+    assert!(!template.contains("st.f32"));
+
+    let constraints = asm
+        .get_attr_inline_asm_constraints(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("m64n128 value-form WGMMA constraints");
+    assert_eq!(
+        constraints
+            .split(',')
+            .filter(|value| *value == "=f")
+            .count(),
+        64
+    );
+    assert_eq!(
+        constraints.split(',').filter(|value| *value == "l").count(),
+        4
+    );
+    assert!(constraints.ends_with("~{memory}"));
+
+    let aggregate = asm.get_operation().deref(&ctx).get_result(0);
+    let aggregate_ty = aggregate.get_type(&ctx);
+    let aggregate_ty = aggregate_ty.deref(&ctx);
+    let struct_ty = aggregate_ty
+        .downcast_ref::<llvm_types::StructType>()
+        .expect("m64n128 inline asm must return an LLVM struct");
+    assert_eq!(struct_ty.num_fields(), ACCUMULATOR_LEN);
+    assert_eq!(llvm::asm_kind(&ctx, asm), llvm::AsmKind::Convergent);
+
+    Ok(())
+}
+
+#[test]
+fn test_value_form_f16_wgmma_group_lowers_to_tied_register_inline_ptx() -> Result<(), anyhow::Error>
+{
+    use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+
+    const ACCUMULATOR_LEN: usize = 32;
+    const DESCRIPTOR_COUNT: usize = 2;
+
+    let mut ctx = make_test_ctx();
+    let f32_ty = FP32Type::get(&ctx);
+    let u64_ty = IntegerType::get(&ctx, 64, Signedness::Unsigned);
+    let argument_types = (0..ACCUMULATOR_LEN)
+        .map(|_| f32_ty.into())
+        .chain((0..DESCRIPTOR_COUNT).map(|_| u64_ty.into()))
+        .collect::<Vec<pliron::r#type::TypeHandle>>();
+    let (module_ptr, entry) = build_test_kernel(&mut ctx, argument_types);
+
+    let accumulators = (0..ACCUMULATOR_LEN)
+        .map(|index| entry.deref(&ctx).get_argument(index))
+        .collect::<Vec<_>>();
+    let descriptors = (0..DESCRIPTOR_COUNT)
+        .map(|index| entry.deref(&ctx).get_argument(ACCUMULATOR_LEN + index))
+        .collect::<Vec<_>>();
+
+    nvvm::WgmmaMmaGroupValuesM64N64K16F32F16Op::build(&mut ctx, accumulators, descriptors)
+        .insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let matching = lowered_kernel_body(&ctx, module_ptr)
+        .into_iter()
+        .filter_map(|operation| Operation::get_op::<llvm::InlineAsmOp>(operation, &ctx))
+        .filter(|asm| {
+            asm.get_attr_inline_asm_template(&ctx)
+                .map(|value| String::from((*value).clone()))
+                .is_some_and(|template| template.contains("m64n64k16.f32.f16.f16"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1);
+
+    let asm = &matching[0];
+    let template = asm
+        .get_attr_inline_asm_template(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("F16 value-form WGMMA template");
+    assert_eq!(template.matches("wgmma.mma_async").count(), 1);
+    assert!(template.contains("m64n64k16.f32.f16.f16"));
+    assert!(!template.contains(".bf16.bf16"));
+    assert!(template.contains("wgmma.fence.sync.aligned"));
+    assert!(template.contains("wgmma.commit_group.sync.aligned"));
+    assert!(template.contains("wgmma.wait_group.sync.aligned 0"));
+    assert!(!template.contains("ld.f32"));
+    assert!(!template.contains("st.f32"));
+
+    let constraints = asm
+        .get_attr_inline_asm_constraints(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("F16 value-form WGMMA constraints");
+    assert_eq!(
+        constraints
+            .split(',')
+            .filter(|value| *value == "=f")
+            .count(),
+        32
+    );
+    assert_eq!(
+        constraints.split(',').filter(|value| *value == "l").count(),
+        2
+    );
+    assert!(constraints.ends_with("~{memory}"));
+    assert_eq!(llvm::asm_kind(&ctx, asm), llvm::AsmKind::Convergent);
+
+    Ok(())
+}
+
+#[test]
+fn test_value_form_tf32_wgmma_group_lowers_to_tied_register_inline_ptx() -> Result<(), anyhow::Error>
+{
+    use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+
+    const ACCUMULATOR_LEN: usize = 32;
+    const DESCRIPTOR_COUNT: usize = 2;
+
+    let mut ctx = make_test_ctx();
+    let f32_ty = FP32Type::get(&ctx);
+    let u64_ty = IntegerType::get(&ctx, 64, Signedness::Unsigned);
+    let argument_types = (0..ACCUMULATOR_LEN)
+        .map(|_| f32_ty.into())
+        .chain((0..DESCRIPTOR_COUNT).map(|_| u64_ty.into()))
+        .collect::<Vec<pliron::r#type::TypeHandle>>();
+    let (module_ptr, entry) = build_test_kernel(&mut ctx, argument_types);
+
+    let accumulators = (0..ACCUMULATOR_LEN)
+        .map(|index| entry.deref(&ctx).get_argument(index))
+        .collect::<Vec<_>>();
+    let descriptors = (0..DESCRIPTOR_COUNT)
+        .map(|index| entry.deref(&ctx).get_argument(ACCUMULATOR_LEN + index))
+        .collect::<Vec<_>>();
+
+    nvvm::WgmmaMmaGroupValuesM64N64K8F32Tf32Op::build(&mut ctx, accumulators, descriptors)
+        .insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let matching = lowered_kernel_body(&ctx, module_ptr)
+        .into_iter()
+        .filter_map(|operation| Operation::get_op::<llvm::InlineAsmOp>(operation, &ctx))
+        .filter(|asm| {
+            asm.get_attr_inline_asm_template(&ctx)
+                .map(|value| String::from((*value).clone()))
+                .is_some_and(|template| template.contains("m64n64k8.f32.tf32.tf32"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1);
+
+    let asm = &matching[0];
+    let template = asm
+        .get_attr_inline_asm_template(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("TF32 value-form WGMMA template");
+    assert_eq!(template.matches("wgmma.mma_async").count(), 1);
+    assert!(template.contains("m64n64k8.f32.tf32.tf32"));
+    assert!(!template.contains(".bf16.bf16"));
+    assert!(!template.contains(".f16.f16"));
+    assert!(!template.contains("m64n64k16"));
+    assert!(template.contains("$64, $65, 1, 1, 1;"));
+    assert!(!template.contains("$64, $65, 1, 1, 1, 0, 0;"));
+    assert!(template.contains("wgmma.fence.sync.aligned"));
+    assert!(template.contains("wgmma.commit_group.sync.aligned"));
+    assert!(template.contains("wgmma.wait_group.sync.aligned 0"));
+    assert!(!template.contains("ld.f32"));
+    assert!(!template.contains("st.f32"));
+
+    let constraints = asm
+        .get_attr_inline_asm_constraints(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("TF32 value-form WGMMA constraints");
+    assert_eq!(
+        constraints
+            .split(',')
+            .filter(|value| *value == "=f")
+            .count(),
+        32
+    );
+    assert_eq!(
+        constraints.split(',').filter(|value| *value == "l").count(),
+        2
+    );
+    assert!(constraints.ends_with("~{memory}"));
+    assert_eq!(llvm::asm_kind(&ctx, asm), llvm::AsmKind::Convergent);
+
+    Ok(())
+}
+
+#[test]
 fn test_pointer_form_wgmma_sequence_preserves_deferred_fallback() -> Result<(), anyhow::Error> {
     use dialect_mir::types::MirPtrType;
     use pliron::builtin::attributes::IntegerAttr;
@@ -9275,6 +9791,172 @@ fn test_pointer_form_wgmma_sequence_uses_value_adapter_before_lowering() -> Resu
 }
 
 #[test]
+fn test_pointer_form_m64n128_bf16_linear_full_drain_uses_sixty_four_value_adapter()
+-> Result<(), anyhow::Error> {
+    let mut ctx = make_test_ctx();
+    let (module_ptr, entry, accumulators, descriptors) =
+        build_wgmma_m64n128_canonical_pointer_test_kernel(&mut ctx, 1, 4);
+    let accumulator = accumulators[0];
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_pointer_wgmma_mma_m64n128(&mut ctx, entry, accumulator, descriptors[0], descriptors[1]);
+    append_pointer_wgmma_mma_m64n128(&mut ctx, entry, accumulator, descriptors[2], descriptors[3]);
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 0);
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let matching = lowered_kernel_body(&ctx, module_ptr)
+        .into_iter()
+        .filter_map(|operation| Operation::get_op::<llvm::InlineAsmOp>(operation, &ctx))
+        .filter(|asm| {
+            asm.get_attr_inline_asm_template(&ctx)
+                .map(|value| String::from((*value).clone()))
+                .is_some_and(|template| template.contains("m64n128k16.f32.bf16.bf16"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1);
+
+    let asm = &matching[0];
+    let template = asm
+        .get_attr_inline_asm_template(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("m64n128 pointer-form WGMMA template");
+    assert_eq!(template.matches("wgmma.mma_async").count(), 2);
+    assert!(template.contains("m64n128k16.f32.bf16.bf16"));
+    assert!(!template.contains("ld.f32"));
+    assert!(!template.contains("st.f32"));
+
+    let constraints = asm
+        .get_attr_inline_asm_constraints(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("m64n128 pointer-form WGMMA constraints");
+    assert_eq!(
+        constraints
+            .split(',')
+            .filter(|value| *value == "=f")
+            .count(),
+        64
+    );
+    assert_eq!(
+        constraints.split(',').filter(|value| *value == "l").count(),
+        4
+    );
+    assert_eq!(llvm::asm_kind(&ctx, asm), llvm::AsmKind::Convergent);
+
+    Ok(())
+}
+
+#[test]
+fn test_pointer_form_f16_wgmma_linear_full_drain_uses_value_adapter() -> Result<(), anyhow::Error> {
+    let mut ctx = make_test_ctx();
+    let (module_ptr, entry, accumulators, descriptors) =
+        build_wgmma_canonical_pointer_test_kernel(&mut ctx, 1, 2);
+    let accumulator = accumulators[0];
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_pointer_wgmma_mma_f16(&mut ctx, entry, accumulator, descriptors[0], descriptors[1]);
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 0);
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let matching = lowered_kernel_body(&ctx, module_ptr)
+        .into_iter()
+        .filter_map(|operation| Operation::get_op::<llvm::InlineAsmOp>(operation, &ctx))
+        .filter(|asm| {
+            asm.get_attr_inline_asm_template(&ctx)
+                .map(|value| String::from((*value).clone()))
+                .is_some_and(|template| template.contains("m64n64k16.f32.f16.f16"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1);
+
+    let asm = &matching[0];
+    let template = asm
+        .get_attr_inline_asm_template(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("F16 pointer-form WGMMA template");
+    assert_eq!(template.matches("wgmma.fence.sync.aligned").count(), 1);
+    assert_eq!(template.matches("wgmma.mma_async").count(), 1);
+    assert_eq!(
+        template.matches("wgmma.commit_group.sync.aligned").count(),
+        1
+    );
+    assert_eq!(
+        template.matches("wgmma.wait_group.sync.aligned 0").count(),
+        1
+    );
+    assert!(template.contains("m64n64k16.f32.f16.f16"));
+    assert!(!template.contains(".bf16.bf16"));
+    assert!(!template.contains("ld.f32"));
+    assert!(!template.contains("st.f32"));
+    assert_eq!(llvm::asm_kind(&ctx, asm), llvm::AsmKind::Convergent);
+
+    Ok(())
+}
+
+#[test]
+fn test_pointer_form_tf32_wgmma_linear_full_drain_uses_value_adapter() -> Result<(), anyhow::Error>
+{
+    let mut ctx = make_test_ctx();
+    let (module_ptr, entry, accumulators, descriptors) =
+        build_wgmma_canonical_pointer_test_kernel(&mut ctx, 1, 2);
+    let accumulator = accumulators[0];
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_pointer_wgmma_mma_tf32(&mut ctx, entry, accumulator, descriptors[0], descriptors[1]);
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 0);
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let matching = lowered_kernel_body(&ctx, module_ptr)
+        .into_iter()
+        .filter_map(|operation| Operation::get_op::<llvm::InlineAsmOp>(operation, &ctx))
+        .filter(|asm| {
+            asm.get_attr_inline_asm_template(&ctx)
+                .map(|value| String::from((*value).clone()))
+                .is_some_and(|template| template.contains("m64n64k8.f32.tf32.tf32"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1);
+
+    let asm = &matching[0];
+    let template = asm
+        .get_attr_inline_asm_template(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("TF32 pointer-form WGMMA template");
+    assert_eq!(template.matches("wgmma.fence.sync.aligned").count(), 1);
+    assert_eq!(template.matches("wgmma.mma_async").count(), 1);
+    assert_eq!(
+        template.matches("wgmma.commit_group.sync.aligned").count(),
+        1
+    );
+    assert_eq!(
+        template.matches("wgmma.wait_group.sync.aligned 0").count(),
+        1
+    );
+    assert!(template.contains("m64n64k8.f32.tf32.tf32"));
+    assert!(!template.contains(".bf16.bf16"));
+    assert!(!template.contains(".f16.f16"));
+    assert!(!template.contains("m64n64k16"));
+    assert!(template.contains("$64, $65, 1, 1, 1;"));
+    assert!(!template.contains("$64, $65, 1, 1, 1, 0, 0;"));
+    assert!(!template.contains("ld.f32"));
+    assert!(!template.contains("st.f32"));
+    assert_eq!(llvm::asm_kind(&ctx, asm), llvm::AsmKind::Convergent);
+
+    Ok(())
+}
+
+#[test]
 fn test_pointer_form_wgmma_partial_wait_pipeline_keeps_multiple_groups_in_flight()
 -> Result<(), anyhow::Error> {
     const SLOT_COUNT: usize = 2;
@@ -9423,6 +10105,655 @@ fn test_pointer_form_wgmma_partial_wait_pipeline_keeps_multiple_groups_in_flight
     );
 
     Ok(())
+}
+
+fn build_pointer_form_wgmma_counted_pipeline_case(
+    ctx: &mut Context,
+    slot_count: usize,
+    wait_depths: &[i64],
+    repeat_last_accumulator: bool,
+) -> pliron::context::Ptr<Operation> {
+    use dialect_mir::types::{MirArrayType, MirPtrType};
+    use pliron::basic_block::BasicBlock;
+    use pliron::builtin::op_interfaces::OperandSegmentInterface;
+    use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+
+    assert_eq!(wait_depths.len(), slot_count);
+
+    let f32_ty = FP32Type::get(ctx);
+    let row_ty = MirArrayType::get(ctx, f32_ty.into(), 8);
+    let accumulator_ty = MirArrayType::get(ctx, row_ty.into(), 4);
+    let accumulator_ptr_ty = MirPtrType::get_generic(ctx, accumulator_ty.into(), true);
+    let u32_ty = IntegerType::get(ctx, 32, Signedness::Unsigned);
+    let u64_ty = IntegerType::get(ctx, 64, Signedness::Unsigned);
+    let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+    let u64_type: pliron::r#type::TypeHandle = u64_ty.into();
+
+    let mut argument_types: Vec<pliron::r#type::TypeHandle> =
+        vec![accumulator_ptr_ty.into(); slot_count];
+    argument_types.extend(vec![u64_type; slot_count * 2]);
+    let (module_ptr, preheader) = build_test_kernel(ctx, argument_types);
+
+    let accumulators = (0..slot_count)
+        .map(|slot| preheader.deref(ctx).get_argument(slot))
+        .collect::<Vec<_>>();
+    let desc_bases = (0..slot_count * 2)
+        .map(|index| preheader.deref(ctx).get_argument(slot_count + index))
+        .collect::<Vec<_>>();
+
+    let module_region = module_ptr.deref(ctx).get_region(0);
+    let module_block = module_region.deref(ctx).iter(ctx).next().unwrap();
+    let function = module_block.deref(ctx).iter(ctx).next().unwrap();
+    let function_region = function.deref(ctx).get_region(0);
+
+    let mut header_types: Vec<pliron::r#type::TypeHandle> = vec![u32_ty.into()];
+    header_types.extend(vec![u64_type; slot_count * 2]);
+    let header = BasicBlock::new(ctx, None, header_types);
+    header.insert_at_back(function_region, ctx);
+    let latch = BasicBlock::new(ctx, None, vec![]);
+    latch.insert_at_back(function_region, ctx);
+    let exit = BasicBlock::new(ctx, None, vec![]);
+    exit.insert_at_back(function_region, ctx);
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(ctx).insert_at_back(preheader, ctx);
+    let i0 = append_mir_unsigned_constant(ctx, preheader, u32_ty, 0);
+    let mut initial_values = vec![i0];
+    initial_values.extend(desc_bases.iter().copied());
+    Operation::new(
+        ctx,
+        mir::MirGotoOp::get_concrete_op_info(),
+        vec![],
+        initial_values,
+        vec![header],
+        0,
+    )
+    .insert_at_back(preheader, ctx);
+
+    let i = header.deref(ctx).get_argument(0);
+    let descriptors = (0..slot_count * 2)
+        .map(|index| header.deref(ctx).get_argument(1 + index))
+        .collect::<Vec<_>>();
+    let bound = append_mir_unsigned_constant(ctx, header, u32_ty, 4);
+    let lt = Operation::new(
+        ctx,
+        mir::MirLtOp::get_concrete_op_info(),
+        vec![i1_ty.into()],
+        vec![i, bound],
+        vec![],
+        0,
+    );
+    lt.insert_at_back(header, ctx);
+    let lt_value = lt.deref(ctx).get_result(0);
+    let not_lt = Operation::new(
+        ctx,
+        mir::MirNotOp::get_concrete_op_info(),
+        vec![i1_ty.into()],
+        vec![lt_value],
+        vec![],
+        0,
+    );
+    not_lt.insert_at_back(header, ctx);
+    let not_lt_value = not_lt.deref(ctx).get_result(0);
+    let (branch_operands, segment_sizes) =
+        mir::MirCondBranchOp::compute_segment_sizes(vec![vec![not_lt_value], vec![], vec![]]);
+    let branch = Operation::new(
+        ctx,
+        mir::MirCondBranchOp::get_concrete_op_info(),
+        vec![],
+        branch_operands,
+        vec![exit, latch],
+        0,
+    );
+    Operation::get_op::<mir::MirCondBranchOp>(branch, ctx)
+        .expect("MirCondBranchOp")
+        .set_operand_segment_sizes(ctx, segment_sizes);
+    branch.insert_at_back(header, ctx);
+
+    for slot in 0..slot_count {
+        let accumulator = if repeat_last_accumulator && slot + 1 == slot_count {
+            accumulators[0]
+        } else {
+            accumulators[slot]
+        };
+        append_pointer_wgmma_mma(
+            ctx,
+            latch,
+            accumulator,
+            descriptors[slot * 2],
+            descriptors[slot * 2 + 1],
+        );
+        nvvm::WgmmaCommitGroupSyncAlignedOp::build(ctx).insert_at_back(latch, ctx);
+        append_wgmma_wait_group_constant(ctx, latch, wait_depths[slot]);
+    }
+
+    let one = append_mir_unsigned_constant(ctx, latch, u32_ty, 1);
+    let i_next = Operation::new(
+        ctx,
+        mir::MirAddOp::get_concrete_op_info(),
+        vec![u32_ty.into()],
+        vec![i, one],
+        vec![],
+        0,
+    );
+    i_next.insert_at_back(latch, ctx);
+    let i_next = i_next.deref(ctx).get_result(0);
+
+    let mut next_values = vec![i_next];
+    for (index, descriptor) in descriptors.iter().copied().enumerate() {
+        let step = append_mir_unsigned_constant(ctx, latch, u64_ty, 16 * (index as u64 + 1));
+        let next = Operation::new(
+            ctx,
+            mir::MirAddOp::get_concrete_op_info(),
+            vec![u64_ty.into()],
+            vec![descriptor, step],
+            vec![],
+            0,
+        );
+        next.insert_at_back(latch, ctx);
+        next_values.push(next.deref(ctx).get_result(0));
+    }
+
+    Operation::new(
+        ctx,
+        mir::MirGotoOp::get_concrete_op_info(),
+        vec![],
+        next_values,
+        vec![header],
+        0,
+    )
+    .insert_at_back(latch, ctx);
+
+    append_wgmma_wait_group_constant(ctx, exit, 0);
+    append_return(ctx, exit);
+
+    module_ptr
+}
+
+#[test]
+fn test_pointer_form_wgmma_two_slot_counted_pipeline_stays_register_resident()
+-> Result<(), anyhow::Error> {
+    use dialect_mir::types::{MirArrayType, MirPtrType};
+    use pliron::basic_block::BasicBlock;
+    use pliron::builtin::op_interfaces::OperandSegmentInterface;
+    use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+
+    const SLOT_COUNT: usize = 2;
+    const ACCUMULATOR_LEN: usize = 32;
+    const RESULT_COUNT: usize = SLOT_COUNT * ACCUMULATOR_LEN;
+    const LOOP_CONTROL_COUNT: usize = 9;
+    const TRIP_COUNT: u64 = 4;
+    const DESC_A0_STEP: u64 = 16;
+    const DESC_B0_STEP: u64 = 32;
+    const DESC_A1_STEP: u64 = 48;
+    const DESC_B1_STEP: u64 = 64;
+
+    let mut ctx = make_test_ctx();
+    let f32_ty = FP32Type::get(&ctx);
+    let row_ty = MirArrayType::get(&mut ctx, f32_ty.into(), 8);
+    let accumulator_ty = MirArrayType::get(&mut ctx, row_ty.into(), 4);
+    let accumulator_ptr_ty = MirPtrType::get_generic(&mut ctx, accumulator_ty.into(), true);
+    let u32_ty = IntegerType::get(&ctx, 32, Signedness::Unsigned);
+    let u64_ty = IntegerType::get(&ctx, 64, Signedness::Unsigned);
+    let i1_ty = IntegerType::get(&ctx, 1, Signedness::Signless);
+
+    let (module_ptr, preheader) = build_test_kernel(
+        &mut ctx,
+        vec![
+            accumulator_ptr_ty.into(),
+            accumulator_ptr_ty.into(),
+            u64_ty.into(),
+            u64_ty.into(),
+            u64_ty.into(),
+            u64_ty.into(),
+        ],
+    );
+    let accumulator0 = preheader.deref(&ctx).get_argument(0);
+    let accumulator1 = preheader.deref(&ctx).get_argument(1);
+    let desc_a0_base = preheader.deref(&ctx).get_argument(2);
+    let desc_b0_base = preheader.deref(&ctx).get_argument(3);
+    let desc_a1_base = preheader.deref(&ctx).get_argument(4);
+    let desc_b1_base = preheader.deref(&ctx).get_argument(5);
+
+    let module_region = module_ptr.deref(&ctx).get_region(0);
+    let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+    let function = module_block.deref(&ctx).iter(&ctx).next().unwrap();
+    let function_region = function.deref(&ctx).get_region(0);
+
+    let header = BasicBlock::new(
+        &mut ctx,
+        None,
+        vec![
+            u32_ty.into(),
+            u64_ty.into(),
+            u64_ty.into(),
+            u64_ty.into(),
+            u64_ty.into(),
+        ],
+    );
+    header.insert_at_back(function_region, &ctx);
+    let latch = BasicBlock::new(&mut ctx, None, vec![]);
+    latch.insert_at_back(function_region, &ctx);
+    let exit = BasicBlock::new(&mut ctx, None, vec![]);
+    exit.insert_at_back(function_region, &ctx);
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(preheader, &ctx);
+    let i0 = append_mir_unsigned_constant(&mut ctx, preheader, u32_ty, 0);
+    Operation::new(
+        &mut ctx,
+        mir::MirGotoOp::get_concrete_op_info(),
+        vec![],
+        vec![i0, desc_a0_base, desc_b0_base, desc_a1_base, desc_b1_base],
+        vec![header],
+        0,
+    )
+    .insert_at_back(preheader, &ctx);
+
+    let i = header.deref(&ctx).get_argument(0);
+    let desc_a0 = header.deref(&ctx).get_argument(1);
+    let desc_b0 = header.deref(&ctx).get_argument(2);
+    let desc_a1 = header.deref(&ctx).get_argument(3);
+    let desc_b1 = header.deref(&ctx).get_argument(4);
+    let bound = append_mir_unsigned_constant(&mut ctx, header, u32_ty, TRIP_COUNT);
+    let lt = Operation::new(
+        &mut ctx,
+        mir::MirLtOp::get_concrete_op_info(),
+        vec![i1_ty.into()],
+        vec![i, bound],
+        vec![],
+        0,
+    );
+    lt.insert_at_back(header, &ctx);
+    let lt_value = lt.deref(&ctx).get_result(0);
+    let not_lt = Operation::new(
+        &mut ctx,
+        mir::MirNotOp::get_concrete_op_info(),
+        vec![i1_ty.into()],
+        vec![lt_value],
+        vec![],
+        0,
+    );
+    not_lt.insert_at_back(header, &ctx);
+    let not_lt_value = not_lt.deref(&ctx).get_result(0);
+    let (branch_operands, segment_sizes) =
+        mir::MirCondBranchOp::compute_segment_sizes(vec![vec![not_lt_value], vec![], vec![]]);
+    let branch = Operation::new(
+        &mut ctx,
+        mir::MirCondBranchOp::get_concrete_op_info(),
+        vec![],
+        branch_operands,
+        vec![exit, latch],
+        0,
+    );
+    Operation::get_op::<mir::MirCondBranchOp>(branch, &ctx)
+        .expect("MirCondBranchOp")
+        .set_operand_segment_sizes(&ctx, segment_sizes);
+    branch.insert_at_back(header, &ctx);
+
+    append_pointer_wgmma_mma(&mut ctx, latch, accumulator0, desc_a0, desc_b0);
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(latch, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, latch, 1);
+    append_pointer_wgmma_mma(&mut ctx, latch, accumulator1, desc_a1, desc_b1);
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(latch, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, latch, 1);
+
+    let one = append_mir_unsigned_constant(&mut ctx, latch, u32_ty, 1);
+    let i_next = Operation::new(
+        &mut ctx,
+        mir::MirAddOp::get_concrete_op_info(),
+        vec![u32_ty.into()],
+        vec![i, one],
+        vec![],
+        0,
+    );
+    i_next.insert_at_back(latch, &ctx);
+    let i_next = i_next.deref(&ctx).get_result(0);
+
+    let desc_a0_step = append_mir_unsigned_constant(&mut ctx, latch, u64_ty, DESC_A0_STEP);
+    let desc_a0_next = Operation::new(
+        &mut ctx,
+        mir::MirAddOp::get_concrete_op_info(),
+        vec![u64_ty.into()],
+        vec![desc_a0, desc_a0_step],
+        vec![],
+        0,
+    );
+    desc_a0_next.insert_at_back(latch, &ctx);
+    let desc_a0_next = desc_a0_next.deref(&ctx).get_result(0);
+
+    let desc_b0_step = append_mir_unsigned_constant(&mut ctx, latch, u64_ty, DESC_B0_STEP);
+    let desc_b0_next = Operation::new(
+        &mut ctx,
+        mir::MirAddOp::get_concrete_op_info(),
+        vec![u64_ty.into()],
+        vec![desc_b0, desc_b0_step],
+        vec![],
+        0,
+    );
+    desc_b0_next.insert_at_back(latch, &ctx);
+    let desc_b0_next = desc_b0_next.deref(&ctx).get_result(0);
+
+    let desc_a1_step = append_mir_unsigned_constant(&mut ctx, latch, u64_ty, DESC_A1_STEP);
+    let desc_a1_next = Operation::new(
+        &mut ctx,
+        mir::MirAddOp::get_concrete_op_info(),
+        vec![u64_ty.into()],
+        vec![desc_a1, desc_a1_step],
+        vec![],
+        0,
+    );
+    desc_a1_next.insert_at_back(latch, &ctx);
+    let desc_a1_next = desc_a1_next.deref(&ctx).get_result(0);
+
+    let desc_b1_step = append_mir_unsigned_constant(&mut ctx, latch, u64_ty, DESC_B1_STEP);
+    let desc_b1_next = Operation::new(
+        &mut ctx,
+        mir::MirAddOp::get_concrete_op_info(),
+        vec![u64_ty.into()],
+        vec![desc_b1, desc_b1_step],
+        vec![],
+        0,
+    );
+    desc_b1_next.insert_at_back(latch, &ctx);
+    let desc_b1_next = desc_b1_next.deref(&ctx).get_result(0);
+
+    Operation::new(
+        &mut ctx,
+        mir::MirGotoOp::get_concrete_op_info(),
+        vec![],
+        vec![
+            i_next,
+            desc_a0_next,
+            desc_b0_next,
+            desc_a1_next,
+            desc_b1_next,
+        ],
+        vec![header],
+        0,
+    )
+    .insert_at_back(latch, &ctx);
+
+    append_wgmma_wait_group_constant(&mut ctx, exit, 0);
+    append_return(&mut ctx, exit);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let body = lowered_kernel_body(&ctx, module_ptr);
+    let matching = body
+        .iter()
+        .copied()
+        .filter_map(|operation| {
+            Operation::get_op::<llvm::InlineAsmOp>(operation, &ctx)
+                .map(|inline_asm| (operation, inline_asm))
+        })
+        .filter(|(_, asm)| {
+            asm.get_attr_inline_asm_template(&ctx)
+                .map(|value| String::from((*value).clone()))
+                .is_some_and(|template| template.contains("L__wgmma_pipeline_loop_${:uid}:"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected one fused two-slot counted WGMMA pipeline"
+    );
+
+    let (asm_operation, asm) = &matching[0];
+    let template = asm
+        .get_attr_inline_asm_template(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("counted-pipeline WGMMA template");
+
+    assert_eq!(template.matches("wgmma.fence.sync.aligned").count(), 1);
+    assert_eq!(template.matches("wgmma.mma_async").count(), 2);
+    assert_eq!(
+        template.matches("wgmma.commit_group.sync.aligned").count(),
+        2
+    );
+    assert_eq!(
+        template.matches("wgmma.wait_group.sync.aligned 1").count(),
+        2
+    );
+    assert_eq!(
+        template.matches("wgmma.wait_group.sync.aligned 0").count(),
+        1
+    );
+    assert!(template.contains("{$0, $1"));
+    assert!(template.contains("{$32, $33"));
+    assert!(template.contains("mov.u64 %desc_a0, $128;"));
+    assert!(template.contains("mov.u64 %desc_b0, $129;"));
+    assert!(template.contains("mov.u64 %desc_a1, $130;"));
+    assert!(template.contains("mov.u64 %desc_b1, $131;"));
+    assert!(template.contains("add.u64 %desc_a0, %desc_a0, $132;"));
+    assert!(template.contains("add.u64 %desc_b0, %desc_b0, $133;"));
+    assert!(template.contains("add.u64 %desc_a1, %desc_a1, $134;"));
+    assert!(template.contains("add.u64 %desc_b1, %desc_b1, $135;"));
+    assert!(template.contains("mov.u64 %remaining, $136;"));
+    assert!(
+        !template.contains(".reg .f32")
+            && !template.contains("ld.f32")
+            && !template.contains("st.f32"),
+        "counted pipeline must keep accumulator memory outside asm: {template}"
+    );
+
+    let mut expected_constraints = vec!["=f".to_owned(); RESULT_COUNT];
+    expected_constraints.extend((0..RESULT_COUNT).map(|index| index.to_string()));
+    expected_constraints.extend((0..LOOP_CONTROL_COUNT).map(|_| "l".to_owned()));
+    expected_constraints.push("~{memory}".to_owned());
+    let expected_constraints = expected_constraints.join(",");
+    assert_eq!(
+        asm.get_attr_inline_asm_constraints(&ctx)
+            .map(|value| String::from((*value).clone()))
+            .as_deref(),
+        Some(expected_constraints.as_str())
+    );
+    assert_eq!(llvm::asm_kind(&ctx, asm), llvm::AsmKind::Convergent);
+    assert_eq!(
+        asm_operation.deref(&ctx).get_num_operands(),
+        RESULT_COUNT + LOOP_CONTROL_COUNT
+    );
+
+    let asm_position = body
+        .iter()
+        .position(|operation| operation == asm_operation)
+        .expect("counted-pipeline WGMMA asm must be in the lowered kernel body");
+    let load_positions = body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            Operation::get_op::<llvm::LoadOp>(*operation, &ctx)
+                .is_some()
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(load_positions.len(), RESULT_COUNT);
+    assert!(load_positions.iter().all(|index| *index < asm_position));
+
+    let store_positions = body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            Operation::get_op::<llvm::StoreOp>(*operation, &ctx)
+                .is_some()
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(store_positions.len(), RESULT_COUNT);
+    assert!(store_positions.iter().all(|index| *index > asm_position));
+    assert_eq!(
+        body.iter()
+            .filter(|operation| {
+                Operation::get_op::<llvm::ExtractValueOp>(**operation, &ctx).is_some()
+            })
+            .count(),
+        RESULT_COUNT
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_pointer_form_wgmma_three_slot_counted_pipeline_stays_register_resident()
+-> Result<(), anyhow::Error> {
+    const RESULT_COUNT: usize = 96;
+    const LOOP_CONTROL_COUNT: usize = 13;
+
+    let mut ctx = make_test_ctx();
+    let module_ptr = build_pointer_form_wgmma_counted_pipeline_case(&mut ctx, 3, &[2, 2, 2], false);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let body = lowered_kernel_body(&ctx, module_ptr);
+    let matching = body
+        .iter()
+        .copied()
+        .filter_map(|operation| {
+            Operation::get_op::<llvm::InlineAsmOp>(operation, &ctx)
+                .map(|inline_asm| (operation, inline_asm))
+        })
+        .filter(|(_, asm)| {
+            asm.get_attr_inline_asm_template(&ctx)
+                .map(|value| String::from((*value).clone()))
+                .is_some_and(|template| template.contains("L__wgmma_pipeline_loop_${:uid}:"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected one fused three-slot counted WGMMA pipeline"
+    );
+
+    let (asm_operation, asm) = &matching[0];
+    let template = asm
+        .get_attr_inline_asm_template(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("three-slot counted-pipeline WGMMA template");
+
+    assert_eq!(template.matches("wgmma.fence.sync.aligned").count(), 1);
+    assert_eq!(template.matches("wgmma.mma_async").count(), 3);
+    assert_eq!(
+        template.matches("wgmma.commit_group.sync.aligned").count(),
+        3
+    );
+    assert_eq!(
+        template.matches("wgmma.wait_group.sync.aligned 2").count(),
+        3
+    );
+    assert_eq!(
+        template.matches("wgmma.wait_group.sync.aligned 0").count(),
+        1
+    );
+    assert!(template.contains("{$0, $1"));
+    assert!(template.contains("{$32, $33"));
+    assert!(template.contains("{$64, $65"));
+    assert!(template.contains("mov.u64 %desc_a0, $192;"));
+    assert!(template.contains("mov.u64 %desc_b0, $193;"));
+    assert!(template.contains("mov.u64 %desc_a1, $194;"));
+    assert!(template.contains("mov.u64 %desc_b1, $195;"));
+    assert!(template.contains("mov.u64 %desc_a2, $196;"));
+    assert!(template.contains("mov.u64 %desc_b2, $197;"));
+    assert!(template.contains("add.u64 %desc_a0, %desc_a0, $198;"));
+    assert!(template.contains("add.u64 %desc_b0, %desc_b0, $199;"));
+    assert!(template.contains("add.u64 %desc_a1, %desc_a1, $200;"));
+    assert!(template.contains("add.u64 %desc_b1, %desc_b1, $201;"));
+    assert!(template.contains("add.u64 %desc_a2, %desc_a2, $202;"));
+    assert!(template.contains("add.u64 %desc_b2, %desc_b2, $203;"));
+    assert!(template.contains("mov.u64 %remaining, $204;"));
+    assert!(
+        !template.contains(".reg .f32")
+            && !template.contains("ld.f32")
+            && !template.contains("st.f32"),
+        "three-slot counted pipeline must keep accumulator memory outside asm: {template}"
+    );
+
+    let mut expected_constraints = vec!["=f".to_owned(); RESULT_COUNT];
+    expected_constraints.extend((0..RESULT_COUNT).map(|index| index.to_string()));
+    expected_constraints.extend((0..LOOP_CONTROL_COUNT).map(|_| "l".to_owned()));
+    expected_constraints.push("~{memory}".to_owned());
+    let expected_constraints = expected_constraints.join(",");
+    assert_eq!(
+        asm.get_attr_inline_asm_constraints(&ctx)
+            .map(|value| String::from((*value).clone()))
+            .as_deref(),
+        Some(expected_constraints.as_str())
+    );
+    assert_eq!(llvm::asm_kind(&ctx, asm), llvm::AsmKind::Convergent);
+    assert_eq!(
+        asm_operation.deref(&ctx).get_num_operands(),
+        RESULT_COUNT + LOOP_CONTROL_COUNT
+    );
+
+    let asm_position = body
+        .iter()
+        .position(|operation| operation == asm_operation)
+        .expect("three-slot counted-pipeline WGMMA asm must be in the lowered kernel body");
+    let load_positions = body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            Operation::get_op::<llvm::LoadOp>(*operation, &ctx)
+                .is_some()
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(load_positions.len(), RESULT_COUNT);
+    assert!(load_positions.iter().all(|index| *index < asm_position));
+
+    let store_positions = body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            Operation::get_op::<llvm::StoreOp>(*operation, &ctx)
+                .is_some()
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(store_positions.len(), RESULT_COUNT);
+    assert!(store_positions.iter().all(|index| *index > asm_position));
+    assert_eq!(
+        body.iter()
+            .filter(|operation| {
+                Operation::get_op::<llvm::ExtractValueOp>(**operation, &ctx).is_some()
+            })
+            .count(),
+        RESULT_COUNT
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_pointer_form_wgmma_counted_pipeline_rejects_wait_two_with_two_slots() {
+    let mut ctx = make_test_ctx();
+    let module_ptr = build_pointer_form_wgmma_counted_pipeline_case(&mut ctx, 2, &[2, 2], false);
+
+    assert!(
+        mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr).is_err(),
+        "wait_group<2> must require three counted-pipeline accumulator slots"
+    );
+}
+
+#[test]
+fn test_pointer_form_wgmma_counted_pipeline_rejects_mixed_partial_waits() {
+    let mut ctx = make_test_ctx();
+    let module_ptr = build_pointer_form_wgmma_counted_pipeline_case(&mut ctx, 3, &[2, 1, 2], false);
+
+    assert!(
+        mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr).is_err(),
+        "all counted-pipeline stages must use the same partial-wait depth"
+    );
+}
+
+#[test]
+fn test_pointer_form_wgmma_counted_pipeline_rejects_reused_accumulator_slot() {
+    let mut ctx = make_test_ctx();
+    let module_ptr = build_pointer_form_wgmma_counted_pipeline_case(&mut ctx, 3, &[2, 2, 2], true);
+
+    assert!(
+        mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr).is_err(),
+        "counted-pipeline accumulator slots must be pairwise distinct"
+    );
 }
 
 #[test]
@@ -9699,6 +11030,626 @@ fn test_pointer_form_wgmma_counted_k_loop_stays_register_resident() -> Result<()
         ACCUMULATOR_LEN
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_f16_wgmma_counted_k_loop_stays_register_resident() -> Result<(), anyhow::Error> {
+    use dialect_mir::types::{MirArrayType, MirPtrType};
+    use pliron::basic_block::BasicBlock;
+    use pliron::builtin::op_interfaces::OperandSegmentInterface;
+    use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+
+    const ACCUMULATOR_LEN: usize = 32;
+    const LOOP_CONTROL_COUNT: usize = 5;
+    const TRIP_COUNT: u64 = 4;
+    const DESC_A_STEP: u64 = 16;
+    const DESC_B_STEP: u64 = 32;
+
+    let mut ctx = make_test_ctx();
+    let f32_ty = FP32Type::get(&ctx);
+    let row_ty = MirArrayType::get(&mut ctx, f32_ty.into(), 8);
+    let accumulator_ty = MirArrayType::get(&mut ctx, row_ty.into(), 4);
+    let accumulator_ptr_ty = MirPtrType::get_generic(&mut ctx, accumulator_ty.into(), true);
+    let u32_ty = IntegerType::get(&ctx, 32, Signedness::Unsigned);
+    let u64_ty = IntegerType::get(&ctx, 64, Signedness::Unsigned);
+    let i1_ty = IntegerType::get(&ctx, 1, Signedness::Signless);
+
+    let (module_ptr, preheader) = build_test_kernel(
+        &mut ctx,
+        vec![accumulator_ptr_ty.into(), u64_ty.into(), u64_ty.into()],
+    );
+    let accumulator = preheader.deref(&ctx).get_argument(0);
+    let desc_a_base = preheader.deref(&ctx).get_argument(1);
+    let desc_b_base = preheader.deref(&ctx).get_argument(2);
+
+    let module_region = module_ptr.deref(&ctx).get_region(0);
+    let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+    let function = module_block.deref(&ctx).iter(&ctx).next().unwrap();
+    let function_region = function.deref(&ctx).get_region(0);
+
+    let header = BasicBlock::new(
+        &mut ctx,
+        None,
+        vec![u32_ty.into(), u64_ty.into(), u64_ty.into()],
+    );
+    header.insert_at_back(function_region, &ctx);
+    let latch = BasicBlock::new(&mut ctx, None, vec![]);
+    latch.insert_at_back(function_region, &ctx);
+    let exit = BasicBlock::new(&mut ctx, None, vec![]);
+    exit.insert_at_back(function_region, &ctx);
+
+    // preheader: fence; i0 = 0; goto header(i0, desc_a_base, desc_b_base)
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(preheader, &ctx);
+    let i0 = append_mir_unsigned_constant(&mut ctx, preheader, u32_ty, 0);
+    Operation::new(
+        &mut ctx,
+        mir::MirGotoOp::get_concrete_op_info(),
+        vec![],
+        vec![i0, desc_a_base, desc_b_base],
+        vec![header],
+        0,
+    )
+    .insert_at_back(preheader, &ctx);
+
+    // header(i, desc_a, desc_b): if !(i < 4) exit else latch.
+    let i = header.deref(&ctx).get_argument(0);
+    let desc_a = header.deref(&ctx).get_argument(1);
+    let desc_b = header.deref(&ctx).get_argument(2);
+    let bound = append_mir_unsigned_constant(&mut ctx, header, u32_ty, TRIP_COUNT);
+    let lt = Operation::new(
+        &mut ctx,
+        mir::MirLtOp::get_concrete_op_info(),
+        vec![i1_ty.into()],
+        vec![i, bound],
+        vec![],
+        0,
+    );
+    lt.insert_at_back(header, &ctx);
+    let lt_value = lt.deref(&ctx).get_result(0);
+    let not_lt = Operation::new(
+        &mut ctx,
+        mir::MirNotOp::get_concrete_op_info(),
+        vec![i1_ty.into()],
+        vec![lt_value],
+        vec![],
+        0,
+    );
+    not_lt.insert_at_back(header, &ctx);
+    let not_lt_value = not_lt.deref(&ctx).get_result(0);
+    let (branch_operands, segment_sizes) =
+        mir::MirCondBranchOp::compute_segment_sizes(vec![vec![not_lt_value], vec![], vec![]]);
+    let branch = Operation::new(
+        &mut ctx,
+        mir::MirCondBranchOp::get_concrete_op_info(),
+        vec![],
+        branch_operands,
+        vec![exit, latch],
+        0,
+    );
+    Operation::get_op::<mir::MirCondBranchOp>(branch, &ctx)
+        .expect("MirCondBranchOp")
+        .set_operand_segment_sizes(&ctx, segment_sizes);
+    branch.insert_at_back(header, &ctx);
+
+    // latch: one WGMMA per K iteration and affine descriptor recurrences.
+    append_pointer_wgmma_mma_f16(&mut ctx, latch, accumulator, desc_a, desc_b);
+
+    let one = append_mir_unsigned_constant(&mut ctx, latch, u32_ty, 1);
+    let i_next = Operation::new(
+        &mut ctx,
+        mir::MirAddOp::get_concrete_op_info(),
+        vec![u32_ty.into()],
+        vec![i, one],
+        vec![],
+        0,
+    );
+    i_next.insert_at_back(latch, &ctx);
+    let i_next = i_next.deref(&ctx).get_result(0);
+
+    let desc_a_step = append_mir_unsigned_constant(&mut ctx, latch, u64_ty, DESC_A_STEP);
+    let desc_a_next = Operation::new(
+        &mut ctx,
+        mir::MirAddOp::get_concrete_op_info(),
+        vec![u64_ty.into()],
+        vec![desc_a, desc_a_step],
+        vec![],
+        0,
+    );
+    desc_a_next.insert_at_back(latch, &ctx);
+    let desc_a_next = desc_a_next.deref(&ctx).get_result(0);
+
+    let desc_b_step = append_mir_unsigned_constant(&mut ctx, latch, u64_ty, DESC_B_STEP);
+    let desc_b_next = Operation::new(
+        &mut ctx,
+        mir::MirAddOp::get_concrete_op_info(),
+        vec![u64_ty.into()],
+        vec![desc_b, desc_b_step],
+        vec![],
+        0,
+    );
+    desc_b_next.insert_at_back(latch, &ctx);
+    let desc_b_next = desc_b_next.deref(&ctx).get_result(0);
+
+    Operation::new(
+        &mut ctx,
+        mir::MirGotoOp::get_concrete_op_info(),
+        vec![],
+        vec![i_next, desc_a_next, desc_b_next],
+        vec![header],
+        0,
+    )
+    .insert_at_back(latch, &ctx);
+
+    // exit: the only place where the asynchronous lifetime may become visible.
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(exit, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, exit, 0);
+    append_return(&mut ctx, exit);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let body = lowered_kernel_body(&ctx, module_ptr);
+    let matching = body
+        .iter()
+        .copied()
+        .filter_map(|operation| {
+            Operation::get_op::<llvm::InlineAsmOp>(operation, &ctx)
+                .map(|inline_asm| (operation, inline_asm))
+        })
+        .filter(|(_, asm)| {
+            asm.get_attr_inline_asm_template(&ctx)
+                .map(|value| String::from((*value).clone()))
+                .is_some_and(|template| template.contains("L__wgmma_loop_${:uid}:"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected one fused F16 counted-loop WGMMA asm"
+    );
+
+    let (asm_operation, asm) = &matching[0];
+    let template = asm
+        .get_attr_inline_asm_template(&ctx)
+        .map(|value| String::from((*value).clone()))
+        .expect("F16 counted-loop WGMMA template");
+
+    assert_eq!(template.matches("wgmma.fence.sync.aligned").count(), 1);
+    assert_eq!(
+        template
+            .matches("wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16")
+            .count(),
+        1,
+        "the F16 counted-loop template must contain exactly one F16 MMA"
+    );
+    assert!(!template.contains(".bf16.bf16"));
+    assert_eq!(
+        template.matches("wgmma.commit_group.sync.aligned").count(),
+        1
+    );
+    assert_eq!(
+        template.matches("wgmma.wait_group.sync.aligned 0").count(),
+        1
+    );
+    assert!(template.contains("mov.u64 %desc_a, $64;"));
+    assert!(template.contains("mov.u64 %desc_b, $65;"));
+    assert!(template.contains("add.u64 %desc_a, %desc_a, $66;"));
+    assert!(template.contains("add.u64 %desc_b, %desc_b, $67;"));
+    assert!(template.contains("mov.u64 %remaining, $68;"));
+    assert!(template.contains("@%loop_more bra.uni L__wgmma_done_${:uid};"));
+    assert!(template.contains("@%loop_more bra.uni L__wgmma_loop_${:uid};"));
+    assert!(template.contains("L__wgmma_done_${:uid}:"));
+    assert!(
+        !template.contains(".reg .f32")
+            && !template.contains("ld.f32")
+            && !template.contains("st.f32"),
+        "F16 counted-loop WGMMA must keep accumulator memory outside asm: {template}"
+    );
+
+    let mut expected_constraints = vec!["=f".to_owned(); ACCUMULATOR_LEN];
+    expected_constraints.extend((0..ACCUMULATOR_LEN).map(|index| index.to_string()));
+    expected_constraints.extend((0..LOOP_CONTROL_COUNT).map(|_| "l".to_owned()));
+    expected_constraints.push("~{memory}".to_owned());
+    let expected_constraints = expected_constraints.join(",");
+    assert_eq!(
+        asm.get_attr_inline_asm_constraints(&ctx)
+            .map(|value| String::from((*value).clone()))
+            .as_deref(),
+        Some(expected_constraints.as_str())
+    );
+    assert_eq!(llvm::asm_kind(&ctx, asm), llvm::AsmKind::Convergent);
+    assert_eq!(
+        asm_operation.deref(&ctx).get_num_operands(),
+        ACCUMULATOR_LEN + LOOP_CONTROL_COUNT
+    );
+
+    let asm_position = body
+        .iter()
+        .position(|operation| operation == asm_operation)
+        .expect("F16 counted-loop WGMMA asm must be in the lowered kernel body");
+
+    let load_positions = body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            Operation::get_op::<llvm::LoadOp>(*operation, &ctx)
+                .is_some()
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        load_positions.len(),
+        ACCUMULATOR_LEN,
+        "F16 K-loop accumulator must be loaded exactly once"
+    );
+    assert!(load_positions.iter().all(|index| *index < asm_position));
+
+    let store_positions = body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            Operation::get_op::<llvm::StoreOp>(*operation, &ctx)
+                .is_some()
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        store_positions.len(),
+        ACCUMULATOR_LEN,
+        "F16 K-loop accumulator must be stored exactly once after the final wait"
+    );
+    assert!(store_positions.iter().all(|index| *index > asm_position));
+
+    assert_eq!(
+        body.iter()
+            .filter(
+                |operation| Operation::get_op::<llvm::ExtractValueOp>(**operation, &ctx).is_some()
+            )
+            .count(),
+        ACCUMULATOR_LEN
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_tf32_wgmma_counted_k_loop_remains_unsupported() -> Result<(), anyhow::Error> {
+    use dialect_mir::types::{MirArrayType, MirPtrType};
+    use pliron::basic_block::BasicBlock;
+    use pliron::builtin::op_interfaces::OperandSegmentInterface;
+    use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+
+    const TRIP_COUNT: u64 = 4;
+    const DESC_A_STEP: u64 = 16;
+    const DESC_B_STEP: u64 = 32;
+
+    let mut ctx = make_test_ctx();
+    let f32_ty = FP32Type::get(&ctx);
+    let row_ty = MirArrayType::get(&mut ctx, f32_ty.into(), 8);
+    let accumulator_ty = MirArrayType::get(&mut ctx, row_ty.into(), 4);
+    let accumulator_ptr_ty = MirPtrType::get_generic(&mut ctx, accumulator_ty.into(), true);
+    let u32_ty = IntegerType::get(&ctx, 32, Signedness::Unsigned);
+    let u64_ty = IntegerType::get(&ctx, 64, Signedness::Unsigned);
+    let i1_ty = IntegerType::get(&ctx, 1, Signedness::Signless);
+
+    let (module_ptr, preheader) = build_test_kernel(
+        &mut ctx,
+        vec![accumulator_ptr_ty.into(), u64_ty.into(), u64_ty.into()],
+    );
+    let accumulator = preheader.deref(&ctx).get_argument(0);
+    let desc_a_base = preheader.deref(&ctx).get_argument(1);
+    let desc_b_base = preheader.deref(&ctx).get_argument(2);
+
+    let module_region = module_ptr.deref(&ctx).get_region(0);
+    let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+    let function = module_block.deref(&ctx).iter(&ctx).next().unwrap();
+    let function_region = function.deref(&ctx).get_region(0);
+
+    let header = BasicBlock::new(
+        &mut ctx,
+        None,
+        vec![u32_ty.into(), u64_ty.into(), u64_ty.into()],
+    );
+    header.insert_at_back(function_region, &ctx);
+    let latch = BasicBlock::new(&mut ctx, None, vec![]);
+    latch.insert_at_back(function_region, &ctx);
+    let exit = BasicBlock::new(&mut ctx, None, vec![]);
+    exit.insert_at_back(function_region, &ctx);
+
+    // preheader: fence; i0 = 0; goto header(i0, desc_a_base, desc_b_base)
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(preheader, &ctx);
+    let i0 = append_mir_unsigned_constant(&mut ctx, preheader, u32_ty, 0);
+    Operation::new(
+        &mut ctx,
+        mir::MirGotoOp::get_concrete_op_info(),
+        vec![],
+        vec![i0, desc_a_base, desc_b_base],
+        vec![header],
+        0,
+    )
+    .insert_at_back(preheader, &ctx);
+
+    // header(i, desc_a, desc_b): if !(i < 4) exit else latch.
+    let i = header.deref(&ctx).get_argument(0);
+    let desc_a = header.deref(&ctx).get_argument(1);
+    let desc_b = header.deref(&ctx).get_argument(2);
+    let bound = append_mir_unsigned_constant(&mut ctx, header, u32_ty, TRIP_COUNT);
+    let lt = Operation::new(
+        &mut ctx,
+        mir::MirLtOp::get_concrete_op_info(),
+        vec![i1_ty.into()],
+        vec![i, bound],
+        vec![],
+        0,
+    );
+    lt.insert_at_back(header, &ctx);
+    let lt_value = lt.deref(&ctx).get_result(0);
+    let not_lt = Operation::new(
+        &mut ctx,
+        mir::MirNotOp::get_concrete_op_info(),
+        vec![i1_ty.into()],
+        vec![lt_value],
+        vec![],
+        0,
+    );
+    not_lt.insert_at_back(header, &ctx);
+    let not_lt_value = not_lt.deref(&ctx).get_result(0);
+    let (branch_operands, segment_sizes) =
+        mir::MirCondBranchOp::compute_segment_sizes(vec![vec![not_lt_value], vec![], vec![]]);
+    let branch = Operation::new(
+        &mut ctx,
+        mir::MirCondBranchOp::get_concrete_op_info(),
+        vec![],
+        branch_operands,
+        vec![exit, latch],
+        0,
+    );
+    Operation::get_op::<mir::MirCondBranchOp>(branch, &ctx)
+        .expect("MirCondBranchOp")
+        .set_operand_segment_sizes(&ctx, segment_sizes);
+    branch.insert_at_back(header, &ctx);
+
+    // latch: one WGMMA per K iteration and affine descriptor recurrences.
+    append_pointer_wgmma_mma_tf32(&mut ctx, latch, accumulator, desc_a, desc_b);
+
+    let one = append_mir_unsigned_constant(&mut ctx, latch, u32_ty, 1);
+    let i_next = Operation::new(
+        &mut ctx,
+        mir::MirAddOp::get_concrete_op_info(),
+        vec![u32_ty.into()],
+        vec![i, one],
+        vec![],
+        0,
+    );
+    i_next.insert_at_back(latch, &ctx);
+    let i_next = i_next.deref(&ctx).get_result(0);
+
+    let desc_a_step = append_mir_unsigned_constant(&mut ctx, latch, u64_ty, DESC_A_STEP);
+    let desc_a_next = Operation::new(
+        &mut ctx,
+        mir::MirAddOp::get_concrete_op_info(),
+        vec![u64_ty.into()],
+        vec![desc_a, desc_a_step],
+        vec![],
+        0,
+    );
+    desc_a_next.insert_at_back(latch, &ctx);
+    let desc_a_next = desc_a_next.deref(&ctx).get_result(0);
+
+    let desc_b_step = append_mir_unsigned_constant(&mut ctx, latch, u64_ty, DESC_B_STEP);
+    let desc_b_next = Operation::new(
+        &mut ctx,
+        mir::MirAddOp::get_concrete_op_info(),
+        vec![u64_ty.into()],
+        vec![desc_b, desc_b_step],
+        vec![],
+        0,
+    );
+    desc_b_next.insert_at_back(latch, &ctx);
+    let desc_b_next = desc_b_next.deref(&ctx).get_result(0);
+
+    Operation::new(
+        &mut ctx,
+        mir::MirGotoOp::get_concrete_op_info(),
+        vec![],
+        vec![i_next, desc_a_next, desc_b_next],
+        vec![header],
+        0,
+    )
+    .insert_at_back(latch, &ctx);
+
+    // exit: the only place where the asynchronous lifetime may become visible.
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(exit, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, exit, 0);
+    append_return(&mut ctx, exit);
+
+    assert_wgmma_lowering_rejected(
+        &mut ctx,
+        module_ptr,
+        "WGMMA MMA reached lowering without deferred accumulator fusion",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_m64n128_wgmma_noncanonical_accumulator_has_no_pointer_fallback() -> Result<(), anyhow::Error>
+{
+    let mut ctx = make_test_ctx();
+    let (module_ptr, entry, accumulators, desc_a, desc_b, _) =
+        build_wgmma_pointer_test_kernel(&mut ctx, 1, vec![]);
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_pointer_wgmma_mma_m64n128(&mut ctx, entry, accumulators[0], desc_a, desc_b);
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 0);
+    append_return(&mut ctx, entry);
+
+    assert_wgmma_lowering_rejected(
+        &mut ctx,
+        module_ptr,
+        "WGMMA linear full-drain lowering for this variant requires a canonical [[f32; 8]; 8] accumulator",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_f16_wgmma_noncanonical_accumulator_has_no_pointer_fallback() -> Result<(), anyhow::Error> {
+    let mut ctx = make_test_ctx();
+    let (module_ptr, entry, accumulators, desc_a, desc_b, _) =
+        build_wgmma_pointer_test_kernel(&mut ctx, 1, vec![]);
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_pointer_wgmma_mma_f16(&mut ctx, entry, accumulators[0], desc_a, desc_b);
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 0);
+    append_return(&mut ctx, entry);
+
+    assert_wgmma_lowering_rejected(
+        &mut ctx,
+        module_ptr,
+        "WGMMA linear full-drain lowering for this variant requires a canonical [[f32; 8]; 4] accumulator",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_tf32_wgmma_noncanonical_accumulator_has_no_pointer_fallback() -> Result<(), anyhow::Error> {
+    let mut ctx = make_test_ctx();
+    let (module_ptr, entry, accumulators, desc_a, desc_b, _) =
+        build_wgmma_pointer_test_kernel(&mut ctx, 1, vec![]);
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_pointer_wgmma_mma_tf32(&mut ctx, entry, accumulators[0], desc_a, desc_b);
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 0);
+    append_return(&mut ctx, entry);
+
+    assert_wgmma_lowering_rejected(
+        &mut ctx,
+        module_ptr,
+        "WGMMA linear full-drain lowering for this variant requires a canonical [[f32; 8]; 4] accumulator",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_linear_wgmma_full_drain_rejects_mixed_bf16_and_f16() -> Result<(), anyhow::Error> {
+    let mut ctx = make_test_ctx();
+    let (module_ptr, entry, accumulators, descriptors) =
+        build_wgmma_canonical_pointer_test_kernel(&mut ctx, 1, 4);
+    let accumulator = accumulators[0];
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_pointer_wgmma_mma(&mut ctx, entry, accumulator, descriptors[0], descriptors[1]);
+    append_pointer_wgmma_mma_f16(&mut ctx, entry, accumulator, descriptors[2], descriptors[3]);
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 0);
+    append_return(&mut ctx, entry);
+
+    assert_wgmma_lowering_rejected(
+        &mut ctx,
+        module_ptr,
+        "one linear WGMMA full-drain region cannot mix MMA variants or shapes",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_linear_wgmma_full_drain_rejects_mixed_bf16_and_tf32() -> Result<(), anyhow::Error> {
+    let mut ctx = make_test_ctx();
+    let (module_ptr, entry, accumulators, descriptors) =
+        build_wgmma_canonical_pointer_test_kernel(&mut ctx, 1, 4);
+    let accumulator = accumulators[0];
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_pointer_wgmma_mma(&mut ctx, entry, accumulator, descriptors[0], descriptors[1]);
+    append_pointer_wgmma_mma_tf32(&mut ctx, entry, accumulator, descriptors[2], descriptors[3]);
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 0);
+    append_return(&mut ctx, entry);
+
+    assert_wgmma_lowering_rejected(
+        &mut ctx,
+        module_ptr,
+        "one linear WGMMA full-drain region cannot mix MMA variants or shapes",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_linear_wgmma_full_drain_rejects_mixed_f16_and_tf32() -> Result<(), anyhow::Error> {
+    let mut ctx = make_test_ctx();
+    let (module_ptr, entry, accumulators, descriptors) =
+        build_wgmma_canonical_pointer_test_kernel(&mut ctx, 1, 4);
+    let accumulator = accumulators[0];
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_pointer_wgmma_mma_f16(&mut ctx, entry, accumulator, descriptors[0], descriptors[1]);
+    append_pointer_wgmma_mma_tf32(&mut ctx, entry, accumulator, descriptors[2], descriptors[3]);
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 0);
+    append_return(&mut ctx, entry);
+
+    assert_wgmma_lowering_rejected(
+        &mut ctx,
+        module_ptr,
+        "one linear WGMMA full-drain region cannot mix MMA variants or shapes",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_f16_wgmma_partial_wait_remains_unsupported() -> Result<(), anyhow::Error> {
+    let mut ctx = make_test_ctx();
+    let (module_ptr, entry, accumulators, descriptors) =
+        build_wgmma_canonical_pointer_test_kernel(&mut ctx, 1, 2);
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_pointer_wgmma_mma_f16(
+        &mut ctx,
+        entry,
+        accumulators[0],
+        descriptors[0],
+        descriptors[1],
+    );
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 1);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 0);
+    append_return(&mut ctx, entry);
+
+    assert_wgmma_lowering_rejected(
+        &mut ctx,
+        module_ptr,
+        "WGMMA deferred accumulator lowering requires wait_group<0>",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_tf32_wgmma_partial_wait_remains_unsupported() -> Result<(), anyhow::Error> {
+    let mut ctx = make_test_ctx();
+    let (module_ptr, entry, accumulators, descriptors) =
+        build_wgmma_canonical_pointer_test_kernel(&mut ctx, 1, 2);
+
+    nvvm::WgmmaFenceSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_pointer_wgmma_mma_tf32(
+        &mut ctx,
+        entry,
+        accumulators[0],
+        descriptors[0],
+        descriptors[1],
+    );
+    nvvm::WgmmaCommitGroupSyncAlignedOp::build(&mut ctx).insert_at_back(entry, &ctx);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 1);
+    append_wgmma_wait_group_constant(&mut ctx, entry, 0);
+    append_return(&mut ctx, entry);
+
+    assert_wgmma_lowering_rejected(
+        &mut ctx,
+        module_ptr,
+        "WGMMA deferred accumulator lowering requires wait_group<0>",
+    );
     Ok(())
 }
 

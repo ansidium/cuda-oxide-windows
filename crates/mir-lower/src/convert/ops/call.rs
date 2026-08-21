@@ -61,9 +61,11 @@
 //! callee declaration carried `addrspace(3)`. The verifier rejected the
 //! mismatch.
 
+use crate::convert::target_stable_storage::coerce_target_stable_value;
 use crate::convert::types::{
-    StructLayoutInfo, build_struct_slot_map, convert_function_type, convert_type, is_kernel_func,
-    is_zero_sized_type,
+    StructLayoutInfo, TransparentScalarAbiInfo, build_struct_slot_map, convert_function_type,
+    convert_type, is_kernel_func, is_zero_sized_type, packed_shared_internal_abi_info,
+    transparent_scalar_abi_info,
 };
 use crate::helpers;
 use dialect_mir::ops::{MirCallOp, MirFuncOp};
@@ -657,6 +659,8 @@ pub fn convert(
     };
 
     let mut zst_replacement_type = None;
+    let mut transparent_result_abi = None;
+    let mut packed_shared_result_abi = None;
     let result_type = if let Some(mir_ty) = mir_result_ty_ptr {
         // Only the empty tuple `()` is the unit type. `is::<MirTupleType>()`
         // also matches `(T, U, ...)`, so we have to peek at the field count.
@@ -666,7 +670,26 @@ pub fn convert(
             .deref(ctx)
             .downcast_ref::<MirTupleType>()
             .is_some_and(|t| t.get_types().is_empty());
-        let converted = convert_type(ctx, mir_ty).map_err(anyhow_to_pliron)?;
+        let is_transparent_scalar = {
+            let ty_ref = mir_ty.deref(ctx);
+            ty_ref
+                .downcast_ref::<MirStructType>()
+                .is_some_and(MirStructType::is_transparent_scalar)
+        };
+        let converted = if is_transparent_scalar {
+            let abi = transparent_scalar_abi_info(ctx, mir_ty).map_err(anyhow_to_pliron)?;
+            let scalar_ty = abi.scalar_ty;
+            transparent_result_abi = Some(abi);
+            scalar_ty
+        } else if let Some(abi) =
+            packed_shared_internal_abi_info(ctx, mir_ty).map_err(anyhow_to_pliron)?
+        {
+            let storage_ty = abi.storage_ty;
+            packed_shared_result_abi = Some(abi);
+            storage_ty
+        } else {
+            convert_type(ctx, mir_ty).map_err(anyhow_to_pliron)?
+        };
         if is_unit || is_zero_sized_type(ctx, converted) {
             // NVPTX cannot carry a ZST in a function signature, so the call
             // itself returns void. Keep the converted ZST type so any MIR uses
@@ -732,11 +755,42 @@ pub fn convert(
         func_type,
         flattened_args,
     );
+    crate::convert::preserve_location(ctx, op, llvm_call.get_operation());
     rewriter.insert_operation(ctx, llvm_call.get_operation());
 
     let is_void = result_type.deref(ctx).is::<llvm_types::VoidType>();
     if has_result && !is_void && llvm_call.get_operation().deref(ctx).get_num_results() > 0 {
-        rewriter.replace_operation(ctx, op, llvm_call.get_operation());
+        if let Some(abi) = transparent_result_abi {
+            // The ABI call returns only the underlying scalar, but MIR users
+            // still operate on the ordinary converted wrapper aggregate.
+            // Rebuild nested transparent layers from inner to outer so the
+            // replacement result has exactly the MIR op's converted type.
+            let mut value = llvm_call.get_operation().deref(ctx).get_result(0);
+            let mut replacement = llvm_call.get_operation();
+            for layer in abi.layers.iter().rev() {
+                let undef = llvm::UndefOp::new(ctx, layer.llvm_struct_ty);
+                rewriter.insert_operation(ctx, undef.get_operation());
+                let aggregate = undef.get_operation().deref(ctx).get_result(0);
+                let insert =
+                    llvm::InsertValueOp::new(ctx, aggregate, value, vec![layer.field_slot]);
+                rewriter.insert_operation(ctx, insert.get_operation());
+                value = insert.get_operation().deref(ctx).get_result(0);
+                replacement = insert.get_operation();
+            }
+            rewriter.replace_operation(ctx, op, replacement);
+        } else if let Some(abi) = packed_shared_result_abi {
+            let value = llvm_call.get_operation().deref(ctx).get_result(0);
+            let semantic = coerce_target_stable_value(
+                ctx,
+                rewriter,
+                value,
+                abi.semantic_ty,
+                "packed shared internal ABI",
+            )?;
+            rewriter.replace_operation_with_values(ctx, op, vec![semantic]);
+        } else {
+            rewriter.replace_operation(ctx, op, llvm_call.get_operation());
+        }
     } else if op.deref(ctx).has_use()
         && let Some(zst_type) = zst_replacement_type
     {
@@ -1524,11 +1578,63 @@ fn cast_integer_value_to_type(
     Ok((cast_op.deref(ctx).get_result(0), Some(cast_op)))
 }
 
+/// Recover the transparent scalar ABI projection required by the callee's
+/// declared LLVM parameter type.
+///
+/// A `mir.call` to a `#[device] extern` can already carry the final link symbol,
+/// so the reserved source-level extern prefix is not a reliable discriminator at
+/// this stage. Instead, use the callee declaration as the ABI authority: when an
+/// operand's MIR type history contains a rustc-proven transparent scalar wrapper
+/// whose final scalar type exactly matches the next declared LLVM parameter, that
+/// wrapper must cross this call boundary as the scalar.
+///
+/// Nested wrapper histories can contain both `Outer` and `Inner`. Prefer the
+/// candidate with the most projection layers so the live outer aggregate is
+/// fully unwrapped instead of stopping after the innermost recorded wrapper.
+fn transparent_scalar_abi_matching_param(
+    ctx: &mut Context,
+    arg: Value,
+    operands_info: &OperandsInfo,
+    expected_ty: Option<TypeHandle>,
+) -> Result<Option<TransparentScalarAbiInfo>> {
+    let Some(expected_ty) = expected_ty else {
+        return Ok(None);
+    };
+
+    let mut best: Option<TransparentScalarAbiInfo> = None;
+    for mir_ty in operands_info.lookup_operand_history(arg) {
+        let is_transparent_scalar = {
+            let ty_ref = mir_ty.deref(ctx);
+            ty_ref
+                .downcast_ref::<MirStructType>()
+                .is_some_and(MirStructType::is_transparent_scalar)
+        };
+        if !is_transparent_scalar {
+            continue;
+        }
+
+        let abi = transparent_scalar_abi_info(ctx, mir_ty).map_err(anyhow_to_pliron)?;
+        if abi.scalar_ty != expected_ty {
+            continue;
+        }
+
+        let replace = best
+            .as_ref()
+            .is_none_or(|current| abi.layers.len() > current.layers.len());
+        if replace {
+            best = Some(abi);
+        }
+    }
+
+    Ok(best)
+}
+
 /// Flatten arguments according to ABI rules and coerce each one to the
 /// callee's expected parameter type.
 ///
 /// - Slice types → (ptr, len) pair
 /// - Struct types → individual field values (in MEMORY ORDER)
+/// - `repr(transparent)` scalar structs at device-extern boundaries → underlying scalar
 /// - Other types → pass through
 ///
 /// `expected_param_tys`, when present, is the LLVM-level (post-flatten)
@@ -1568,10 +1674,20 @@ fn flatten_arguments(
             Struct {
                 layout: StructLayoutInfo,
             },
+            TransparentScalar(TransparentScalarAbiInfo),
             None,
         }
 
-        let flatten_kind = if let Some(mir_ty) = operands_info.lookup_most_recent_type(*arg) {
+        let transparent_abi = transparent_scalar_abi_matching_param(
+            ctx,
+            *arg,
+            operands_info,
+            take_expected(&flattened_arg_types),
+        )?;
+
+        let flatten_kind = if let Some(abi) = transparent_abi {
+            FlattenKind::TransparentScalar(abi)
+        } else if let Some(mir_ty) = operands_info.lookup_most_recent_type(*arg) {
             let ty_ref = mir_ty.deref(ctx);
             if ty_ref.is::<MirSliceType>() {
                 FlattenKind::Slice {
@@ -1656,6 +1772,28 @@ fn flatten_arguments(
                     flattened_args.push(space_val);
                     flattened_arg_types.push(space_ty);
                 }
+            }
+            FlattenKind::TransparentScalar(abi) => {
+                let mut scalar = *arg;
+
+                // Layers are recorded outer-to-inner. Extract through every
+                // wrapper so nested transparent ADTs reach the exact scalar
+                // type declared by the device extern.
+                for layer in &abi.layers {
+                    let extract = llvm::ExtractValueOp::new(ctx, scalar, vec![layer.field_slot])?;
+                    rewriter.insert_operation(ctx, extract.get_operation());
+                    scalar = extract.get_operation().deref(ctx).get_result(0);
+                }
+
+                let (scalar, scalar_ty) = coerce_arg_to_param_ty(
+                    ctx,
+                    rewriter,
+                    scalar,
+                    abi.scalar_ty,
+                    take_expected(&flattened_arg_types),
+                )?;
+                flattened_args.push(scalar);
+                flattened_arg_types.push(scalar_ty);
             }
             FlattenKind::Struct { layout } => {
                 // Walk in memory order (the order `convert_function_type`
@@ -1884,6 +2022,76 @@ mod tests {
         assert!(flags.contains(FastmathFlags::REASSOC));
         assert!(flags.contains(FastmathFlags::NNAN));
         assert!(flags.contains(FastmathFlags::NINF));
+    }
+
+    #[test]
+    fn nested_transparent_arg_uses_scalar_when_callee_param_is_scalar() {
+        use dialect_mir::types::StructAbiKind;
+
+        let mut ctx = Context::new();
+        dialect_mir::register(&mut ctx);
+        crate::register(&mut ctx);
+
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let inner: TypeHandle = MirStructType::get_with_full_layout_and_abi(
+            &mut ctx,
+            "Inner".into(),
+            vec!["value".into()],
+            vec![u32_ty],
+            vec![0],
+            vec![0],
+            4,
+            4,
+            StructAbiKind::TransparentScalar,
+        )
+        .into();
+        let outer: TypeHandle = MirStructType::get_with_full_layout_and_abi(
+            &mut ctx,
+            "Outer".into(),
+            vec!["inner".into()],
+            vec![inner],
+            vec![0],
+            vec![0],
+            4,
+            4,
+            StructAbiKind::TransparentScalar,
+        )
+        .into();
+
+        // Model the real conversion pipeline: the live value gets its LLVM
+        // type from ordinary aggregate conversion, while OperandsInfo retains
+        // the MIR wrapper history separately.
+        let live_outer_ty = convert_type(&mut ctx, outer).unwrap();
+        let undef = llvm::UndefOp::new(&mut ctx, live_outer_ty);
+        let arg = undef.get_operation().deref(&ctx).get_result(0);
+        let operands_info = OperandsInfo::new(vec![(arg, vec![outer, inner])]);
+
+        let outer_abi = transparent_scalar_abi_info(&mut ctx, outer).unwrap();
+        let selected = transparent_scalar_abi_matching_param(
+            &mut ctx,
+            arg,
+            &operands_info,
+            Some(outer_abi.scalar_ty),
+        )
+        .unwrap()
+        .expect("scalar callee parameter must select the outer transparent ABI");
+        assert_eq!(selected.layers.len(), 2);
+        assert_eq!(selected.scalar_ty, outer_abi.scalar_ty);
+
+        // An ordinary Rust device-function boundary for `Outer(Inner(T))`
+        // still expects the inner aggregate after one-level struct flattening,
+        // so the transparent scalar projection must not activate there.
+        let inner_aggregate_ty = convert_type(&mut ctx, inner).unwrap();
+        assert!(
+            transparent_scalar_abi_matching_param(
+                &mut ctx,
+                arg,
+                &operands_info,
+                Some(inner_aggregate_ty),
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]

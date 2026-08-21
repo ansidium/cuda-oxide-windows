@@ -61,6 +61,23 @@ pub fn prepare_mir_module(
         &mut analyses,
     )?;
 
+    // Compiler-owned multi-result device operations are temporarily adapted
+    // to Rust aggregate return values by the MIR importer. Prove and remove
+    // that ABI-only boundary before mem2reg so the independent register values
+    // remain SSA all the way into LLVM/PTX lowering.
+    mir_transforms::forward_compiler_result_bundles::forward_compiler_result_bundles(
+        module,
+        ctx,
+        &mut analyses,
+        preparation.verbose,
+    )
+    .map_err(|error| PipelineError::Verification {
+        name: "compiler-result forwarding".to_string(),
+        message: error.disp(ctx).to_string(),
+        operation: None,
+    })?;
+    verify_operation(ctx, module, "module post-compiler-result-forwarding")?;
+
     // A by-value aggregate argument initially lives in a MIR alloca. Read-only
     // field/index projections make that alloca non-promotable even though the
     // original entry-block argument is already an SSA value. Canonicalize the
@@ -83,6 +100,28 @@ pub fn prepare_mir_module(
         }
     })?;
     verify_operation(ctx, module, "module post-mem2reg")?;
+
+    // Source-level dynamic indices commonly pass through temporary MIR slots.
+    // After mem2reg, bounded forms such as `index % C` are direct SSA values,
+    // while result-bundle allocas blocked by dynamic array projections remain.
+    // Re-run the same fail-closed forwarding proof here so those bundles can
+    // be recovered without teaching the pass to trace arbitrary stack slots.
+    mir_transforms::forward_compiler_result_bundles::forward_compiler_result_bundles(
+        module,
+        ctx,
+        &mut analyses,
+        preparation.verbose,
+    )
+    .map_err(|error| PipelineError::Verification {
+        name: "post-mem2reg compiler-result forwarding".to_string(),
+        message: error.disp(ctx).to_string(),
+        operation: None,
+    })?;
+    verify_operation(
+        ctx,
+        module,
+        "module post-mem2reg-compiler-result-forwarding",
+    )?;
 
     // Formation passes that need promoted SSA values but must still see the
     // original loop CFG run here. In particular, a reduction formation pass

@@ -86,10 +86,12 @@ jobs:
       - name: Verify the book documents every cargo oxide subcommand
         run: bash scripts/check-cli-doc-coverage.sh
 
-  # A Rust code block in the book is something a reader pastes. When a device
-  # function is renamed the book keeps compiling and rendering, so the stale name
+  # A Rust code block in the book or a README is something a reader pastes. When
+  # a device function is renamed the docs still render, so the stale name
   # survives until someone tries it -- #797 and the `warp::shuffle_xor_i32` entry
-  # in the API quick reference were both found by hand, months apart.
+  # in the API quick reference were both found by hand, months apart. An example
+  # README naming `warp::shfl`, which has never existed, widened the scope to
+  # the crate and example READMEs.
   book-api-names:
     name: book device-API names
     runs-on: ubuntu-latest
@@ -98,9 +100,48 @@ jobs:
       - name: Clone repository
         uses: actions/checkout@v4
 
-      # Reads the book and cuda-device's sources: no cargo, no build, no network.
+      # Reads the book, the crate and example READMEs, and cuda-device's
+      # sources: no cargo, no build, no network.
       - name: Verify every device call the book shows resolves
         run: bash scripts/check-book-api-names.sh
+
+  # The dialect-nvvm book page prints the catalog SHA-256 and states its own
+  # freshness rule: if the stamp no longer matches, every count on the page
+  # predates the catalog being read. Nothing enforced that rule, so the page
+  # failed its own test for weeks -- 560 operations printed against 570 in the
+  # tree -- and only a hand audit caught it, twice. Machine-checking the stamp
+  # turns "the counts are stale" into a red check on the pull request that
+  # rotated the catalog. The counts stay hand-written; only the stamp is gated,
+  # because the page derives staleness from it.
+  book-catalog-stamp:
+    name: book catalog stamp
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      # Hashes one file and greps one page: no cargo, no build, no network.
+      - name: Verify the dialect page's catalog stamp is current
+        run: bash scripts/check-book-catalog-stamp.sh
+
+  # `unit-tests.yml`'s matrix is the only thing deciding which crates get
+  # `cargo test`, and a member missing from it fails nothing: the workflow is
+  # green, `just check` is green, and the tests never ran. #971 found four
+  # crates in that state holding 107 tests between them, two of them for
+  # months. The workflow's own "intentionally not in this matrix" comment
+  # reading as complete is what hid them.
+  test-matrix-coverage:
+    name: test-matrix coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      # Reads Cargo.toml, unit-tests.yml and the Justfile: no cargo, no network.
+      - name: Verify every workspace member is tested or declared untested
+        run: bash scripts/check-test-matrix-coverage.sh
 
   # #702 let a kernel-only crate drop the host surface (and with it `cuda.h`) via
   # `cuda-macros = { default-features = false }`, which is what #701 asked for.

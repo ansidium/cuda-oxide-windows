@@ -62,7 +62,9 @@ test:
         -p dialect-mir -p dialect-nvvm -p mir-importer -p mir-lower \
         -p mir-transforms -p nvvm-transforms -p reserved-oxide-symbols \
         -p cuda-device -p libnvvm-sys -p nvjitlink-sys \
-        -p cuda-artifact-finalizer -p cargo-oxide
+        -p cuda-artifact-finalizer -p cuda-toolkit-discovery -p cargo-oxide \
+        -p dialect-iket -p iket-lower -p ptx-parse -p dialect-ptx \
+        -p ptx-schedule
     # `default = []`, but every consumer turns the object features on, and the
     # default set alone skips the eight ELF emit/extract tests.
     cargo test -p oxide-artifacts --all-targets --features object
@@ -111,8 +113,8 @@ test-cuda:
 # Mirror unit-tests.yml's third job, `generated-intrinsics`: the three gates a
 # change under crates/cuda-intrinsics-gen has to pass. Nothing else here ran
 # them, so a catalog edit could clear `just check` and still fail CI -- and the
-# catalog is the majority of the intrinsic surface (986 entries, 35 generated
-# files, against 7 hand-written op modules).
+# catalog is the majority of the intrinsic surface: it generates 35 op modules,
+# against 7 that are hand-written.
 #
 # Needs no CUDA toolkit: `--skip-terminal` is CI's own flag for runners without
 # the recorded CUDA 13.3 ptxas, leaving the pinned llc identity and the exact
@@ -145,12 +147,12 @@ doc-check:
 # `clippy` and `doc-check` already build cuda-bindings, so this recipe needs a
 # CUDA toolkit either way. Machines without even a toolkit get `test`. A driver
 # is no longer required: `test-cuda` shadows the toolkit's libcuda stub itself.
-# `check-guards` covers the status-guard and cargo-deny workflows in full, and
-# `check-intrinsics` the generated-intrinsics job; see their comments for
-# prerequisites. Still CI-only: clippy's per-example pass (one run per example
-# workspace), examples-compile (needs the CUDA codegen backend), and CodeQL. The
-# book gate has a local mirror too, but `just book` stays out of `check` as the
-# one gate needing a Python virtualenv.
+# `check-guards` covers the status-guard, naming-guard and cargo-deny workflows
+# in full, and `check-intrinsics` the generated-intrinsics job; see their
+# comments for prerequisites. Still CI-only: clippy's per-example pass (one run
+# per example workspace), examples-compile (needs the CUDA codegen backend),
+# and CodeQL. The book gate has a local mirror too, but `just book` stays out
+# of `check` as the one gate needing a Python virtualenv.
 # Run CI's gates minus examples-compile, book, CodeQL
 check: fmt-check clippy test test-cuda check-guards check-intrinsics doc-check
 
@@ -205,21 +207,24 @@ check-errors:
     scripts/check-error-example-status.sh
 
 # Every status-guard job (error* examples in STATUS.md, the smoketest example
-# contract, the README crate inventory, toolchain-pin parity, and the book's CLI
-# command reference) plus all three cargo-deny jobs: `cargo deny check` enforces
-# deny.toml over the root workspace's resolved graph and again over
-# crates/rustc-codegen-cuda, which resolves its own because it has its own
-# `[workspace]`; the license inventory covers what both declare; and deny.toml
-# holds over the example workspaces. These were only reachable by reading the
-# workflows, so `just
-# check` could pass while status-guard or cargo-deny failed. Keep this list in
-# step when a guard is added to either workflow -- the crate-inventory and
-# toolchain-parity jobs were added to CI without being added here, which is the
-# same drift this recipe exists to prevent. Prerequisites: `cargo-deny` on PATH
-# (`cargo install cargo-deny --locked`) and `python3` (most of the scripts drive
-# it). The scripts are invoked via `bash` as CI does, since not all of them
-# carry an exec bit.
-# Run the status-guard and cargo-deny CI jobs (needs cargo-deny, python3)
+# contract, the README crate inventory, toolchain-pin parity, the book's CLI
+# command reference, the book's device-API names, the device-only build, and
+# test-matrix coverage),
+# the naming-guard's reserved-prefix search, and all four cargo-deny jobs:
+# `cargo deny check` enforces deny.toml over each non-example `[workspace]`
+# root that resolves third-party crates -- the root workspace,
+# crates/rustc-codegen-cuda, and the cuda-macros device-only fixture, each of
+# which resolves its own graph because each declares its own `[workspace]`;
+# the license inventory covers what the first two declare; deny.toml holds over the example workspaces; and every first-party
+# source file carries an SPDX header. These were only reachable by reading the
+# workflows, so `just check` could pass while status-guard or cargo-deny
+# failed. Keep this list in step when a guard is added to any of the three
+# workflows -- the crate-inventory and toolchain-parity jobs were added to CI
+# without being added here, which is the same drift this recipe exists to
+# prevent. Prerequisites: `cargo-deny` on PATH (`cargo install cargo-deny
+# --locked`) and `python3` (most of the scripts drive it). The scripts are
+# invoked via `bash` as CI does, since not all of them carry an exec bit.
+# Run the status-guard, naming-guard and cargo-deny CI jobs (needs cargo-deny, python3)
 check-guards:
     bash scripts/check-error-example-status.sh
     bash scripts/check-example-smoketest-contract.sh
@@ -229,8 +234,10 @@ check-guards:
     bash scripts/check-book-api-names.sh
     bash scripts/check-reserved-prefixes.sh
     bash scripts/check-device-only-build.sh
+    bash scripts/check-test-matrix-coverage.sh
     cargo deny --locked check
     cargo deny --manifest-path crates/rustc-codegen-cuda/Cargo.toml --locked check
+    cargo deny --manifest-path crates/cuda-macros/tests/device-only/Cargo.toml --locked check
     bash scripts/check-dependency-licenses.sh
     bash scripts/check-example-license-policy.sh
     bash scripts/check-spdx-headers.sh
