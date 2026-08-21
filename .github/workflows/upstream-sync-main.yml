@@ -69,6 +69,11 @@ jobs:
           sub-packages: '["nvcc", "cudart-dev"]'
           non-cuda-sub-packages: '["libcurand-dev"]'
 
+      - name: Restore clean worktree
+        if: steps.compare.outputs.behind_count != '0'
+        shell: bash
+        run: git clean -ffd
+
       - name: Prepare check environment
         if: steps.compare.outputs.behind_count != '0'
         shell: bash
