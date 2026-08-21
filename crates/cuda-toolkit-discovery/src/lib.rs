@@ -367,8 +367,11 @@ mod tests {
     const AARCH64_LINUX_TARGET: &str = "aarch64-unknown-linux-gnu";
 
     #[test]
-    fn windows_default_v13_3_candidates_are_present() {
-        let root = PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3");
+    fn latest_windows_default_candidates_are_present() {
+        let latest = WINDOWS_CUDA_DEFAULT_VERSIONS
+            .first()
+            .expect("Windows default CUDA versions must not be empty");
+        let root = PathBuf::from(WINDOWS_CUDA_DEFAULT_ROOT).join(latest);
         let roots = root_candidates_from_env(Vec::<(OsString, OsString)>::new(), DefaultRoots::All);
 
         assert!(roots.contains(&root));
