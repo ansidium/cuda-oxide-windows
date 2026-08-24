@@ -82,7 +82,7 @@ jobs:
         run: .\target\debug\cargo-oxide.exe setup
 
       - name: Compile vecadd
-        run: .\target\debug\cargo-oxide.exe build vecadd --arch sm_75
+        run: .\target\debug\cargo-oxide.exe build vecadd --materialize-cubin --arch sm_75
 
   windows-cuda-compile:
     name: Windows CUDA compile (manual best effort)
@@ -128,6 +128,13 @@ jobs:
         shell: pwsh
         run: .\.github\scripts\install-libffi.ps1
 
+      - name: Test CUDA discovery and runtime loading
+        shell: pwsh
+        run: |
+          cargo test --locked -p cuda-toolkit-discovery
+          cargo test --locked -p libnvvm-sys -- --ignored
+          cargo test --locked -p nvjitlink-sys -- --ignored
+
       - name: Build cargo-oxide
         run: cargo build --locked -p cargo-oxide
 
@@ -135,7 +142,7 @@ jobs:
         run: .\target\debug\cargo-oxide.exe setup
 
       - name: Compile vecadd
-        run: .\target\debug\cargo-oxide.exe build vecadd --arch sm_75
+        run: .\target\debug\cargo-oxide.exe build vecadd --materialize-cubin --arch sm_75
 
   windows-gpu-smoke:
     name: Windows GPU smoke (self-hosted best effort)
