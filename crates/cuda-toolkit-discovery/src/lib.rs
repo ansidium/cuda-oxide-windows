@@ -16,12 +16,9 @@ use std::{
 
 const ROOT_ENV_VARS: &[&str] = &["CUDA_TOOLKIT_PATH", "CUDA_HOME", "CUDA_PATH"];
 const WINDOWS_CUDA_DEFAULT_ROOT: &str = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA";
-const WINDOWS_CUDA_DEFAULT_VERSIONS: &[&str] = &[
-    "v13.3", "v13.2", "v13.1", "v13.0", "v12.9", "v12.8", "v12.6", "v12.5", "v12.4", "v12.3",
-    "v12.2", "v12.1", "v12.0", "v11.8", "v11.7", "v11.6", "v11.5", "v11.4", "v11.3", "v11.2",
-    "v11.1", "v11.0",
-];
 const LINUX_CUDA_DEFAULT_ROOTS: &[&str] = &["/usr/local/cuda", "/opt/cuda"];
+const LIBNVVM_WINDOWS_PREFIX: &str = "nvvm64_";
+const NVJITLINK_WINDOWS_PREFIX: &str = "nvJitLink_";
 
 /// Candidate CUDA Toolkit include directories, in root discovery order.
 pub fn include_candidates() -> Vec<PathBuf> {
@@ -84,9 +81,17 @@ fn cuda_redistributable_target_dir(target: &str) -> &'static str {
 pub fn libnvvm_dll_candidates(target: &str) -> Vec<PathBuf> {
     let roots = root_candidates(DefaultRoots::for_target(target));
     if is_windows_target(target) {
-        windows_runtime_library_candidates(&roots, &["nvvm64_40_0.dll"], |root| {
-            root.join("nvvm").join("bin").join("x64")
-        })
+        windows_runtime_library_candidates(
+            &roots,
+            &windows_runtime_search_dirs(),
+            LIBNVVM_WINDOWS_PREFIX,
+            |root| {
+                [
+                    root.join("nvvm").join("bin").join("x64"),
+                    root.join("nvvm").join("bin"),
+                ]
+            },
+        )
     } else {
         dedup(
             roots
@@ -103,8 +108,9 @@ pub fn nvjitlink_dll_candidates(target: &str) -> Vec<PathBuf> {
     if is_windows_target(target) {
         windows_runtime_library_candidates(
             &roots,
-            &["nvJitLink_130_0.dll", "nvJitLink_120_0.dll"],
-            |root| root.join("bin").join("x64"),
+            &windows_runtime_search_dirs(),
+            NVJITLINK_WINDOWS_PREFIX,
+            |root| [root.join("bin").join("x64"), root.join("bin")],
         )
     } else {
         dedup(
@@ -156,13 +162,13 @@ pub fn path_dirs_for_runtime(target: &str) -> Vec<PathBuf> {
 enum DefaultRoots {
     All,
     Linux,
-    WindowsThenLinux,
+    Windows,
 }
 
 impl DefaultRoots {
     fn for_target(target: &str) -> Self {
         if is_windows_target(target) {
-            Self::WindowsThenLinux
+            Self::Windows
         } else {
             Self::Linux
         }
@@ -201,15 +207,16 @@ where
     }
 
     match defaults {
-        DefaultRoots::All | DefaultRoots::WindowsThenLinux => {
+        DefaultRoots::All | DefaultRoots::Windows => {
             roots.extend(windows_default_roots());
         }
         DefaultRoots::Linux => {}
     }
     match defaults {
-        DefaultRoots::All | DefaultRoots::WindowsThenLinux | DefaultRoots::Linux => {
+        DefaultRoots::All | DefaultRoots::Linux => {
             roots.extend(LINUX_CUDA_DEFAULT_ROOTS.iter().map(PathBuf::from));
         }
+        DefaultRoots::Windows => {}
     }
 
     dedup(roots)
@@ -244,104 +251,134 @@ fn push_if_not_empty(roots: &mut Vec<PathBuf>, value: &OsStr) {
 
 fn windows_default_roots() -> Vec<PathBuf> {
     let base = PathBuf::from(WINDOWS_CUDA_DEFAULT_ROOT);
-    let mut roots = Vec::new();
-
-    if let Ok(entries) = std::fs::read_dir(&base) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && looks_like_cuda_version_dir(&path) {
-                roots.push(path);
-            }
-        }
-        roots.sort_by(|left, right| compare_cuda_version_paths(right, left));
-    }
-
-    roots.extend(
-        WINDOWS_CUDA_DEFAULT_VERSIONS
-            .iter()
-            .map(|version| base.join(version)),
-    );
-    roots
+    versioned_cuda_roots(&base)
 }
 
-fn windows_runtime_library_candidates<F>(
+fn versioned_cuda_roots(base: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut roots = entries
+        .flatten()
+        .filter_map(|entry| {
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            let version = cuda_version_parts(name)?;
+            Some((version, name.to_ascii_lowercase(), path))
+        })
+        .collect::<Vec<_>>();
+    roots.sort_by(
+        |(left_version, left_name, left_path), (right_version, right_name, right_path)| {
+            right_version
+                .cmp(left_version)
+                .then_with(|| left_name.cmp(right_name))
+                .then_with(|| left_path.cmp(right_path))
+        },
+    );
+    roots.into_iter().map(|(_, _, path)| path).collect()
+}
+
+fn windows_runtime_library_candidates<F, D>(
     roots: &[PathBuf],
-    fallback_names: &[&str],
+    search_dirs: &[PathBuf],
+    file_prefix: &str,
     dir_for_root: F,
 ) -> Vec<PathBuf>
 where
-    F: Fn(&Path) -> PathBuf,
+    F: Fn(&Path) -> D,
+    D: IntoIterator<Item = PathBuf>,
 {
     let mut candidates = Vec::new();
     for root in roots {
-        let dir = dir_for_root(root);
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            let mut files = entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
-                })
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| {
-                            fallback_names.iter().any(|fallback| {
-                                name.eq_ignore_ascii_case(fallback)
-                                    || name_prefix_before_version(name)
-                                        == name_prefix_before_version(fallback)
-                            })
-                        })
-                })
-                .collect::<Vec<_>>();
-            files.sort();
-            candidates.extend(files);
+        for dir in dir_for_root(root) {
+            candidates.extend(versioned_windows_dlls(&dir, file_prefix));
         }
-        candidates.extend(fallback_names.iter().map(|name| dir.join(name)));
+    }
+    for dir in search_dirs {
+        candidates.extend(versioned_windows_dlls(dir, file_prefix));
     }
     dedup(candidates)
 }
 
-fn looks_like_cuda_version_dir(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.strip_prefix('v')
-                .is_some_and(|version| version.split('.').all(|part| part.parse::<u16>().is_ok()))
-        })
+fn windows_runtime_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        dirs.push(current_dir);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dedup(dirs)
 }
 
-fn compare_cuda_version_paths(left: &Path, right: &Path) -> Ordering {
-    version_parts(
-        left.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default(),
-    )
-    .cmp(&version_parts(
-        right
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default(),
-    ))
+fn versioned_windows_dlls(directory: &Path, file_prefix: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .flatten()
+        .filter_map(|entry| {
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            let version = windows_dll_version(name, file_prefix)?;
+            Some((version, name.to_ascii_lowercase(), path))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(
+        |(left_version, left_name, left_path), (right_version, right_name, right_path)| {
+            right_version
+                .cmp(left_version)
+                .then_with(|| left_name.cmp(right_name))
+                .then_with(|| left_path.cmp(right_path))
+        },
+    );
+    files.into_iter().map(|(_, _, path)| path).collect()
 }
 
 fn compare_cuda_path_version_vars(left: &str, right: &str) -> Ordering {
-    version_parts(left).cmp(&version_parts(right))
+    numeric_version_parts(left).cmp(&numeric_version_parts(right))
 }
 
-fn version_parts(value: &str) -> Vec<u16> {
-    value
+fn cuda_version_parts(value: &str) -> Option<Vec<u32>> {
+    let version = value
+        .strip_prefix('v')
+        .or_else(|| value.strip_prefix('V'))?;
+    let parts = version
+        .split('.')
+        .map(str::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (!parts.is_empty()).then_some(parts)
+}
+
+fn windows_dll_version(value: &str, file_prefix: &str) -> Option<Vec<u32>> {
+    let prefix = value.get(..file_prefix.len())?;
+    if !prefix.eq_ignore_ascii_case(file_prefix) {
+        return None;
+    }
+    let version_with_suffix = value.get(file_prefix.len()..)?;
+    let suffix_start = version_with_suffix.len().checked_sub(".dll".len())?;
+    let (version, suffix) = version_with_suffix.split_at(suffix_start);
+    if !suffix.eq_ignore_ascii_case(".dll") {
+        return None;
+    }
+    numeric_version_parts(version)
+}
+
+fn numeric_version_parts(value: &str) -> Option<Vec<u32>> {
+    let parts = value
         .split(|ch: char| !ch.is_ascii_digit())
         .filter(|part| !part.is_empty())
-        .filter_map(|part| part.parse().ok())
-        .collect()
-}
-
-fn name_prefix_before_version(name: &str) -> &str {
-    name.find(|ch: char| ch.is_ascii_digit())
-        .map_or(name, |index| &name[..index])
+        .map(str::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (!parts.is_empty()).then_some(parts)
 }
 
 fn is_windows_target(target: &str) -> bool {
@@ -366,36 +403,107 @@ mod tests {
     const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
     const AARCH64_LINUX_TARGET: &str = "aarch64-unknown-linux-gnu";
 
-    #[test]
-    fn latest_windows_default_candidates_are_present() {
-        let latest = WINDOWS_CUDA_DEFAULT_VERSIONS
-            .first()
-            .expect("Windows default CUDA versions must not be empty");
-        let root = PathBuf::from(WINDOWS_CUDA_DEFAULT_ROOT).join(latest);
-        let roots = root_candidates_from_env(Vec::<(OsString, OsString)>::new(), DefaultRoots::All);
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{now}", std::process::id()))
+    }
 
-        assert!(roots.contains(&root));
-        assert!(include_candidates_from_roots(roots.clone()).contains(&root.join("include")));
-        assert!(
-            cuda_driver_lib_candidates_from_roots(roots.clone(), WINDOWS_TARGET)
-                .contains(&root.join("lib").join("x64"))
+    #[test]
+    fn windows_default_roots_are_discovered_in_numeric_order() {
+        let base = unique_temp_dir("cuda-toolkit-roots");
+        for version in ["v13.9", "v13.10", "v12.99", "not-a-version"] {
+            std::fs::create_dir_all(base.join(version)).expect("create Toolkit root fixture");
+        }
+        std::fs::write(base.join("v99.0"), []).expect("create non-directory fixture");
+
+        let names = versioned_cuda_roots(&base)
+            .into_iter()
+            .map(|path| {
+                path.file_name()
+                    .expect("Toolkit root has a file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["v13.10", "v13.9", "v12.99"]);
+        std::fs::remove_dir_all(base).expect("remove Toolkit root fixture");
+    }
+
+    #[test]
+    fn windows_targets_do_not_inherit_linux_default_roots() {
+        let roots =
+            root_candidates_from_env(Vec::<(OsString, OsString)>::new(), DefaultRoots::Windows);
+
+        for root in LINUX_CUDA_DEFAULT_ROOTS {
+            assert!(!roots.contains(&PathBuf::from(root)));
+        }
+    }
+
+    #[test]
+    fn versioned_cuda_path_variables_are_sorted_numerically() {
+        let roots = root_candidates_from_env(
+            vec![
+                (
+                    OsString::from("CUDA_PATH_V13_9"),
+                    OsString::from(r"D:\CUDA\v13.9"),
+                ),
+                (
+                    OsString::from("CUDA_PATH_V13_10"),
+                    OsString::from(r"D:\CUDA\v13.10"),
+                ),
+            ],
+            DefaultRoots::Windows,
         );
-        assert!(
-            path_dirs_for_runtime_from_roots(roots.clone(), WINDOWS_TARGET)
-                .contains(&root.join("bin"))
+
+        assert_eq!(roots.first(), Some(&PathBuf::from(r"D:\CUDA\v13.10")));
+        assert_eq!(roots.get(1), Some(&PathBuf::from(r"D:\CUDA\v13.9")));
+    }
+
+    #[test]
+    fn windows_dll_scan_is_case_insensitive_and_numeric() {
+        let root = unique_temp_dir("cuda-toolkit-dlls");
+        let directory = root.join("bin").join("x64");
+        std::fs::create_dir_all(&directory).expect("create DLL fixture directory");
+        for name in [
+            "nvJitLink_99_0.dll",
+            "nvJitLink_130_9.dll",
+            "NVJITLINK_130_10.DLL",
+            "not-nvJitLink_999_0.dll",
+        ] {
+            std::fs::write(directory.join(name), []).expect("create DLL fixture");
+        }
+        std::fs::create_dir(directory.join("nvJitLink_999_0.dll"))
+            .expect("create non-file DLL fixture");
+
+        let candidates = windows_runtime_library_candidates(
+            std::slice::from_ref(&root),
+            &[],
+            NVJITLINK_WINDOWS_PREFIX,
+            |root| [root.join("bin").join("x64")],
         );
-        assert!(
-            path_dirs_for_runtime_from_roots(roots.clone(), WINDOWS_TARGET)
-                .contains(&root.join("bin").join("x64"))
+        let names = candidates
+            .into_iter()
+            .map(|path| {
+                path.file_name()
+                    .expect("DLL candidate has a file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            [
+                "NVJITLINK_130_10.DLL",
+                "nvJitLink_130_9.dll",
+                "nvJitLink_99_0.dll",
+            ]
         );
-        assert!(
-            path_dirs_for_runtime_from_roots(roots.clone(), WINDOWS_TARGET)
-                .contains(&root.join("nvvm").join("bin").join("x64"))
-        );
-        assert!(
-            libdevice_candidates_from_roots(roots)
-                .contains(&root.join("nvvm").join("libdevice").join("libdevice.10.bc"))
-        );
+        std::fs::remove_dir_all(root).expect("remove DLL fixture");
     }
 
     #[test]
@@ -451,7 +559,7 @@ mod tests {
 
     #[test]
     fn cuda_path_only_is_first_root() {
-        let cuda_path = OsString::from(r"D:\NVIDIA\CUDA\v13.3");
+        let cuda_path = OsString::from(r"D:\NVIDIA\CUDA\current");
         let roots = root_candidates_from_env(
             vec![(OsString::from("CUDA_PATH"), cuda_path.clone())],
             DefaultRoots::All,
@@ -460,7 +568,7 @@ mod tests {
         assert_eq!(roots.first(), Some(&PathBuf::from(cuda_path)));
         assert_eq!(
             include_candidates_from_roots(roots).first(),
-            Some(&PathBuf::from(r"D:\NVIDIA\CUDA\v13.3").join("include"))
+            Some(&PathBuf::from(r"D:\NVIDIA\CUDA\current").join("include"))
         );
     }
 
@@ -492,7 +600,7 @@ mod tests {
 
     #[test]
     fn spaces_in_cuda_root_are_preserved() {
-        let root = PathBuf::from(r"D:\CUDA Toolkit Installs\v13.3");
+        let root = PathBuf::from(r"D:\CUDA Toolkit Installs\current");
         let roots = root_candidates_from_env(
             vec![(OsString::from("CUDA_PATH"), root.clone().into_os_string())],
             DefaultRoots::All,
@@ -509,10 +617,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_runtime_dirs_cover_toolkit_layouts() {
+        let root = PathBuf::from(r"D:\CUDA Toolkit Installs\current");
+        let candidates = path_dirs_for_runtime_from_roots(vec![root.clone()], WINDOWS_TARGET);
+
+        assert_eq!(
+            candidates,
+            [
+                root.join("bin"),
+                root.join("bin").join("x64"),
+                root.join("nvvm").join("bin").join("x64"),
+            ]
+        );
+    }
+
     fn libnvvm_dll_candidates_from_roots(roots: Vec<PathBuf>, target: &str) -> Vec<PathBuf> {
         if is_windows_target(target) {
-            windows_runtime_library_candidates(&roots, &["nvvm64_40_0.dll"], |root| {
-                root.join("nvvm").join("bin").join("x64")
+            windows_runtime_library_candidates(&roots, &[], LIBNVVM_WINDOWS_PREFIX, |root| {
+                [
+                    root.join("nvvm").join("bin").join("x64"),
+                    root.join("nvvm").join("bin"),
+                ]
             })
         } else {
             dedup(
@@ -526,11 +652,9 @@ mod tests {
 
     fn nvjitlink_dll_candidates_from_roots(roots: Vec<PathBuf>, target: &str) -> Vec<PathBuf> {
         if is_windows_target(target) {
-            windows_runtime_library_candidates(
-                &roots,
-                &["nvJitLink_130_0.dll", "nvJitLink_120_0.dll"],
-                |root| root.join("bin").join("x64"),
-            )
+            windows_runtime_library_candidates(&roots, &[], NVJITLINK_WINDOWS_PREFIX, |root| {
+                [root.join("bin").join("x64"), root.join("bin")]
+            })
         } else {
             dedup(
                 roots

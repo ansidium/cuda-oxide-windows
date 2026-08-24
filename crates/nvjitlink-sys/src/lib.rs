@@ -14,13 +14,13 @@
 //!
 //! [`LibNvJitLink::load`] tries (in order):
 //! 1. `LIBNVJITLINK_PATH` env var, if set.
-//! 2. Platform loader names (`libnvJitLink.so.13`, `libnvJitLink.so.12`,
-//!    `libnvJitLink.so` on Linux; discovered `nvJitLink_*.dll` files on
-//!    Windows).
-//! 3. CUDA Toolkit roots from `cuda-toolkit-discovery`, including
+//! 2. CUDA Toolkit roots and runtime search directories from
+//!    `cuda-toolkit-discovery`, including
 //!    `<root>/lib64/libnvJitLink.so` on Linux and
 //!    `<root>/bin/x64/nvJitLink_*.dll` / `<root>/bin/nvJitLink_*.dll` on
 //!    Windows.
+//! 3. Platform loader names (`libnvJitLink.so.13`, `libnvJitLink.so.12`,
+//!    `libnvJitLink.so`) on Linux.
 //!
 //! # Symbol naming
 //!
@@ -43,10 +43,16 @@
 
 use libloading::Library;
 use std::borrow::Cow;
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::time::SystemTime;
@@ -290,11 +296,11 @@ impl LibNvJitLink {
     /// Load nvJitLink while retaining an exact, fingerprintable descriptor
     /// when the platform supports it.
     ///
-    /// This is intended for a process-wide pinned linker cache handle. On
-    /// Linux it opens the concrete library before `dlopen` and retains that
-    /// descriptor so callers can fingerprint the selected file. Callers must
-    /// retain the returned `LibNvJitLink` for the process lifetime and restart
-    /// to change toolkits. General callers should use [`LibNvJitLink::load`].
+    /// This is intended for a process-wide pinned linker cache handle. It
+    /// retains a descriptor for the exact file selected by the platform loader
+    /// so callers can fingerprint it. Callers must retain the returned
+    /// `LibNvJitLink` for the process lifetime and restart to change toolkits.
+    /// General callers should use [`LibNvJitLink::load`].
     #[doc(hidden)]
     pub fn load_for_cache() -> Result<Self, NvJitLinkError> {
         Self::load_inner(true)
@@ -677,6 +683,42 @@ fn try_log(
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsFileTime {
+    low: u32,
+    high: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsFileInformation {
+    attributes: u32,
+    creation_time: WindowsFileTime,
+    last_access_time: WindowsFileTime,
+    last_write_time: WindowsFileTime,
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> Option<(u32, u64)> {
+    let mut information = std::mem::MaybeUninit::<WindowsFileInformation>::uninit();
+    let succeeded =
+        unsafe { get_file_information_by_handle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return None;
+    }
+    let information = unsafe { information.assume_init() };
+    let file_index =
+        (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
+    Some((information.volume_serial_number, file_index))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct LibraryFileIdentity {
     len: u64,
@@ -687,18 +729,21 @@ struct LibraryFileIdentity {
     inode: u64,
     #[cfg(unix)]
     change_time: (i64, i64),
+    #[cfg(windows)]
+    volume_serial_number: u32,
+    #[cfg(windows)]
+    file_index: u64,
 }
 
 impl LibraryFileIdentity {
     fn capture_file(file: &File) -> Option<Self> {
-        Self::from_metadata(&file.metadata().ok()?)
-    }
-
-    fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        let metadata = file.metadata().ok()?;
         let modified = metadata.modified().ok()?;
 
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
+        #[cfg(windows)]
+        let (volume_serial_number, file_index) = windows_file_identity(file)?;
 
         Some(Self {
             len: metadata.len(),
@@ -709,6 +754,10 @@ impl LibraryFileIdentity {
             inode: metadata.ino(),
             #[cfg(unix)]
             change_time: (metadata.ctime(), metadata.ctime_nsec()),
+            #[cfg(windows)]
+            volume_serial_number,
+            #[cfg(windows)]
+            file_index,
         })
     }
 
@@ -718,10 +767,10 @@ impl LibraryFileIdentity {
 
     #[cfg(test)]
     fn matches_path(&self, path: &Path) -> bool {
-        path.metadata()
+        File::open(path)
             .ok()
             .as_ref()
-            .and_then(Self::from_metadata)
+            .and_then(Self::capture_file)
             .as_ref()
             == Some(self)
     }
@@ -738,22 +787,14 @@ struct OpenedLibrary {
 enum LibraryCandidate {
     Path(PathBuf),
     LoaderName(&'static str),
-    SearchPattern {
-        dir: Option<PathBuf>,
-        pattern: &'static str,
-    },
 }
 
+#[cfg(test)]
 impl LibraryCandidate {
     fn description(&self) -> String {
         match self {
             Self::Path(path) => path.display().to_string(),
             Self::LoaderName(name) => (*name).to_string(),
-            Self::SearchPattern {
-                dir: Some(dir),
-                pattern,
-            } => dir.join(pattern).display().to_string(),
-            Self::SearchPattern { dir: None, pattern } => (*pattern).to_string(),
         }
     }
 }
@@ -788,15 +829,6 @@ fn open_library_from_candidates(
                     });
                 }
             }
-            LibraryCandidate::SearchPattern { dir, pattern } => {
-                tried.push(candidate.description());
-                for path in matching_files(dir.as_deref(), pattern) {
-                    tried.push(path.display().to_string());
-                    if let Some(opened) = open_library_path(&path, retain_exact_file) {
-                        return Some(opened);
-                    }
-                }
-            }
         }
     }
 
@@ -828,39 +860,6 @@ fn platform_library_candidates(
     candidates: &mut Vec<LibraryCandidate>,
     discovered_paths: &[PathBuf],
 ) {
-    candidates.push(LibraryCandidate::SearchPattern {
-        dir: None,
-        pattern: "nvJitLink_*.dll",
-    });
-
-    for path in discovered_paths {
-        let Some(parent) = path.parent() else {
-            continue;
-        };
-        push_candidate_once(
-            candidates,
-            LibraryCandidate::SearchPattern {
-                dir: Some(parent.to_path_buf()),
-                pattern: "nvJitLink_*.dll",
-            },
-        );
-
-        if parent
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("x64"))
-            && let Some(bin_dir) = parent.parent()
-        {
-            push_candidate_once(
-                candidates,
-                LibraryCandidate::SearchPattern {
-                    dir: Some(bin_dir.to_path_buf()),
-                    pattern: "nvJitLink_*.dll",
-                },
-            );
-        }
-    }
-
     for path in discovered_paths {
         push_candidate_once(candidates, LibraryCandidate::Path(path.clone()));
     }
@@ -871,16 +870,16 @@ fn platform_library_candidates(
     candidates: &mut Vec<LibraryCandidate>,
     discovered_paths: &[PathBuf],
 ) {
+    for path in discovered_paths {
+        push_candidate_once(candidates, LibraryCandidate::Path(path.clone()));
+    }
+
     for soname in [
         "libnvJitLink.so.13",
         "libnvJitLink.so.12",
         "libnvJitLink.so",
     ] {
-        candidates.push(LibraryCandidate::LoaderName(soname));
-    }
-
-    for path in discovered_paths {
-        push_candidate_once(candidates, LibraryCandidate::Path(path.clone()));
+        push_candidate_once(candidates, LibraryCandidate::LoaderName(soname));
     }
 }
 
@@ -888,65 +887,6 @@ fn push_candidate_once(candidates: &mut Vec<LibraryCandidate>, candidate: Librar
     if !candidates.contains(&candidate) {
         candidates.push(candidate);
     }
-}
-
-fn matching_files(dir: Option<&Path>, pattern: &str) -> Vec<PathBuf> {
-    let mut matches = Vec::new();
-    let Some((prefix, suffix)) = pattern.split_once('*') else {
-        return matches;
-    };
-
-    for dir in search_dirs(dir) {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if wildcard_match(file_name, prefix, suffix) {
-                matches.push(path);
-            }
-        }
-    }
-
-    matches.sort_by(|a, b| b.file_name().cmp(&a.file_name()).then_with(|| b.cmp(a)));
-    matches.dedup();
-    matches
-}
-
-fn wildcard_match(file_name: &str, prefix: &str, suffix: &str) -> bool {
-    #[cfg(windows)]
-    {
-        let file_name = file_name.to_ascii_lowercase();
-        let prefix = prefix.to_ascii_lowercase();
-        let suffix = suffix.to_ascii_lowercase();
-        file_name.starts_with(&prefix) && file_name.ends_with(&suffix)
-    }
-
-    #[cfg(not(windows))]
-    {
-        file_name.starts_with(prefix) && file_name.ends_with(suffix)
-    }
-}
-
-fn search_dirs(dir: Option<&Path>) -> Vec<PathBuf> {
-    if let Some(dir) = dir {
-        return vec![dir.to_path_buf()];
-    }
-
-    let mut dirs = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        dirs.push(cwd);
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        dirs.extend(std::env::split_paths(&path));
-    }
-    dirs
 }
 
 fn target_triple_hint() -> &'static str {
@@ -957,8 +897,60 @@ fn target_triple_hint() -> &'static str {
     }
 }
 
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "GetFileInformationByHandle"]
+    fn get_file_information_by_handle(
+        file: *mut c_void,
+        information: *mut WindowsFileInformation,
+    ) -> i32;
+
+    #[link_name = "GetModuleFileNameW"]
+    fn get_module_file_name_w(module: isize, filename: *mut u16, size: u32) -> u32;
+}
+
+#[cfg(windows)]
+fn windows_module_path(module: isize) -> Option<PathBuf> {
+    const MAX_PATH_CHARS: usize = 32_768;
+    let mut capacity = 256;
+
+    loop {
+        let mut buffer = vec![0_u16; capacity];
+        let copied = unsafe {
+            get_module_file_name_w(
+                module,
+                buffer.as_mut_ptr(),
+                u32::try_from(buffer.len()).ok()?,
+            )
+        } as usize;
+        if copied == 0 {
+            return None;
+        }
+        if copied < buffer.len() {
+            buffer.truncate(copied);
+            return Some(PathBuf::from(OsString::from_wide(&buffer)));
+        }
+        if capacity == MAX_PATH_CHARS {
+            return None;
+        }
+        capacity = (capacity * 2).min(MAX_PATH_CHARS);
+    }
+}
+
+#[cfg(windows)]
+fn open_windows_library(path: &Path) -> Option<(Library, PathBuf)> {
+    use libloading::os::windows::Library as WindowsLibrary;
+
+    let native = unsafe { WindowsLibrary::new(path) }.ok()?;
+    let handle = native.into_raw();
+    let loaded_path = windows_module_path(handle);
+    let native = unsafe { WindowsLibrary::from_raw(handle) };
+    loaded_path.map(|path| (native.into(), path))
+}
+
 fn open_library_path(path: &Path, retain_exact_file: bool) -> Option<OpenedLibrary> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     let _ = retain_exact_file;
     #[cfg(target_os = "linux")]
     let canonical_path = path.canonicalize().ok();
@@ -984,6 +976,33 @@ fn open_library_path(path: &Path, retain_exact_file: bool) -> Option<OpenedLibra
         }
     }
 
+    #[cfg(windows)]
+    if retain_exact_file
+        && let Ok(canonical_path) = path.canonicalize()
+        && let Ok(file) = File::open(&canonical_path)
+        && file.metadata().is_ok_and(|metadata| metadata.is_file())
+        && let Some(identity) = LibraryFileIdentity::capture_file(&file)
+        && let Some((lib, loaded_path)) = open_windows_library(&canonical_path)
+    {
+        // Windows cannot load through a retained file descriptor. Verify that
+        // the module handle and the pre-opened descriptor identify the same file.
+        let loaded_path_matches = File::open(loaded_path)
+            .ok()
+            .is_some_and(|loaded_file| identity.matches_file(&loaded_file));
+        if loaded_path_matches && identity.matches_file(&file) {
+            return Some(OpenedLibrary {
+                library: lib,
+                loaded_file: Some(file),
+                loaded_identity: Some(identity),
+            });
+        }
+        return Some(OpenedLibrary {
+            library: lib,
+            loaded_file: None,
+            loaded_identity: None,
+        });
+    }
+
     let lib = unsafe { Library::new(path) }.ok()?;
     Some(OpenedLibrary {
         library: lib,
@@ -999,7 +1018,6 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use libloading::Symbol;
-    use std::fs;
 
     fn candidate_descriptions(
         override_path: Option<PathBuf>,
@@ -1010,14 +1028,6 @@ mod tests {
             .iter()
             .map(LibraryCandidate::description)
             .collect()
-    }
-
-    fn unique_temp_dir(prefix: &str) -> PathBuf {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX_EPOCH")
-            .as_nanos();
-        std::env::temp_dir().join(format!("{prefix}-{}-{now}", std::process::id()))
     }
 
     #[test]
@@ -1034,31 +1044,12 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_candidates_include_loader_and_toolkit_patterns() {
+    fn windows_candidates_use_discovered_paths_directly() {
         let root = PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0");
         let discovered = vec![root.join("bin").join("x64").join("nvJitLink_130_0.dll")];
         let descriptions = candidate_descriptions(None, &discovered, false);
 
-        assert!(descriptions.contains(&"nvJitLink_*.dll".to_string()));
-        assert!(
-            descriptions.contains(
-                &root
-                    .join("bin")
-                    .join("x64")
-                    .join("nvJitLink_*.dll")
-                    .display()
-                    .to_string()
-            )
-        );
-        assert!(
-            descriptions.contains(
-                &root
-                    .join("bin")
-                    .join("nvJitLink_*.dll")
-                    .display()
-                    .to_string()
-            )
-        );
+        assert_eq!(descriptions, [discovered[0].display().to_string()]);
     }
 
     #[cfg(not(windows))]
@@ -1068,10 +1059,13 @@ mod tests {
         let discovered = vec![root.join("lib64/libnvJitLink.so")];
         let descriptions = candidate_descriptions(None, &discovered, false);
 
-        assert_eq!(descriptions[0], "libnvJitLink.so.13");
-        assert_eq!(descriptions[1], "libnvJitLink.so.12");
-        assert_eq!(descriptions[2], "libnvJitLink.so");
-        assert!(descriptions.contains(&root.join("lib64/libnvJitLink.so").display().to_string()));
+        assert_eq!(
+            descriptions[0],
+            root.join("lib64/libnvJitLink.so").display().to_string()
+        );
+        assert_eq!(descriptions[1], "libnvJitLink.so.13");
+        assert_eq!(descriptions[2], "libnvJitLink.so.12");
+        assert_eq!(descriptions[3], "libnvJitLink.so");
     }
 
     #[test]
@@ -1080,25 +1074,6 @@ mod tests {
         let descriptions = candidate_descriptions(None, std::slice::from_ref(&path), true);
 
         assert_eq!(descriptions[0], path.display().to_string());
-    }
-
-    #[test]
-    fn wildcard_scan_finds_versioned_dlls_without_glob_dependency() {
-        let dir = unique_temp_dir("nvjitlink-sys-dll-scan");
-        fs::create_dir_all(&dir).expect("create temp dll scan dir");
-        fs::write(dir.join("nvJitLink_120_0.dll"), []).expect("write old dll");
-        fs::write(dir.join("nvJitLink_130_0.dll"), []).expect("write new dll");
-        fs::write(dir.join("not-nvJitLink_130_0.dll"), []).expect("write nonmatch");
-
-        let matches = matching_files(Some(&dir), "nvJitLink_*.dll");
-        let names: Vec<_> = matches
-            .iter()
-            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-
-        assert_eq!(names, ["nvJitLink_130_0.dll", "nvJitLink_120_0.dll"]);
-
-        fs::remove_dir_all(dir).expect("remove temp dll scan dir");
     }
 
     #[test]
@@ -1144,6 +1119,17 @@ mod tests {
 
         drop(library);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cache_loader_retains_loaded_module_file() {
+        let system_root = std::env::var_os("SystemRoot").expect("SystemRoot is defined");
+        let library_path = PathBuf::from(system_root).join("System32/version.dll");
+        let opened = open_library_path(&library_path, true).expect("load version.dll");
+
+        assert!(opened.loaded_file.is_some());
+        assert!(opened.loaded_identity.is_some());
     }
 
     #[cfg(target_os = "linux")]
@@ -1373,7 +1359,8 @@ mod tests {
     #[test]
     #[ignore = "requires an installed CUDA Toolkit with nvJitLink"]
     fn installed_toolkit_rejects_unknown_options_with_unrecognized_option() {
-        let library = LibNvJitLink::load().expect("load nvJitLink");
+        let library = LibNvJitLink::load_for_cache().expect("load nvJitLink");
+        assert!(library.loaded_file_if_unchanged().is_some());
         let Err(error) = Linker::new(&library, &["-arch=sm_86", "-cuda-oxide-unknown-option"])
         else {
             panic!("nvJitLink accepts only documented options");
