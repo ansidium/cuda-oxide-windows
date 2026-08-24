@@ -72,6 +72,13 @@ jobs:
         shell: pwsh
         run: .\.github\scripts\install-libffi.ps1
 
+      - name: Test CUDA discovery and runtime loading
+        shell: pwsh
+        run: |
+          cargo test --locked -p cuda-toolkit-discovery
+          cargo test --locked -p libnvvm-sys -- --ignored
+          cargo test --locked -p nvjitlink-sys -- --ignored
+
       - name: Build cargo-oxide
         run: cargo build --locked -p cargo-oxide
 
