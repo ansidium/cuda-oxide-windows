@@ -180,6 +180,8 @@ pub const CALLEE_COSH_F64: &str = placeholder!("coshf64");
 pub const CALLEE_TANH_F32: &str = placeholder!("tanhf32");
 /// Placeholder call used for `f64::tanh` / `std::sys::cmath::tanh`.
 pub const CALLEE_TANH_F64: &str = placeholder!("tanhf64");
+// Keep placeholders for inverse hyperbolics whether `std` lowers them through
+// pure-Rust formulas or `std::sys::cmath` shims.
 /// Placeholder call used for `f32::asinh` / `std::sys::cmath::asinhf`.
 pub const CALLEE_ASINH_F32: &str = placeholder!("asinhf32");
 /// Placeholder call used for `f64::asinh` / `std::sys::cmath::asinh`.
@@ -227,6 +229,43 @@ pub const CALLEE_FREM_FAST: &str = placeholder!("frem_fast");
 /// Lowers to an LLVM `select`; the "unpredictable" branch-weight hint has
 /// no device semantics and is dropped.
 pub const CALLEE_SELECT_UNPREDICTABLE: &str = placeholder!("select_unpredictable");
+
+/// Return whether `callee` is one of the exact internal Rust-intrinsic
+/// placeholders understood by MIR lowering.
+///
+/// Do not replace this with a prefix check. The reserved prefix identifies
+/// malformed or future placeholders too; accepting those as an external call
+/// would let an unknown pseudo-call bypass its source-level signature rules.
+pub fn is_known_placeholder(callee: &str) -> bool {
+    is_libdevice_backed_placeholder(callee)
+        || is_backend_dependent_libdevice_placeholder(callee)
+        || matches!(
+            callee,
+            CALLEE_ROTATE_LEFT
+                | CALLEE_ROTATE_RIGHT
+                | CALLEE_CTPOP
+                | CALLEE_CTLZ
+                | CALLEE_CTLZ_NONZERO
+                | CALLEE_CTTZ
+                | CALLEE_CTTZ_NONZERO
+                | CALLEE_BSWAP
+                | CALLEE_BITREVERSE
+                | CALLEE_SATURATING_ADD
+                | CALLEE_SATURATING_SUB
+                | CALLEE_EXACT_DIV
+                | CALLEE_CARRYING_MUL_ADD
+                | CALLEE_MAXNUM_NSZ_F32
+                | CALLEE_MAXNUM_NSZ_F64
+                | CALLEE_MINNUM_NSZ_F32
+                | CALLEE_MINNUM_NSZ_F64
+                | CALLEE_FADD_FAST
+                | CALLEE_FSUB_FAST
+                | CALLEE_FMUL_FAST
+                | CALLEE_FDIV_FAST
+                | CALLEE_FREM_FAST
+                | CALLEE_SELECT_UNPREDICTABLE
+        )
+}
 
 /// Return whether an internal placeholder lowers to a CUDA libdevice call
 /// under every intrinsic backend.
@@ -467,6 +506,7 @@ mod tests {
     #[test]
     fn libdevice_placeholder_classification_is_exact_and_disjoint() {
         for callee in ALWAYS_LIBDEVICE {
+            assert!(is_known_placeholder(callee));
             assert!(
                 is_libdevice_backed_placeholder(callee),
                 "expected `{callee}` to require libdevice on every backend"
@@ -478,6 +518,7 @@ mod tests {
         }
 
         for callee in LIBNVVM_ONLY_LIBDEVICE {
+            assert!(is_known_placeholder(callee));
             assert!(
                 is_backend_dependent_libdevice_placeholder(callee),
                 "expected `{callee}` to require libdevice only under libNVVM"
@@ -489,6 +530,11 @@ mod tests {
         }
 
         for callee in NEVER_LIBDEVICE {
+            if callee.starts_with(PLACEHOLDER_PREFIX)
+                && *callee != "__cuda_oxide_rust_intrinsic_unknown"
+            {
+                assert!(is_known_placeholder(callee));
+            }
             assert!(
                 !is_libdevice_backed_placeholder(callee),
                 "expected `{callee}` not to require libdevice"
@@ -498,5 +544,8 @@ mod tests {
                 "expected `{callee}` not to be backend-dependent libdevice"
             );
         }
+
+        assert!(!is_known_placeholder("__cuda_oxide_rust_intrinsic_unknown"));
+        assert!(!is_known_placeholder("__nv_sinf"));
     }
 }

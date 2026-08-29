@@ -190,7 +190,7 @@ llc-21 --version | grep nvptx
 ```
 
 You should see a line containing `nvptx64` in the registered targets. The
-pipeline auto-discovers `llc-22` and `llc-21` in that order; pin a specific
+pipeline auto-discovers `llc-23`, `llc-22`, and `llc-21` in that order; pin a specific
 binary with `CUDA_OXIDE_LLC=/usr/bin/llc-21` if needed.
 
 :::{warning}
@@ -392,7 +392,7 @@ If everything is configured correctly, this compiles a Rust kernel to PTX, launc
 :::{tip}
 **Common issues:**
 
-- `No working llc-21 or llc-22 found on PATH` -- prefer `rustup component add llvm-tools --toolchain stable`, or install LLVM 21+ (`sudo apt install llvm-21`), add `/usr/lib/llvm-21/bin` to your `PATH`, or set `CUDA_OXIDE_LLC=/usr/bin/llc-21`.
+- `No working llc found` -- prefer `rustup component add llvm-tools --toolchain stable`, or install LLVM 21+ (`sudo apt install llvm-21`), add `/usr/lib/llvm-21/bin` to your `PATH`, or set `CUDA_OXIDE_LLC=/usr/bin/llc-21`.
 - `'stddef.h' file not found` when building host `cuda-bindings` -- install clang dev headers: `sudo apt install clang-21` (or `libclang-common-21-dev`).
 - `cuda.h not found` -- Set `CUDA_TOOLKIT_PATH` to your CUDA install root, or ensure `/usr/local/cuda/include/cuda.h` exists.
 - `rust-src` / `llvm-tools` component missing -- Run `rustup component add rust-src llvm-tools --toolchain stable`.

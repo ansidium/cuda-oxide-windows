@@ -88,7 +88,7 @@ one-shot fix for older clones. The pipeline auto-detects this `llc` at
 
 If you would rather use a system LLVM (for a specific patch level, or
 because you already have one installed), the pipeline falls back to
-`llc-22` / `llc-21` on `PATH`. LLVM 21 is the minimum — earlier releases
+`llc-23` / `llc-22` / `llc-21` on `PATH`. LLVM 21 is the minimum — earlier releases
 reject the TMA / tcgen05 / WGMMA intrinsic signatures that cuda-oxide
 emits.
 
@@ -117,7 +117,7 @@ To pin a specific binary (rustup's, a distro's, or a custom build), set
 
 1. `$CUDA_OXIDE_LLC` (if set)
 2. The Rust toolchain's `llvm-tools` llc
-3. `llc-22`, then `llc-21`, then bare `llc` on `PATH`
+3. `llc-23`, then `llc-22`, then `llc-21`, then bare `llc` on `PATH`
 
 ```{note}
 Older `llc` binaries (LLVM 20 and earlier) will compile simpler kernels when
@@ -281,10 +281,11 @@ cuda-oxide/
 
 `llc` not found or missing NVPTX
 : The fastest fix is `rustup component add llvm-tools` — the pinned
-  toolchain's `llc` is LLVM 22 with NVPTX enabled and is auto-picked up.
+  toolchain's `llc` is LLVM 23 with NVPTX enabled and is auto-picked up.
   Otherwise install a system LLVM 21+ (`sudo apt install llvm-21`); the
-  pipeline probes the rustup `llc` first, then `llc-22` → `llc-21` on
-  `PATH`. To pin a specific binary set `CUDA_OXIDE_LLC=/path/to/llc`.
+  pipeline probes the rustup `llc` first, then `llc-23` → `llc-22` →
+  `llc-21` on `PATH`. To pin a specific binary set
+  `CUDA_OXIDE_LLC=/path/to/llc`.
 
 `Intrinsic has incorrect argument type!` (from `llc`)
 : Your `llc` is older than LLVM 21 and cannot lower the modern TMA / tcgen05

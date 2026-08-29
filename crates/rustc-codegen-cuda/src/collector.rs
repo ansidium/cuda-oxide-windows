@@ -1050,7 +1050,7 @@ impl<'tcx> DeviceCollector<'tcx> {
             let has_mir = self.tcx.is_mir_available(def_id)
                 || matches!(
                     func.instance.def,
-                    InstanceKind::Shim(ShimKind::DropGlue(..))
+                    InstanceKind::Shim(ShimKind::DropGlue(..) | ShimKind::FnPtrAddr(..))
                 );
             if has_mir {
                 // Use instance_mir for monomorphized MIR.
@@ -1379,6 +1379,9 @@ impl<'tcx> DeviceCollector<'tcx> {
         //   Caller: cuda_oxide_kernel_<hash>_scale::<f32> (args = [f32])
         //   Call in MIR: scale<T>(...)  (args = [T])
         //   After substitution: scale::<f32> (args = [f32])
+        //
+        // Stable rustc exposes these built-MIR FnDef args directly. Substitute
+        // the caller's still-generic early-bound parameters below.
         let args = self.tcx.instantiate_and_normalize_erasing_regions(
             caller.instance.args,
             TypingEnv::fully_monomorphized(),
@@ -1510,7 +1513,8 @@ impl<'tcx> DeviceCollector<'tcx> {
         // bodies (e.g. for array/slice element drops) are collected.
         if !matches!(
             resolved.def,
-            InstanceKind::Item(_) | InstanceKind::Shim(ShimKind::DropGlue(..))
+            InstanceKind::Item(_)
+                | InstanceKind::Shim(ShimKind::DropGlue(..) | ShimKind::FnPtrAddr(..))
         ) {
             return;
         }
@@ -1626,7 +1630,13 @@ impl<'tcx> DeviceCollector<'tcx> {
         // Skip functions without MIR bodies (extern intrinsics like cuda_device::threadIdx_x).
         // These are handled specially by the terminator translator in mir-importer
         // which dispatches them to NVVM intrinsic operations.
-        if !self.tcx.is_mir_available(resolved.def_id()) {
+        //
+        // Compiler-built function-pointer shims have no HIR body either, so
+        // `is_mir_available` is false for their def_id, but `instance_mir`
+        // synthesises their body; do not skip those.
+        if !self.tcx.is_mir_available(resolved.def_id())
+            && !matches!(resolved.def, InstanceKind::Shim(ShimKind::FnPtrAddr(..)))
+        {
             if self.verbose {
                 eprintln!(
                     "[collector] Skipping extern/intrinsic (no MIR): {}",
@@ -1694,6 +1704,9 @@ impl<'tcx> DeviceCollector<'tcx> {
                 ("closure", instance)
             }
             TyKind::FnDef(fn_def_id, fn_args) => {
+                // Stable rustc exposes the fully monomorphized FnDef args
+                // directly at this point.
+                let fn_args = *fn_args;
                 let Some(instance) =
                     Instance::try_resolve(self.tcx, typing_env, *fn_def_id, fn_args)
                         .ok()

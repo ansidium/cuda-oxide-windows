@@ -54,9 +54,11 @@
 //! `cargo-oxide` binary and the cached source untouched. The stale `.so` then
 //! loads against the wrong driver and fails with a cryptic
 //! `librustc_driver-<hash>.so: cannot open shared object file`. To catch this
-//! we record the active toolchain fingerprint (`rustc -vV`) next to the cached
-//! `.so` at build time and compare it on every lookup; a recorded fingerprint
-//! that differs from the active toolchain forces a pinned-source re-fetch and rebuild.
+//! we record the fingerprint (`rustc -vV`) of the toolchain that built the
+//! `.so` (resolved from the backend source directory, exactly like the build
+//! command itself) next to the cached `.so`, and compare it on every lookup
+//! against the toolchain active in the user's cwd; a recorded fingerprint
+//! that differs from the active toolchain forces a fresh re-clone and rebuild.
 //! This check has the highest precedence, since a toolchain mismatch makes the
 //! cached `.so` unloadable regardless of mtimes. A cache predating the
 //! fingerprint file defers to the mtime checks (a `cargo-oxide` reinstall or
@@ -70,6 +72,20 @@
 //! the OS releases the lock when its handle or process closes, so a crashed
 //! writer cannot poison the cache. Every new holder double-checks the cache
 //! after acquiring the lock before deciding whether to rebuild it.
+//!
+//! ## Non-convergent toolchain mismatches
+//!
+//! Re-cloning can only heal a mismatch when upstream's pin agrees with the
+//! user's active compiler.
+//! When the user's project and the backend source genuinely pin DIFFERENT
+//! toolchains, every rebuild re-records the same mismatching fingerprint and a
+//! naive retry loops on a multi-minute cold rebuild per invocation. To stop
+//! that, each heal attempt first records the (active, recorded) fingerprint
+//! pair in a marker file next to the cached `.so`; if the very same pair
+//! mismatches again after a rebuild, the lookup reports both toolchain
+//! identities with guidance and exits instead of rebuilding. Any lookup that
+//! passes the fingerprint check deletes the marker, so a genuinely healed
+//! cache clears the memory.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -250,16 +266,25 @@ fn find_or_build_cached_backend(cache_dir: &Path, backend_filename: &str) -> Pat
         } else {
             let source_dir = source_root.join("crates/rustc-codegen-cuda");
             match cached_backend_status(&cached_backend, Some(&source_dir)) {
-                CacheStatus::Fresh => return cached_backend,
-                CacheStatus::StaleVsBinary => invalidate_cache(cache_dir, backend_filename),
-                CacheStatus::StaleVsToolchain => {
-                    eprintln!(
-                        "Cached backend was built against a different Rust \
-                         toolchain; re-fetching pinned source and rebuilding at {}.",
-                        cache_dir.display()
-                    );
-                    invalidate_cache(cache_dir, backend_filename);
+                CacheStatus::Fresh => {
+                    clear_heal_marker(cache_dir);
+                    return cached_backend;
                 }
+                CacheStatus::StaleVsBinary => invalidate_cache(cache_dir, backend_filename),
+                CacheStatus::StaleVsToolchain => match toolchain_heal_decision(cache_dir) {
+                    ToolchainHealDecision::Heal => {
+                        eprintln!(
+                            "Cached backend was built against a different Rust \
+                             toolchain; re-fetching pinned source and rebuilding at {}.",
+                            cache_dir.display()
+                        );
+                        invalidate_cache(cache_dir, backend_filename);
+                    }
+                    ToolchainHealDecision::GiveUp { current, recorded } => {
+                        report_unhealable_toolchain_mismatch(&current, &recorded);
+                        std::process::exit(1);
+                    }
+                },
                 CacheStatus::StaleVsSource => {
                     // The pinned checkout is still the exact source of truth,
                     // so rebuild the library from it in place.
@@ -397,8 +422,39 @@ const TOOLCHAIN_FINGERPRINT_FILE: &str = "toolchain-fingerprint.txt";
 /// output (release, commit-hash, host, LLVM version). The cached backend `.so`
 /// links against this toolchain's `librustc_driver`, so any change here means
 /// the cache can no longer be loaded.
+///
+/// "Active" means resolved from the process working directory, i.e. the
+/// toolchain the APPLICATION build (which loads the `.so`) will use. The
+/// fingerprint RECORDED next to the `.so` must instead come from
+/// [`toolchain_fingerprint_in`] with the backend build directory: rustup's
+/// `rustc` proxy resolves `rust-toolchain.toml` by walking up from the cwd,
+/// and the backend builds with `current_dir = <source clone>` whose nested
+/// pin can differ from the user's cwd.
 fn current_toolchain_fingerprint() -> Option<String> {
-    let output = Command::new("rustc").args(["-vV"]).output().ok()?;
+    fingerprint_from_command(toolchain_fingerprint_command(None))
+}
+
+/// The fingerprint of the toolchain rustup resolves FROM `build_dir`: the
+/// toolchain `backend_build_command` actually builds the `.so` with (same
+/// cwd, inherited env, so `RUSTUP_TOOLCHAIN` and the directory's
+/// `rust-toolchain.toml` resolve identically).
+fn toolchain_fingerprint_in(build_dir: &Path) -> Option<String> {
+    fingerprint_from_command(toolchain_fingerprint_command(Some(build_dir)))
+}
+
+/// `rustc -vV`, optionally resolved from `build_dir` instead of the process
+/// working directory. Split out so tests can assert the resolution cwd.
+fn toolchain_fingerprint_command(build_dir: Option<&Path>) -> Command {
+    let mut cmd = Command::new("rustc");
+    cmd.args(["-vV"]);
+    if let Some(dir) = build_dir {
+        cmd.current_dir(dir);
+    }
+    cmd
+}
+
+fn fingerprint_from_command(mut cmd: Command) -> Option<String> {
+    let output = cmd.output().ok()?;
     output
         .status
         .success()
@@ -428,13 +484,115 @@ fn toolchain_fingerprint_mismatch(cache_dir: &Path) -> bool {
     }
 }
 
-/// Records the active toolchain fingerprint next to the cached `.so`. Best
+/// Records the fingerprint of the toolchain THAT BUILT the backend (resolved
+/// from `build_dir`, the backend source crate) next to the cached `.so`. Best
 /// effort: a write failure just means the next run re-detects a mismatch and
 /// rebuilds again.
-fn write_toolchain_fingerprint(cache_dir: &Path) {
-    if let Some(fp) = current_toolchain_fingerprint() {
+///
+/// Recording the user's-cwd toolchain here instead would be a bug: when the
+/// user's project pins a different nightly than the source clone, the cached
+/// `.so` (linked against the clone's `librustc_driver`) would carry the
+/// project's fingerprint, `toolchain_fingerprint_mismatch` would compare the
+/// project toolchain against itself and never fire, and every application
+/// build would loop on "couldn't load codegen backend" with no self-heal.
+fn write_toolchain_fingerprint(cache_dir: &Path, build_dir: &Path) {
+    if let Some(fp) = toolchain_fingerprint_in(build_dir) {
         let _ = std::fs::write(cache_dir.join(TOOLCHAIN_FINGERPRINT_FILE), fp);
     }
+}
+
+/// File next to the cached `.so` recording the (active, recorded) fingerprint
+/// pair that triggered the most recent toolchain heal attempt (re-clone +
+/// rebuild). Survives [`invalidate_cache`] on purpose: it is the memory that
+/// tells the NEXT lookup whether that heal converged.
+const TOOLCHAIN_HEAL_MARKER_FILE: &str = "toolchain-heal-attempt.txt";
+
+/// What the `StaleVsToolchain` arm of the cache lookup should do.
+#[derive(Debug, PartialEq, Eq)]
+enum ToolchainHealDecision {
+    /// First mismatch for this (active, recorded) pair: invalidate and
+    /// rebuild. This is the legitimate self-heal case, e.g. upstream main
+    /// moved to the nightly the user's project just pinned.
+    Heal,
+    /// A previous heal attempt already re-cloned and rebuilt for this exact
+    /// pair and the mismatch persisted: the user's project pin and the
+    /// backend source's nested pin genuinely differ, so rebuilding again
+    /// would cold-rebuild for minutes on every invocation, forever.
+    GiveUp { current: String, recorded: String },
+}
+
+/// Decides whether a `StaleVsToolchain` cache may attempt another heal, and
+/// records the mismatch pair before approving one so the next IDENTICAL
+/// mismatch is recognized as non-convergent. Conservative: when either
+/// fingerprint cannot be read, always heal (the pre-guard behavior); the
+/// marker write is best effort, a failure just means one more heal attempt.
+fn toolchain_heal_decision(cache_dir: &Path) -> ToolchainHealDecision {
+    let (Some(current), Ok(recorded)) = (
+        current_toolchain_fingerprint(),
+        std::fs::read_to_string(cache_dir.join(TOOLCHAIN_FINGERPRINT_FILE)),
+    ) else {
+        return ToolchainHealDecision::Heal;
+    };
+    let recorded = recorded.trim().to_string();
+    let marker = heal_marker_content(&current, &recorded);
+    if std::fs::read_to_string(cache_dir.join(TOOLCHAIN_HEAL_MARKER_FILE))
+        .is_ok_and(|stored| stored == marker)
+    {
+        return ToolchainHealDecision::GiveUp { current, recorded };
+    }
+    let _ = std::fs::write(cache_dir.join(TOOLCHAIN_HEAL_MARKER_FILE), marker);
+    ToolchainHealDecision::Heal
+}
+
+/// Serialized form of a heal-attempt pair. Compared as a whole string, so it
+/// needs no parsing on the way back in.
+fn heal_marker_content(current: &str, recorded: &str) -> String {
+    format!("active toolchain:\n{current}\n\nrecorded toolchain:\n{recorded}\n")
+}
+
+/// Forgets any recorded heal attempt. Called whenever the cached fingerprint
+/// check passes, so a healed cache does not short-circuit a future mismatch.
+fn clear_heal_marker(cache_dir: &Path) {
+    let _ = std::fs::remove_file(cache_dir.join(TOOLCHAIN_HEAL_MARKER_FILE));
+}
+
+/// One compact identity line (release + commit hash) out of a full
+/// `rustc -vV` fingerprint, for the non-convergence report.
+fn toolchain_identity_line(fingerprint: &str) -> String {
+    let field = |prefix: &str| {
+        fingerprint
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or("unknown")
+    };
+    format!(
+        "release {} (commit-hash {})",
+        field("release: "),
+        field("commit-hash: ")
+    )
+}
+
+/// The repeated-mismatch report: both toolchain identities plus what to do
+/// about it. The caller exits afterwards; rebuilding cannot converge.
+fn report_unhealable_toolchain_mismatch(current: &str, recorded: &str) {
+    eprintln!(
+        "Error: the cached cuda-oxide backend was already re-cloned and rebuilt \
+         for this exact toolchain mismatch, and rebuilding it again cannot fix it:"
+    );
+    eprintln!(
+        "  your project resolves:  {}",
+        toolchain_identity_line(current)
+    );
+    eprintln!(
+        "  the backend built with: {}",
+        toolchain_identity_line(recorded)
+    );
+    eprintln!(
+        "Your project's rust-toolchain.toml pins a different nightly than the \
+         cuda-oxide backend source it depends on. Align the pins (and run \
+         `cargo oxide update` after changing them), or point CUDA_OXIDE_BACKEND \
+         at a backend built with your project's toolchain."
+    );
 }
 
 /// Returns the newest mtime among the backend source inputs under
@@ -524,6 +682,23 @@ pub fn refresh_cached_backend() -> PathBuf {
 /// Builds the backend from a local source tree.
 pub fn build_backend_from_source(codegen_crate: &Path) -> PathBuf {
     println!("Building rustc-codegen-cuda backend...");
+    // The application build still honors these (codegen_env.rs folds them
+    // into the composed flags), so say once why the backend build does not.
+    let ambient_flags_present = [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+    ]
+    .iter()
+    .any(|var| std::env::var(var).is_ok_and(|value| !value.trim().is_empty()));
+    if ambient_flags_present {
+        println!(
+            "  note: ambient RUSTFLAGS are ignored for the backend dylib (its \
+             digest keys every build cache); they still apply to application \
+             builds. For custom backend flags, build crates/rustc-codegen-cuda \
+             manually and point CUDA_OXIDE_BACKEND at the result."
+        );
+    }
 
     let host_target = active_host_target();
     let rustc_sysroot = get_rustc_sysroot();
@@ -591,6 +766,14 @@ fn backend_build_command(
     // host-tuple` makes Cargo compile the dylib for the running toolchain.
     cmd.env("CARGO_TARGET_DIR", &target_dir);
     cmd.env_remove("CARGO_BUILD_TARGET");
+
+    // Keep application rustflags out of the backend dylib: its digest keys the
+    // application cache, so ambient flags would create unstable identities.
+    // An empty encoded value also overrides target/config rustflags that
+    // cannot be removed directly from this process environment.
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", "");
+    cmd.env_remove("RUSTFLAGS");
+    cmd.env_remove("CARGO_BUILD_RUSTFLAGS");
 
     if platform::is_windows_target(host_target) {
         prefer_windows_lld_linker_for_backend(&mut cmd);
@@ -870,7 +1053,7 @@ fn auto_fetch_and_build(cache_dir: &Path, backend_filename: &str) -> PathBuf {
     let codegen_crate = src_dir.join("crates/rustc-codegen-cuda");
     let built_backend = build_backend_from_source(&codegen_crate);
     if built_backend.exists() {
-        install_backend_into(cache_dir, backend_filename, &built_backend)
+        install_backend_into(cache_dir, backend_filename, &built_backend, &codegen_crate)
             .expect("Failed to copy backend to cache");
         eprintln!("✓ Backend cached at {}", backend_path.display());
     }
@@ -1040,12 +1223,15 @@ fn fetch_source_at_revision(
 /// swap, so the next lookup would load a backend linked against the wrong
 /// `librustc_driver`.
 ///
-/// Takes the directory explicitly so it can be exercised without touching
-/// `CARGO_HOME`.
+/// Takes the directories explicitly so it can be exercised without touching
+/// `CARGO_HOME`. `build_dir` is the backend source crate the `.so` was built
+/// in; the recorded fingerprint is resolved from there (see
+/// [`write_toolchain_fingerprint`]).
 fn install_backend_into(
     cache_dir: &Path,
     backend_filename: &str,
     built_backend: &Path,
+    build_dir: &Path,
 ) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(cache_dir)?;
     let backend_path = cache_dir.join(backend_filename);
@@ -1057,7 +1243,7 @@ fn install_backend_into(
     if !source_is_destination {
         std::fs::copy(built_backend, &backend_path)?;
     }
-    write_toolchain_fingerprint(cache_dir);
+    write_toolchain_fingerprint(cache_dir, build_dir);
     Ok(backend_path)
 }
 
@@ -1072,11 +1258,11 @@ fn install_backend_into(
 /// Returns `None` when the cache directory cannot be determined or the copy
 /// fails. Callers treat this as best effort: a failure leaves the in-repo build
 /// usable and costs external projects only a rebuild.
-pub fn publish_to_cache(built_backend: &Path) -> Option<PathBuf> {
+pub fn publish_to_cache(built_so: &Path, codegen_crate: &Path) -> Option<PathBuf> {
     let cache_dir = cache_directory()?;
     let backend_filename = backend_filename_for_target(&active_host_target());
     with_locked_backend_cache(&cache_dir, |locked_cache_dir| {
-        install_backend_into(locked_cache_dir, &backend_filename, built_backend)
+        install_backend_into(locked_cache_dir, &backend_filename, built_so, codegen_crate)
     })
     .ok()?
     .ok()
@@ -1277,6 +1463,25 @@ mod tests {
         let cargo_build_target = command
             .get_envs()
             .find_map(|(key, value)| (key == OsStr::new("CARGO_BUILD_TARGET")).then_some(value));
+        // Ambient flags must not alter the backend bits, or the identity cfg
+        // digest forks every application unit's cache slot. The empty-but-set
+        // CARGO_ENCODED_RUSTFLAGS is what silences the sources env_remove
+        // cannot reach (CARGO_TARGET_<TRIPLE>_RUSTFLAGS, config-file
+        // [build]/[target.*] rustflags).
+        let encoded = command.get_envs().find_map(|(key, value)| {
+            (key == OsStr::new("CARGO_ENCODED_RUSTFLAGS")).then_some(value)
+        });
+        assert_eq!(
+            encoded,
+            Some(Some(OsStr::new(""))),
+            "CARGO_ENCODED_RUSTFLAGS must be set to the empty string"
+        );
+        for scrubbed in ["RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"] {
+            let entry = command
+                .get_envs()
+                .find_map(|(key, value)| (key == OsStr::new(scrubbed)).then_some(value));
+            assert_eq!(entry, Some(None), "{scrubbed} must be scrubbed");
+        }
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -1747,6 +1952,65 @@ mod tests {
         );
     }
 
+    /// The recorded fingerprint must come from the toolchain that BUILT the
+    /// backend. `backend_build_command` runs cargo with
+    /// `current_dir = <codegen crate>`, so rustup resolves the nested
+    /// `rust-toolchain.toml` there; the fingerprint command must resolve from
+    /// the same directory. Fingerprinting the user's-cwd rustc instead records
+    /// a fingerprint that can never match the `.so`, so the
+    /// `StaleVsToolchain` guard never fires and every application build loops
+    /// on "couldn't load codegen backend".
+    #[test]
+    fn fingerprint_command_resolves_from_the_build_dir() {
+        let command = toolchain_fingerprint_command(Some(Path::new("/tmp/codegen")));
+        assert_eq!(command.get_program(), OsStr::new("rustc"));
+        assert_eq!(
+            command.get_current_dir(),
+            Some(Path::new("/tmp/codegen")),
+            "must resolve rustup's rust-toolchain.toml from the backend build dir"
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["-vV"]);
+
+        // The application-side check keeps resolving from the process cwd.
+        let command = toolchain_fingerprint_command(None);
+        assert_eq!(command.get_current_dir(), None);
+    }
+
+    /// Behavioral proof that resolution honors the build dir: a build dir
+    /// pinning a toolchain that cannot resolve must defeat fingerprinting
+    /// (and thus `write_toolchain_fingerprint` writes nothing), even though
+    /// the process cwd still resolves fine. Skipped when `rustc` is not a
+    /// rustup proxy (resolution is then cwd-insensitive by construction).
+    #[test]
+    fn fingerprint_resolution_follows_the_build_dir_pin_not_the_cwd() {
+        if current_toolchain_fingerprint().is_none() {
+            return; // no rustc here; nothing to observe
+        }
+        let dir = tempdir();
+        std::fs::write(
+            dir.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"cuda-oxide-nonexistent-test-toolchain\"\n",
+        )
+        .unwrap();
+        let pinned = toolchain_fingerprint_in(&dir);
+        if pinned.is_some() {
+            return; // not a rustup proxy; the pin cannot influence resolution
+        }
+
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        write_toolchain_fingerprint(&cache, &dir);
+        assert!(
+            !cache.join(TOOLCHAIN_FINGERPRINT_FILE).exists(),
+            "the recorded fingerprint must be resolved from the build dir, \
+             not from the process cwd"
+        );
+    }
+
     /// Installing must leave both the `.so` and the toolchain fingerprint in
     /// the cache. A `.so` written without a fingerprint defers to the mtime
     /// checks, which cannot see a toolchain swap, so the next lookup would
@@ -1760,8 +2024,8 @@ mod tests {
 
         let cache = dir.join("cache");
         let backend_filename = "backend.bin";
-        let installed =
-            install_backend_into(&cache, backend_filename, &source).expect("install must succeed");
+        let installed = install_backend_into(&cache, backend_filename, &source, &dir)
+            .expect("install must succeed");
 
         assert_eq!(
             installed,
@@ -1798,8 +2062,8 @@ mod tests {
         let source = dir.join("built.so");
         std::fs::write(&source, b"fresh").unwrap();
 
-        let installed =
-            install_backend_into(&cache, backend_filename, &source).expect("install must succeed");
+        let installed = install_backend_into(&cache, backend_filename, &source, &dir)
+            .expect("install must succeed");
 
         assert_eq!(
             std::fs::read(&installed).unwrap(),
@@ -1820,8 +2084,8 @@ mod tests {
         let source = cache.join(backend_filename);
         std::fs::write(&source, b"built").unwrap();
 
-        let installed =
-            install_backend_into(&cache, backend_filename, &source).expect("install must succeed");
+        let installed = install_backend_into(&cache, backend_filename, &source, &dir)
+            .expect("install must succeed");
 
         assert_eq!(installed, source);
         assert_eq!(std::fs::read(&installed).unwrap(), b"built");
@@ -1911,6 +2175,78 @@ mod tests {
             cached_backend_status(&so, None),
             CacheStatus::StaleVsToolchain,
             "toolchain mismatch must win over binary staleness"
+        );
+    }
+
+    /// The heal guard must short-circuit a REPEATED identical mismatch pair:
+    /// the first `StaleVsToolchain` verdict for a pair heals (recording the
+    /// pair first), the second identical one gives up instead of re-cloning
+    /// and cold-rebuilding on every invocation forever. A pair that changed
+    /// (a different recorded fingerprint after a rebuild) is a fresh
+    /// mismatch and must heal again.
+    #[test]
+    fn repeated_identical_toolchain_mismatch_gives_up_instead_of_rebuilding() {
+        let Some(current) = current_toolchain_fingerprint() else {
+            return; // no rustc here; nothing to observe
+        };
+        let dir = tempdir();
+        let first_recorded = "rustc 0.0.0 (deadbeef 1970-01-01)\nrelease: 0.0.0";
+        std::fs::write(dir.join(TOOLCHAIN_FINGERPRINT_FILE), first_recorded).unwrap();
+
+        assert_eq!(
+            toolchain_heal_decision(&dir),
+            ToolchainHealDecision::Heal,
+            "the FIRST mismatch for a pair is the legitimate self-heal case"
+        );
+        assert!(
+            dir.join(TOOLCHAIN_HEAL_MARKER_FILE).exists(),
+            "a heal attempt must be recorded before the rebuild runs"
+        );
+
+        assert_eq!(
+            toolchain_heal_decision(&dir),
+            ToolchainHealDecision::GiveUp {
+                current: current.clone(),
+                recorded: first_recorded.to_string(),
+            },
+            "the SAME pair after a heal attempt cannot converge; it must stop rebuilding"
+        );
+
+        // A rebuild that changed the recorded fingerprint (e.g. the source
+        // clone advanced to a new pin) is a NEW mismatch: heal once more.
+        std::fs::write(
+            dir.join(TOOLCHAIN_FINGERPRINT_FILE),
+            "rustc 0.0.1 (cafef00d 1970-01-02)",
+        )
+        .unwrap();
+        assert_eq!(
+            toolchain_heal_decision(&dir),
+            ToolchainHealDecision::Heal,
+            "a changed mismatch pair must get its own heal attempt"
+        );
+    }
+
+    /// A cache lookup that passes the fingerprint check must delete the heal
+    /// marker: a genuinely healed cache forgets the old mismatch, so a
+    /// future, unrelated mismatch gets its own one-shot heal attempt instead
+    /// of being short-circuited by stale memory.
+    #[test]
+    fn clear_heal_marker_forgets_a_successful_heal() {
+        let Some(fp) = current_toolchain_fingerprint() else {
+            return; // no rustc here; nothing to assert
+        };
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        write_with_mtime(&so, b"built", SystemTime::now() + year);
+        std::fs::write(dir.join(TOOLCHAIN_FINGERPRINT_FILE), fp).unwrap();
+        std::fs::write(dir.join(TOOLCHAIN_HEAL_MARKER_FILE), "stale heal memory").unwrap();
+
+        assert_eq!(cached_backend_status(&so, None), CacheStatus::Fresh);
+        clear_heal_marker(&dir);
+        assert!(
+            !dir.join(TOOLCHAIN_HEAL_MARKER_FILE).exists(),
+            "a passing fingerprint check must clear the heal marker"
         );
     }
 

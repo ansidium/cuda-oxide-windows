@@ -272,6 +272,8 @@ impl RustFloatMathIntrinsic {
             "std::sys::cmath::cosh" => Some(Self::CoshF64),
             "std::sys::cmath::tanhf" => Some(Self::TanhF32),
             "std::sys::cmath::tanh" => Some(Self::TanhF64),
+            // Accept both current and future `std::sys::cmath` shims for
+            // inverse hyperbolics; some toolchains still use pure-Rust formulas.
             "std::sys::cmath::asinhf" => Some(Self::AsinhF32),
             "std::sys::cmath::asinh" => Some(Self::AsinhF64),
             "std::sys::cmath::acoshf" => Some(Self::AcoshF32),
@@ -674,6 +676,7 @@ pub fn emit_rust_float_math_intrinsic(
         args,
         destination,
         return_type,
+        None,
         target,
         block_ptr,
         prev_op,

@@ -234,7 +234,7 @@ sudo ./llvm.sh 21
 llc-21 --version | grep nvptx
 ```
 
-The pipeline prefers `llc` in Rust toolchain, and auto-discovers `llc-22` and `llc-21` on `PATH` (in that order).
+The pipeline prefers `llc` in Rust toolchain, and auto-discovers `llc-23`, `llc-22`, and `llc-21` on `PATH` (in that order).
 To pin a specific binary, set `CUDA_OXIDE_LLC=/usr/bin/llc-21`.
 
 > We emit TMA / tcgen05 / WGMMA intrinsics that `llc` from LLVM 20 and earlier can't handle.
@@ -320,6 +320,7 @@ cargo oxide run gemm_sol_final
 | `cuda-core`         | Safe RAII wrappers (`CudaContext`, `CudaStream`, `DeviceBuffer<T>`, ...)  |
 | `cuda-async`        | Async execution layer (`DeviceOperation`, `DeviceFuture`, `DeviceBox<T>`) |
 | `libnvvm-sys`       | `dlopen` bindings to libNVVM (used by `cuda-host::ltoir`)                 |
+| `cuda-target-spec`  | Shared CUDA target parsing and recorded LLVM PTX-floor policy             |
 | `nvjitlink-sys`     | `dlopen` bindings to nvJitLink (used by `cuda-host::ltoir`)               |
 | `ptx-parse`         | Lossless structural views over PTX source text                            |
 

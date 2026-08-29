@@ -10,5 +10,6 @@ readme = "README.md"
 
 [dependencies]
 cuda-toolkit-discovery = { workspace = true }
+cuda-target-spec = { workspace = true }
 libloading = { workspace = true }
 thiserror = { workspace = true }

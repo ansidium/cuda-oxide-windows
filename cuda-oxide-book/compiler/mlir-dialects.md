@@ -164,8 +164,8 @@ pliron operation, and the types map directly to LLVM's type system. The
 dialect itself (ops, types, attributes, op-interfaces) is defined upstream in
 the `pliron-llvm` crate; cuda-oxide consumes it and re-exports it through the
 thin `llvm-export` crate, which also carries the textual `.ll` exporter and a
-few GPU-specific extensions (named address spaces, a syncscope enum, fp16 bit
-helpers) that pliron-llvm does not ship.
+few GPU-specific extensions (named address spaces, fp16 bit helpers) that
+pliron-llvm does not ship.
 
 ### Types
 
@@ -296,11 +296,11 @@ they become `call` instructions to `@llvm.nvvm.*` intrinsics.
 
 ### Architecture Coverage
 
-At catalog SHA-256 `90f843cc` (the stamp in every `ops/generated/` file
+At catalog SHA-256 `49bcd626` (the stamp in every `ops/generated/` file
 header), the dialect holds 575 operations across 42 modules, and they come
 from two different places. The split is the first thing to know about it,
 because it decides where -- and whether -- you would add one. If the header
-stamp no longer starts with `90f843cc`, the counts on this page predate the
+stamp no longer starts with `49bcd626`, the counts on this page predate the
 catalog you are reading.
 
 **Hand-written**, directly under `crates/dialect-nvvm/src/ops/`. These are the

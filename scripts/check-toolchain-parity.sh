@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 ROOT_PIN=rust-toolchain.toml
 NESTED_PIN=crates/rustc-codegen-cuda/rust-toolchain.toml
-SCAFFOLD=crates/cargo-oxide/src/commands.rs
+SCAFFOLD=crates/cargo-oxide/src/commands/scaffold.rs
 DEVCONTAINER=.devcontainer/devcontainer.json
 
 command -v git >/dev/null 2>&1
@@ -69,7 +69,7 @@ if missing:
     sys.exit(f"{root_path} is missing components: {' '.join(missing)}")
 
 scaffold = read(scaffold_path)
-source = 'include_str!("../../../rust-toolchain.toml")'
+source = 'include_str!("../../../../rust-toolchain.toml")'
 if source not in scaffold:
     sys.exit(f"{scaffold_path} must include the root toolchain file")
 if re.search(r'const RUST_TOOLCHAIN_TOML: &str = r#"', scaffold):
