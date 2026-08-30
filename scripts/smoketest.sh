@@ -79,12 +79,9 @@ NVVM_VERIFY_EXAMPLES=(cp_async_small device_global enum_constant_provenance ex2_
 ERROR_EXAMPLES=(error error_set_discriminant_uninhabited error_enum_bool_payload_addr error_enum_pointer_overlap error_enum_shared_pointer_layout error_heap_alloc error_kernel_shared_param error_missing_device_attr error_generated_intrinsic_abi error_generated_intrinsic_unknown_id error_generated_intrinsic_fn_pointer error_generated_intrinsic_callable)
 
 # Per-example rustc flags policy: an example that needs a special rustc flag
-# (e.g. disjoint_slice_len needs -Zinline-mir=no to keep its regression
-# pattern un-inlined) must carry it in its own Cargo.toml via the nightly
-# `profile-rustflags` feature, scoped to its own package. Never route such a
-# flag through RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS here: cargo keys build
-# caches on rustflags, so a global flag forks a full second dependency-tree
-# build (~160s on the CI runner) for that one example.
+# carries it in `package.metadata.cuda-oxide.extra-rustflags`. cargo-oxide
+# reads that stable Cargo metadata for the selected example; smoketest must
+# not hardcode its own RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS override.
 
 # Examples whose `main` deliberately never launches a kernel: they exist to
 # prove the device code compiles, and say so in their module docs

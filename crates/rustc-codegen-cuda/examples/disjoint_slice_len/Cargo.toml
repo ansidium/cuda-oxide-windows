@@ -1,10 +1,11 @@
-cargo-features = ["profile-rustflags"]
-
 [package]
 name = "disjoint_slice_len"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+
+[package.metadata.cuda-oxide]
+extra-rustflags = ["-Zinline-mir=no"]
 
 [workspace]
 
@@ -14,11 +15,5 @@ cuda-host = { path = "../../../cuda-host" }
 cuda-core = { path = "../../../cuda-core" }
 
 # The mir-importer intercepts `DisjointSlice::len` only when rustc's MIR
-# inliner leaves the call intact; at default release settings the call is
-# inlined into the kernel and the issue #343 pattern this example guards
-# disappears. Scoping the flag to this one crate keeps the guard while the
-# shared dependency tree stays identical to every other example. (A global
-# RUSTFLAGS entry re-keys every dependency unit and forces a full second
-# dependency-tree build in CI.)
-[profile.release.package.disjoint_slice_len]
-rustflags = ["-Zinline-mir=no"]
+# inliner leaves the call intact. cargo-oxide reads this package metadata and
+# applies the flag only to this example's codegen invocation.

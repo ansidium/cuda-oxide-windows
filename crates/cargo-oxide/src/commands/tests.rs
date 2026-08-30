@@ -1671,6 +1671,41 @@ fn encoded_rustflags_preserve_configured_flag_boundaries_and_spaces() {
 }
 
 #[test]
+fn package_metadata_parser_loads_scoped_rustflags() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cargo_oxide_package_flags_test_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"
+[package]
+name = "package-flags-test"
+version = "0.1.0"
+
+[package.metadata.cuda-oxide]
+extra-rustflags = ["--cfg", "model=\"alpha beta\""]
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&root);
+    assert_eq!(
+        package_extra_rustflags(&cmd).unwrap(),
+        ["--cfg", "model=\"alpha beta\""]
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn encoded_rustflags_remove_legacy_global_codegen_fingerprints() {
     let encoded = [
         "--cfg",

@@ -33,9 +33,12 @@ fn build_encoded_rustflags(
     ctx: &Context,
     profile: CodegenProfilePolicy,
     device_cfgs: &[String],
+    package_rustflags: &[String],
 ) -> String {
     let existing_encoded = std::env::var("CARGO_ENCODED_RUSTFLAGS").ok();
     let existing = std::env::var("RUSTFLAGS").ok();
+    let mut configured_rustflags = ctx.config.extra_rustflags.clone();
+    configured_rustflags.extend(package_rustflags.iter().cloned());
     let mut explicit_rustflags = Vec::new();
     for cfg in device_cfgs {
         explicit_rustflags.push("--cfg".to_string());
@@ -44,11 +47,52 @@ fn build_encoded_rustflags(
     build_encoded_rustflags_with_existing(
         &ctx.backend_so,
         profile,
-        &ctx.config.extra_rustflags,
+        &configured_rustflags,
         &explicit_rustflags,
         existing_encoded.as_deref(),
         existing.as_deref(),
     )
+}
+
+pub(super) fn package_extra_rustflags(cmd: &Command) -> Result<Vec<String>, String> {
+    let Some(current_dir) = cmd.get_current_dir() else {
+        return Ok(Vec::new());
+    };
+    let manifest_path = current_dir.join("Cargo.toml");
+    if !manifest_path.is_file() {
+        return Ok(Vec::new());
+    }
+
+    let source = std::fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("could not read {}: {error}", manifest_path.display()))?;
+    let manifest: toml::Value = toml::from_str(&source)
+        .map_err(|error| format!("could not parse {}: {error}", manifest_path.display()))?;
+    let Some(value) = manifest
+        .get("package")
+        .and_then(|value| value.get("metadata"))
+        .and_then(|value| value.get("cuda-oxide"))
+        .and_then(|value| value.get("extra-rustflags"))
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!(
+            "package.metadata.cuda-oxide.extra-rustflags in {} must be an array of strings",
+            manifest_path.display()
+        ));
+    };
+
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                format!(
+                    "package.metadata.cuda-oxide.extra-rustflags in {} must be an array of strings",
+                    manifest_path.display()
+                )
+            })
+        })
+        .collect()
 }
 
 pub(super) fn build_encoded_rustflags_with_existing(
@@ -191,13 +235,15 @@ fn apply_codegen_rustflags(
     ctx: &Context,
     profile: CodegenProfilePolicy,
     device_cfgs: &[String],
-) {
-    let mut encoded = build_encoded_rustflags(ctx, profile, device_cfgs);
+) -> Result<(), String> {
+    let package_rustflags = package_extra_rustflags(cmd)?;
+    let mut encoded = build_encoded_rustflags(ctx, profile, device_cfgs, &package_rustflags);
     let inherited_debug = std::env::var("CUDA_OXIDE_DEBUG").ok();
     append_full_debug_mir_rustflag(&mut encoded, cmd, inherited_debug.as_deref());
 
     cmd.env("CARGO_ENCODED_RUSTFLAGS", encoded)
         .env_remove("RUSTFLAGS");
+    Ok(())
 }
 
 /// Apply the two deliberately different Cargo cache boundaries:
@@ -217,7 +263,7 @@ pub(super) fn apply_codegen_configuration(
     global_cfgs.push(format!("{BACKEND_IDENTITY_CFG}=\"{backend_digest}\""));
     global_cfgs.extend(user_device_cfgs.iter().cloned());
 
-    apply_codegen_rustflags(cmd, ctx, profile, &global_cfgs);
+    apply_codegen_rustflags(cmd, ctx, profile, &global_cfgs)?;
     cmd.env(CODEGEN_FINGERPRINT_ENV, codegen_fingerprint);
     Ok(())
 }

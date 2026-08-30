@@ -23,22 +23,21 @@ value through that one pointer layer before extracting its length.
 
 The interceptor only sees the call when rustc's MIR inliner leaves it intact.
 At default release settings rustc inlines `len()` into the kernel and the
-pattern disappears. This example therefore disables MIR inlining for its own
-crate via `profile-rustflags` in its `Cargo.toml`:
+pattern disappears. This example therefore declares an extra rustc flag in
+its stable-compatible package metadata:
 
 ```toml
-[profile.release.package.disjoint_slice_len]
-rustflags = ["-Zinline-mir=no"]
+[package.metadata.cuda-oxide]
+extra-rustflags = ["-Zinline-mir=no"]
 ```
 
 Before the fix, every build of this example failed with the verification
 error above. After the fix, it compiles and runs identically to an inlined
 build.
 
-The flag is scoped to this one package on purpose: a global
-`RUSTFLAGS="-Zinline-mir=no"` re-keys every dependency unit and forces a
-full second dependency-tree build, while the guarded MIR pattern lives only
-in this crate's kernel (MIR inlining rewrites the caller).
+`cargo oxide` reads this metadata and applies the flag only when building this
+example. Direct Cargo commands such as `cargo fmt`, `cargo metadata`, and
+`cargo clippy` continue to work on the stable toolchain.
 
 ## What the kernel checks
 

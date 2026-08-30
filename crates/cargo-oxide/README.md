@@ -446,6 +446,16 @@ flags in boundary-preserving `CARGO_ENCODED_RUSTFLAGS`. Required compiler flags
 are applied last so inherited settings cannot replace the cuda-oxide backend or
 disable its correctness-critical codegen options.
 
+A package that needs rustc flags only for its own cuda-oxide invocation can
+declare them in stable Cargo metadata:
+
+```toml
+[package.metadata.cuda-oxide]
+extra-rustflags = ["-Zinline-mir=no"]
+```
+
+Package flags follow project defaults and precede inherited or explicit flags.
+
 ## Architecture
 
 ```text
