@@ -205,7 +205,9 @@ pub(super) fn render_compat_sparse_mma(catalog: &CatalogFile, hash: &str) -> Str
         assert_eq!(path, &format!("cuda_device::wmma::{}", record.rust.name));
         assert!(matches!(
             mma.adapter,
-            SparseMmaAdapter::C2U32A4U32B4U32MetadataU32SelectorU32ToD2U32
+            SparseMmaAdapter::C2U32A2U32B2U32MetadataU32SelectorU32ToD2U32
+                | SparseMmaAdapter::C2U32A4U32B4U32MetadataU32SelectorU32ToD2U32
+                | SparseMmaAdapter::C4F32A2U32B2U32MetadataU32SelectorU32ToD4F32
                 | SparseMmaAdapter::C4F32A4U32B4U32MetadataU32SelectorU32ToD4F32
                 | SparseMmaAdapter::C4I32A2U32B2U32MetadataU32SelectorU32ToD4I32
                 | SparseMmaAdapter::C4I32A4U32B4U32MetadataU32SelectorU32ToD4I32
@@ -1770,6 +1772,10 @@ pub(super) fn render_compat_mbarrier_basic(catalog: &CatalogFile, hash: &str) ->
                 "/// The barrier must be initialized, and this arrival must be included in the current phase's expected count.\n\
                  /// Use the returned token only with this barrier and phase.\n",
             ),
+            MbarrierBasicOperation::ArriveNoComplete => output.push_str(
+                "/// The barrier must be initialized. `count` must be a valid PTX arrival count and this operation must not complete the current phase.\n\
+                 /// Use the returned opaque state only with this barrier and phase.\n",
+            ),
             MbarrierBasicOperation::TestWait => output.push_str(
                 "/// The barrier must be initialized. `token` must come from this barrier and phase.\n",
             ),
@@ -1797,6 +1803,15 @@ pub(super) fn render_compat_mbarrier_basic(catalog: &CatalogFile, hash: &str) ->
                 )
                 .unwrap();
                 output.push_str("    let _ = bar;\n");
+            }
+            MbarrierBasicOperation::ArriveNoComplete => {
+                writeln!(
+                    output,
+                    "pub unsafe fn {}(bar: *const Barrier, count: u32) -> u64 {{",
+                    record.rust.name
+                )
+                .unwrap();
+                output.push_str("    let _ = (bar, count);\n");
             }
             MbarrierBasicOperation::TestWait => {
                 writeln!(

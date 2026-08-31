@@ -8,12 +8,11 @@ use crate::generated::GeneratedModuleRequirements;
 use crate::llvm_tools::LlvmToolchain;
 use crate::options::BackendOptions;
 use crate::target::{
-    ModuleRequirements, detect_module_requirements_in_llvm_file,
+    ModuleRequirements, PtxIsaRequirement, detect_module_requirements_in_llvm_file,
     merge_generated_module_requirements, merge_generated_module_requirements_for_target,
     required_ptx_feature, resolve_ptx_target_with_generated, validate_ptx_isa_for_llvm_major,
     validate_target_features, validate_target_for_llvm_major,
 };
-use libnvvm_sys::CudaArch;
 use llvm_export::export::DebugKind;
 use ptx_parse::{Document, EditScript, split_top_level};
 use std::path::{Path, PathBuf};
@@ -239,6 +238,103 @@ fn optimize_ll(
 /// path for a few uniform ALU ops.
 const DISABLE_SWITCH_LOOKUP_TABLES: &str = "-switch-to-lookup=false";
 
+/// Disable llc's late branch folding so loops keep the two-jump layout
+/// ptxas's SASS unroller recognizes.
+///
+/// LLVM 23's NVPTX backend gained `reverseBranchCondition`
+/// (llvm/llvm-project PR #191889, commit d55166c23bf1, follow-up PR
+/// #191890, commit 205f4bf6cc03), which lets BranchFolding and
+/// MachineBlockPlacement collapse the classic loop branch idiom into a
+/// single negated conditional with fallthrough:
+///
+/// ```text
+/// LLVM 22 layout (ptxas unrolls)       LLVM 23 layout (ptxas gives up)
+///
+/// guard:  @%p bra body;    ─┐          guard:  @!%p bra exit;
+///         bra.uni exit;     │ taken            (falls through to body)
+/// body:   ...             ◄─┘          body:   ...
+/// latch:  @%p bra exit;                latch:  @%p bra body;
+///         bra.uni body;   ← continue           (falls through to exit)
+/// exit:                                exit:
+/// ```
+///
+/// Why we turn it off:
+///
+/// - ptxas's SASS loop unroller keys on the taken-target orientation at
+///   both ends of the loop: the guard's conditional taken-target must
+///   enter the preheader/body, and the latch must be "conditional exit +
+///   `bra.uni` continue". The folded negated forms defeat it.
+/// - Upstream enabled the folding with no opt-out (PR #191889), so the
+///   only supported control is disabling the two late machine passes.
+/// - Both flags are generic disable-only cl::opts: they skip layout
+///   transforms and change no semantics, so there is no correctness
+///   surface. llc 21.1.8, 22.1.2, 22.1.7, and 23.1.0 all accept them.
+/// - Measured on gemm_views' sgemm_naive_raw (RTX 5090, live benches,
+///   bit-identical numerics): folded layout drops 38 -> 26 registers and
+///   FFMA 18 -> 4, costing 26% throughput (7218 -> 5708 GFLOPS). With
+///   these flags: 38 registers, 7226 GFLOPS. Full-suite sweep (890
+///   kernels, 197 modules): 45 kernels change registers, every one the
+///   SASS unroller re-enabling (register counts and SASS bodies grow,
+///   e.g. the table-lookup scan loops now fully unroll) or an exact
+///   return to the pre-LLVM-23 baseline; zero unexplained movers, all
+///   affected examples numerically verified on hardware. PTX grows
+///   +2.6% in lines suite-wide, all redundant jumps ptxas discards.
+///
+/// Permanent until ptxas learns to unroll both layouts or upstream adds
+/// an opt-out for the NVPTX folding; an internal NVBug and an LLVM issue
+/// are to be filed to track both ends.
+const DISABLE_BRANCH_FOLD: &str = "-disable-branch-fold";
+
+/// Companion to [`DISABLE_BRANCH_FOLD`]: MachineBlockPlacement performs
+/// the same rotation and tail layout on its own, so both passes must be
+/// off or the folded form comes back.
+const DISABLE_BLOCK_PLACEMENT: &str = "-disable-block-placement";
+
+/// The unconditional head of every `llc` invocation: target selection plus
+/// the branch-layout controls ptxas depends on (see
+/// [`DISABLE_BRANCH_FOLD`]). Kept as a function so the tests can assert
+/// the argument list verbatim.
+fn base_llc_args(target: &str) -> Vec<String> {
+    vec![
+        "-march=nvptx64".to_string(),
+        format!("-mcpu={target}"),
+        DISABLE_BRANCH_FOLD.to_string(),
+        DISABLE_BLOCK_PLACEMENT.to_string(),
+    ]
+}
+
+/// Full-debug modules need PTX ISA 7.5 or newer declared, whatever the
+/// target's own floor is.
+///
+/// llc's DWARF emission writes label-difference expressions into debug
+/// sections:
+///
+/// ```text
+/// .section .debug_pubnames
+/// {
+/// .b32 $L__pubNames_end0-$L__pubNames_start0   ← "labels1 - labels2
+///                                                 expression in .section"
+///                                                 = PTX ISA 7.5 feature
+/// ```
+///
+/// but still declares the target's default `.version` (7.0 at sm_80), so
+/// ptxas rejects the module. Observed with llc-22 (CI's floor pin); llc-23
+/// emits its debug sections differently and dodges it. There is no 7.5
+/// requirement spelling in the supported set, so raise to the nearest one,
+/// 7.8; [`required_ptx_feature`] already refuses to downgrade targets whose
+/// floor is at or above it. Caught by the all-examples compile-only ptxas
+/// gate; line-tables debug emits no such expressions and stays untouched.
+fn ptx_isa_with_debug_floor(
+    requirement: PtxIsaRequirement,
+    debug_kind: DebugKind,
+) -> PtxIsaRequirement {
+    if debug_kind.variables_enabled() {
+        requirement.max(PtxIsaRequirement::new(78))
+    } else {
+        requirement
+    }
+}
+
 /// Build the middle-end arguments for a self-contained PTX module.
 ///
 /// The LLVM exporter returns the module's externally consumed definitions as
@@ -450,7 +546,10 @@ fn generate_ptx_impl(
         record_diagnostic(
             &mut diagnostics,
             diagnostic_sink,
-            format!("Target: {target} (from {target_source}; detected {detected:?})"),
+            format!(
+                "Target: {} (from {target_source}; detected {detected:?})",
+                target.sm()
+            ),
         );
     }
 
@@ -536,18 +635,9 @@ fn generate_ptx_impl(
     let requirements =
         merge_generated_module_requirements_for_target(requirements, generated, &target)
             .map_err(PipelineError::PtxGeneration)?;
-    let parsed_target =
-        target
-            .parse::<CudaArch>()
-            .map_err(|error| PipelineError::TargetSelection {
-                target: target.clone(),
-                reason: format!(
-                    "{error} (while validating requirements from the final LLVM input)"
-                ),
-            })?;
-    validate_target_features(&parsed_target, requirements.features).map_err(|reason| {
+    validate_target_features(&target, requirements.features).map_err(|reason| {
         PipelineError::TargetSelection {
-            target: target.clone(),
+            target: target.sm(),
             reason: format!("{reason} (requirements from the final LLVM input)"),
         }
     })?;
@@ -576,11 +666,12 @@ fn generate_ptx_impl(
     }
 
     let mut llc_cmd = std::process::Command::new(&toolchain.llc_path);
-    llc_cmd
-        .arg("-march=nvptx64")
-        .arg(format!("-mcpu={}", target));
-    if let Some(feature) =
-        required_ptx_feature(&target, requirements.ptx_isa).map_err(PipelineError::PtxGeneration)?
+    llc_cmd.args(base_llc_args(&target.sm()));
+    if let Some(feature) = required_ptx_feature(
+        &target,
+        ptx_isa_with_debug_floor(requirements.ptx_isa, debug_kind),
+    )
+    .map_err(PipelineError::PtxGeneration)?
     {
         llc_cmd.arg(format!("-mattr={feature}"));
     }
@@ -999,17 +1090,80 @@ mod tests {
         );
     }
 
+    /// Full-debug DWARF uses label-difference expressions (a PTX ISA 7.5
+    /// feature), so the requirement floor rises to the nearest supported
+    /// spelling, 7.8; targets already at or above it are untouched, and
+    /// line-tables/off never raise (see [`ptx_isa_with_debug_floor`]).
+    #[test]
+    fn full_debug_raises_the_ptx_isa_floor_only_when_below() {
+        assert_eq!(
+            ptx_isa_with_debug_floor(PtxIsaRequirement::Default, DebugKind::Full),
+            PtxIsaRequirement::new(78)
+        );
+        assert_eq!(
+            ptx_isa_with_debug_floor(PtxIsaRequirement::new(70), DebugKind::Full),
+            PtxIsaRequirement::new(78)
+        );
+        assert_eq!(
+            ptx_isa_with_debug_floor(PtxIsaRequirement::new(86), DebugKind::Full),
+            PtxIsaRequirement::new(86)
+        );
+        assert_eq!(
+            ptx_isa_with_debug_floor(PtxIsaRequirement::Default, DebugKind::LineTables),
+            PtxIsaRequirement::Default
+        );
+        assert_eq!(
+            ptx_isa_with_debug_floor(PtxIsaRequirement::Default, DebugKind::Off),
+            PtxIsaRequirement::Default
+        );
+        // End to end: at sm_80 (floor 7.0) the raised requirement emits the
+        // feature; at sm_90a (floor 8.0) it is already satisfied.
+        assert_eq!(
+            required_ptx_feature(
+                &"sm_80".parse().unwrap(),
+                ptx_isa_with_debug_floor(PtxIsaRequirement::Default, DebugKind::Full)
+            )
+            .unwrap(),
+            Some("+ptx78")
+        );
+        assert_eq!(
+            required_ptx_feature(
+                &"sm_90a".parse().unwrap(),
+                ptx_isa_with_debug_floor(PtxIsaRequirement::Default, DebugKind::Full)
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    /// Every llc invocation must carry the branch-layout controls: without
+    /// them LLVM 23's BranchFolding/MachineBlockPlacement rewrite loop
+    /// branches into a form ptxas's SASS unroller does not recognize (see
+    /// [`DISABLE_BRANCH_FOLD`]).
+    #[test]
+    fn llc_base_args_keep_the_ptxas_friendly_branch_layout() {
+        assert_eq!(
+            base_llc_args("sm_90"),
+            [
+                "-march=nvptx64",
+                "-mcpu=sm_90",
+                "-disable-branch-fold",
+                "-disable-block-placement",
+            ]
+        );
+    }
+
     #[test]
     fn final_llc_input_requirements_are_unioned_with_source_requirements() {
         use crate::target::{DetectedFeatures, PtxIsaRequirement};
 
         let source = ModuleRequirements {
             features: DetectedFeatures::Sm80,
-            ptx_isa: PtxIsaRequirement::Ptx70,
+            ptx_isa: PtxIsaRequirement::new(70),
         };
         let llc_input = ModuleRequirements {
             features: DetectedFeatures::DynamicStack,
-            ptx_isa: PtxIsaRequirement::Ptx73,
+            ptx_isa: PtxIsaRequirement::new(73),
         };
 
         let merged = merge_module_requirements(source, llc_input);
@@ -1017,9 +1171,9 @@ mod tests {
             merged.features,
             DetectedFeatures::Sm80 | DetectedFeatures::DynamicStack
         );
-        assert_eq!(merged.ptx_isa, PtxIsaRequirement::Ptx73);
+        assert_eq!(merged.ptx_isa, PtxIsaRequirement::new(73));
         assert_eq!(
-            required_ptx_feature("sm_80", merged.ptx_isa).unwrap(),
+            required_ptx_feature(&"sm_80".parse().unwrap(), merged.ptx_isa).unwrap(),
             Some("+ptx73")
         );
     }

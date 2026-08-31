@@ -188,6 +188,7 @@ compiler/compiler-optimizations
 compiler/mlir-dialects
 compiler/lowering-pipeline
 compiler/adding-new-intrinsics
+compiler/catalog-generated-intrinsics
 compiler/fuzzing-and-differential-testing
 ```
 
