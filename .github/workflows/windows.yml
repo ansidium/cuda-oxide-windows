@@ -76,14 +76,16 @@ jobs:
         shell: pwsh
         run: |
           cargo test --locked -p cuda-toolkit-discovery
-          cargo test --locked -p libnvvm-sys -- --ignored
-          cargo test --locked -p nvjitlink-sys -- --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p libnvvm-sys -- --include-ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p nvjitlink-sys -- --include-ignored --nocapture
 
       - name: Build cargo-oxide
         run: cargo build --locked -p cargo-oxide
 
       - name: Test oxide-artifacts object feature
-        run: cargo test -p oxide-artifacts --features object
+        run: cargo test --locked --manifest-path crates/oxide-artifacts/Cargo.toml --features object
 
       - name: Build codegen backend
         run: .\target\debug\cargo-oxide.exe setup
@@ -139,8 +141,10 @@ jobs:
         shell: pwsh
         run: |
           cargo test --locked -p cuda-toolkit-discovery
-          cargo test --locked -p libnvvm-sys -- --ignored
-          cargo test --locked -p nvjitlink-sys -- --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p libnvvm-sys -- --include-ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p nvjitlink-sys -- --include-ignored --nocapture
 
       - name: Build cargo-oxide
         run: cargo build --locked -p cargo-oxide

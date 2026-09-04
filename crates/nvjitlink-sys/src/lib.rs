@@ -800,7 +800,10 @@ impl LibraryCandidate {
 }
 
 fn open_library(tried: &mut Vec<String>, retain_exact_file: bool) -> Option<OpenedLibrary> {
+    #[cfg(windows)]
     let override_path = std::env::var_os("LIBNVJITLINK_PATH").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let override_path = std::env::var("LIBNVJITLINK_PATH").ok().map(PathBuf::from);
     let discovered = cuda_toolkit_discovery::nvjitlink_dll_candidates(target_triple_hint());
     let candidates = library_candidates(override_path, &discovered, retain_exact_file);
     open_library_from_candidates(&candidates, tried, retain_exact_file)
@@ -845,7 +848,7 @@ fn library_candidates(
         candidates.push(LibraryCandidate::Path(path));
     }
 
-    if prefer_discovered_paths {
+    if prefer_discovered_paths && cfg!(windows) {
         for path in discovered_paths {
             push_candidate_once(&mut candidates, LibraryCandidate::Path(path.clone()));
         }
@@ -871,7 +874,7 @@ fn platform_library_candidates(
     discovered_paths: &[PathBuf],
 ) {
     for path in discovered_paths {
-        push_candidate_once(candidates, LibraryCandidate::Path(path.clone()));
+        candidates.push(LibraryCandidate::Path(path.clone()));
     }
 
     for soname in [
@@ -879,7 +882,7 @@ fn platform_library_candidates(
         "libnvJitLink.so.12",
         "libnvJitLink.so",
     ] {
-        push_candidate_once(candidates, LibraryCandidate::LoaderName(soname));
+        candidates.push(LibraryCandidate::LoaderName(soname));
     }
 }
 
@@ -940,9 +943,19 @@ fn windows_module_path(module: isize) -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn open_windows_library(path: &Path) -> Option<(Library, PathBuf)> {
-    use libloading::os::windows::Library as WindowsLibrary;
+    use libloading::os::windows::{
+        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        Library as WindowsLibrary,
+    };
 
-    let native = unsafe { WindowsLibrary::new(path) }.ok()?;
+    // Resolve dependencies beside this DLL or in trusted loader directories, not the CWD.
+    let native = unsafe {
+        WindowsLibrary::load_with_flags(
+            path,
+            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        )
+    }
+    .ok()?;
     let handle = native.into_raw();
     let loaded_path = windows_module_path(handle);
     let native = unsafe { WindowsLibrary::from_raw(handle) };
@@ -1003,6 +1016,9 @@ fn open_library_path(path: &Path, retain_exact_file: bool) -> Option<OpenedLibra
         });
     }
 
+    #[cfg(windows)]
+    let lib = open_windows_library(&path.canonicalize().ok()?)?.0;
+    #[cfg(not(windows))]
     let lib = unsafe { Library::new(path) }.ok()?;
     Some(OpenedLibrary {
         library: lib,
@@ -1016,6 +1032,46 @@ fn open_library_path(path: &Path, retain_exact_file: bool) -> Option<OpenedLibra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an installed CUDA Toolkit"]
+    fn installed_toolkit_reports_loaded_file() {
+        let mut tried = Vec::new();
+        let opened = open_library(&mut tried, true).expect("load nvJitLink");
+        let identity = opened
+            .loaded_identity
+            .as_ref()
+            .expect("verified loaded file identity");
+        let file = opened.loaded_file.as_ref().expect("retained loaded file");
+        let path = PathBuf::from(tried.last().expect("a concrete DLL candidate"))
+            .canonicalize()
+            .expect("resolve loaded DLL path");
+        assert!(identity.matches_file(file));
+        assert!(identity.matches_path(&path));
+        println!("nvJitLink loaded: {}", path.display());
+        println!("nvJitLink file identity: {identity:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_candidate_order_preserves_repeated_roots_and_override() {
+        let path = PathBuf::from("/cuda/library.so");
+        let discovered = [path.clone(), path.clone()];
+        for retain_exact_file in [false, true] {
+            let actual = candidate_descriptions(Some(path.clone()), &discovered, retain_exact_file);
+            let mut expected = vec![path.display().to_string(); 3];
+            expected.extend(
+                [
+                    "libnvJitLink.so.13",
+                    "libnvJitLink.so.12",
+                    "libnvJitLink.so",
+                ]
+                .map(str::to_string),
+            );
+            assert_eq!(actual, expected);
+        }
+    }
     #[cfg(target_os = "linux")]
     use libloading::Symbol;
 

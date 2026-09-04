@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Shared CUDA Toolkit discovery helpers for build scripts and runtime loaders.
+//! Shared CUDA Toolkit discovery for compiler libraries and libdevice.
 //!
 //! These helpers return candidate paths in discovery order. They do not require
 //! the CUDA Toolkit, a driver, or a GPU to be present.
@@ -20,147 +20,23 @@ const LINUX_CUDA_DEFAULT_ROOTS: &[&str] = &["/usr/local/cuda", "/opt/cuda"];
 const LIBNVVM_WINDOWS_PREFIX: &str = "nvvm64_";
 const NVJITLINK_WINDOWS_PREFIX: &str = "nvJitLink_";
 
-/// Candidate CUDA Toolkit include directories, in root discovery order.
-pub fn include_candidates() -> Vec<PathBuf> {
-    include_candidates_from_roots(root_candidates(DefaultRoots::All))
-}
-
-/// Candidate CUDA Toolkit include directories for a target triple.
-pub fn include_candidates_for_target(target: &str) -> Vec<PathBuf> {
-    include_candidates_from_roots(root_candidates(DefaultRoots::for_target(target)))
-}
-
-/// Candidate CUDA Toolkit roots, independent of any specific library kind.
-pub fn cuda_roots() -> Vec<PathBuf> {
-    root_candidates(DefaultRoots::All)
-}
-
-/// Candidate native library search directories for the CUDA driver library.
-pub fn cuda_driver_lib_candidates(target: &str) -> Vec<PathBuf> {
-    cuda_driver_lib_candidates_from_roots(root_candidates(DefaultRoots::for_target(target)), target)
-}
-
-fn cuda_driver_lib_candidates_from_roots(roots: Vec<PathBuf>, target: &str) -> Vec<PathBuf> {
-    if is_windows_target(target) {
-        dedup(
-            roots
-                .into_iter()
-                .map(|root| root.join("lib").join("x64"))
-                .collect(),
-        )
-    } else {
-        let target_dir = cuda_redistributable_target_dir(target);
-        dedup(
-            roots
-                .into_iter()
-                .flat_map(|root| {
-                    [
-                        root.join("lib64"),
-                        root.join("lib64").join("stubs"),
-                        root.join("targets").join(target_dir).join("lib"),
-                        root.join("targets")
-                            .join(target_dir)
-                            .join("lib")
-                            .join("stubs"),
-                    ]
-                })
-                .collect(),
-        )
-    }
-}
-
-fn cuda_redistributable_target_dir(target: &str) -> &'static str {
-    if target.starts_with("aarch64") {
-        "sbsa-linux"
-    } else {
-        "x86_64-linux"
-    }
-}
-
 /// Candidate paths to the libNVVM dynamic library.
 pub fn libnvvm_dll_candidates(target: &str) -> Vec<PathBuf> {
-    let roots = root_candidates(DefaultRoots::for_target(target));
-    if is_windows_target(target) {
-        windows_runtime_library_candidates(
-            &roots,
-            &windows_runtime_search_dirs(),
-            LIBNVVM_WINDOWS_PREFIX,
-            |root| {
-                [
-                    root.join("nvvm").join("bin").join("x64"),
-                    root.join("nvvm").join("bin"),
-                ]
-            },
-        )
-    } else {
-        dedup(
-            roots
-                .into_iter()
-                .map(|root| root.join("nvvm").join("lib64").join("libnvvm.so"))
-                .collect(),
-        )
-    }
+    libnvvm_dll_candidates_from_roots(root_candidates(DefaultRoots::for_target(target)), target)
 }
 
 /// Candidate paths to the nvJitLink dynamic library.
 pub fn nvjitlink_dll_candidates(target: &str) -> Vec<PathBuf> {
-    let roots = root_candidates(DefaultRoots::for_target(target));
-    if is_windows_target(target) {
-        windows_runtime_library_candidates(
-            &roots,
-            &windows_runtime_search_dirs(),
-            NVJITLINK_WINDOWS_PREFIX,
-            |root| [root.join("bin").join("x64"), root.join("bin")],
-        )
-    } else {
-        dedup(
-            roots
-                .into_iter()
-                .map(|root| root.join("lib64").join("libnvJitLink.so"))
-                .collect(),
-        )
-    }
+    nvjitlink_dll_candidates_from_roots(root_candidates(DefaultRoots::for_target(target)), target)
 }
 
 /// Candidate paths to CUDA libdevice bitcode.
-pub fn libdevice_candidates() -> Vec<PathBuf> {
-    dedup(
-        root_candidates(DefaultRoots::All)
-            .into_iter()
-            .map(|root| root.join("nvvm").join("libdevice").join("libdevice.10.bc"))
-            .collect(),
-    )
-}
-
-/// Runtime directories that may need to be appended to the process search path.
-pub fn path_dirs_for_runtime(target: &str) -> Vec<PathBuf> {
-    let roots = root_candidates(DefaultRoots::for_target(target));
-    if is_windows_target(target) {
-        dedup(
-            roots
-                .into_iter()
-                .flat_map(|root| {
-                    [
-                        root.join("bin"),
-                        root.join("bin").join("x64"),
-                        root.join("nvvm").join("bin").join("x64"),
-                    ]
-                })
-                .collect(),
-        )
-    } else {
-        dedup(
-            roots
-                .into_iter()
-                .flat_map(|root| [root.join("lib64"), root.join("nvvm").join("lib64")])
-                .collect(),
-        )
-    }
+pub fn libdevice_candidates(target: &str) -> Vec<PathBuf> {
+    libdevice_candidates_from_roots(root_candidates(DefaultRoots::for_target(target)))
 }
 
 #[derive(Clone, Copy)]
 enum DefaultRoots {
-    All,
     Linux,
     Windows,
 }
@@ -187,6 +63,16 @@ where
         .into_iter()
         .filter_map(|(key, value)| key.into_string().ok().map(|key| (key, value)))
         .collect::<Vec<_>>();
+    if matches!(defaults, DefaultRoots::Linux) {
+        // Match upstream std::env::var semantics, including empty and repeated roots.
+        return ROOT_ENV_VARS
+            .iter()
+            .filter_map(|key| env_value(&entries, key))
+            .filter_map(|value| value.to_str())
+            .map(PathBuf::from)
+            .chain(LINUX_CUDA_DEFAULT_ROOTS.iter().map(PathBuf::from))
+            .collect();
+    }
     let mut roots = Vec::new();
 
     for key in ROOT_ENV_VARS {
@@ -206,35 +92,9 @@ where
         push_if_not_empty(&mut roots, value);
     }
 
-    match defaults {
-        DefaultRoots::All | DefaultRoots::Windows => {
-            roots.extend(windows_default_roots());
-        }
-        DefaultRoots::Linux => {}
-    }
-    match defaults {
-        DefaultRoots::All | DefaultRoots::Linux => {
-            roots.extend(LINUX_CUDA_DEFAULT_ROOTS.iter().map(PathBuf::from));
-        }
-        DefaultRoots::Windows => {}
-    }
+    roots.extend(windows_default_roots());
 
     dedup(roots)
-}
-
-fn include_candidates_from_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    dedup(
-        roots
-            .into_iter()
-            .flat_map(|root| {
-                [
-                    root.join("include"),
-                    root.join("targets").join("x86_64-linux").join("include"),
-                    root.join("targets").join("sbsa-linux").join("include"),
-                ]
-            })
-            .collect(),
-    )
 }
 
 fn env_value<'a>(entries: &'a [(String, OsString)], key: &str) -> Option<&'a OsStr> {
@@ -304,14 +164,16 @@ where
 }
 
 fn windows_runtime_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(current_dir) = std::env::current_dir() {
-        dirs.push(current_dir);
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        dirs.extend(std::env::split_paths(&path));
-    }
-    dedup(dirs)
+    windows_path_dirs(std::env::var_os("PATH").as_deref())
+}
+
+fn windows_path_dirs(path: Option<&OsStr>) -> Vec<PathBuf> {
+    dedup(
+        path.into_iter()
+            .flat_map(std::env::split_paths)
+            .filter(|dir| dir.is_absolute())
+            .collect(),
+    )
 }
 
 fn versioned_windows_dlls(directory: &Path, file_prefix: &str) -> Vec<PathBuf> {
@@ -395,13 +257,229 @@ fn dedup(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     deduped
 }
 
+fn libnvvm_dll_candidates_from_roots(roots: Vec<PathBuf>, target: &str) -> Vec<PathBuf> {
+    if is_windows_target(target) {
+        windows_runtime_library_candidates(
+            &roots,
+            &windows_runtime_search_dirs(),
+            LIBNVVM_WINDOWS_PREFIX,
+            |root| {
+                [
+                    root.join("nvvm").join("bin").join("x64"),
+                    root.join("nvvm").join("bin"),
+                ]
+            },
+        )
+    } else {
+        roots
+            .into_iter()
+            .map(|root| root.join("nvvm").join("lib64").join("libnvvm.so"))
+            .collect()
+    }
+}
+
+fn nvjitlink_dll_candidates_from_roots(roots: Vec<PathBuf>, target: &str) -> Vec<PathBuf> {
+    if is_windows_target(target) {
+        windows_runtime_library_candidates(
+            &roots,
+            &windows_runtime_search_dirs(),
+            NVJITLINK_WINDOWS_PREFIX,
+            |root| [root.join("bin").join("x64"), root.join("bin")],
+        )
+    } else {
+        roots
+            .into_iter()
+            .map(|root| root.join("lib64").join("libnvJitLink.so"))
+            .collect()
+    }
+}
+
+fn libdevice_candidates_from_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots
+        .into_iter()
+        .map(|root| root.join("nvvm").join("libdevice").join("libdevice.10.bc"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
     const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
-    const AARCH64_LINUX_TARGET: &str = "aarch64-unknown-linux-gnu";
+
+    #[test]
+    fn linux_candidates_match_upstream_in_order() {
+        for values in [
+            [None, None, None],
+            [
+                Some("/cuda/toolkit"),
+                Some("/cuda/home"),
+                Some("/cuda/path"),
+            ],
+            [Some(""), Some("/opt/cuda"), Some("/opt/cuda")],
+        ] {
+            let env = ROOT_ENV_VARS
+                .iter()
+                .zip(values)
+                .filter_map(|(key, value)| {
+                    value.map(|value| (OsString::from(key), OsString::from(value)))
+                })
+                .chain([(
+                    OsString::from("CUDA_PATH_V99_0"),
+                    OsString::from("/windows-only"),
+                )]);
+            let roots = root_candidates_from_env(env, DefaultRoots::Linux);
+            let expected: Vec<_> = values
+                .into_iter()
+                .flatten()
+                .chain(["/usr/local/cuda", "/opt/cuda"])
+                .map(PathBuf::from)
+                .collect();
+            assert_eq!(roots, expected);
+            assert_eq!(
+                libnvvm_dll_candidates_from_roots(roots.clone(), LINUX_TARGET),
+                expected
+                    .iter()
+                    .map(|root| root.join("nvvm/lib64/libnvvm.so"))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                nvjitlink_dll_candidates_from_roots(roots.clone(), LINUX_TARGET),
+                expected
+                    .iter()
+                    .map(|root| root.join("lib64/libnvJitLink.so"))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                libdevice_candidates_from_roots(roots),
+                expected
+                    .iter()
+                    .map(|root| root.join("nvvm/libdevice/libdevice.10.bc"))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn windows_path_does_not_add_the_current_directory() {
+        let absolute = std::env::temp_dir().join("cuda-toolkit-path");
+        let path = std::env::join_paths([
+            Path::new(""),
+            Path::new("."),
+            Path::new("relative"),
+            absolute.as_path(),
+            absolute.as_path(),
+        ])
+        .unwrap();
+        assert_eq!(windows_path_dirs(None), Vec::<PathBuf>::new());
+        assert_eq!(windows_path_dirs(Some(&path)), [absolute]);
+    }
+
+    #[test]
+    fn windows_toolkit_candidates_precede_path_candidates() {
+        let base = unique_temp_dir("cuda-toolkit-order");
+        let toolkit = base.join("toolkit");
+        let path_dir = base.join("path");
+        std::fs::create_dir_all(toolkit.join("bin")).unwrap();
+        std::fs::create_dir_all(&path_dir).unwrap();
+        let first = toolkit.join("bin/nvJitLink_130_0.dll");
+        let last = path_dir.join("nvJitLink_999_0.dll");
+        std::fs::write(&first, []).unwrap();
+        std::fs::write(&last, []).unwrap();
+        assert_eq!(
+            windows_runtime_library_candidates(
+                &[toolkit],
+                &[path_dir],
+                NVJITLINK_WINDOWS_PREFIX,
+                |root| [root.join("bin")],
+            ),
+            [first, last]
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_runtime_scan_excludes_cwd_dlls() {
+        const CHILD: &str = "CUDA_TOOLKIT_DISCOVERY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let cwd = std::env::current_dir().unwrap();
+            let base = cwd.parent().unwrap();
+            for (actual, relative, filename) in [
+                (
+                    libnvvm_dll_candidates(WINDOWS_TARGET),
+                    "nvvm/bin/x64",
+                    "nvvm64_1_0.dll",
+                ),
+                (
+                    nvjitlink_dll_candidates(WINDOWS_TARGET),
+                    "bin",
+                    "nvJitLink_1_0.dll",
+                ),
+            ] {
+                assert_eq!(
+                    actual.first(),
+                    Some(&base.join("toolkit").join(relative).join(filename))
+                );
+                assert_eq!(actual.last(), Some(&base.join("path").join(filename)));
+                assert!(actual.iter().all(|path| !path.starts_with(&cwd)));
+            }
+            return;
+        }
+        let base = unique_temp_dir("cuda-toolkit-cwd");
+        let cwd = base.join("cwd");
+        let toolkit = base.join("toolkit");
+        let path = base.join("path");
+        for directory in [
+            &cwd,
+            &cwd.join("relative"),
+            &path,
+            &toolkit.join("bin"),
+            &toolkit.join("nvvm/bin/x64"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+            for filename in ["nvvm64_1_0.dll", "nvJitLink_1_0.dll"] {
+                std::fs::write(directory.join(filename), []).unwrap();
+            }
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tests::windows_runtime_scan_excludes_cwd_dlls",
+                "--nocapture",
+            ])
+            .current_dir(&cwd)
+            .env(CHILD, "1");
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("CUDA_")
+            {
+                command.env_remove(key);
+            }
+        }
+        command
+            .env(CHILD, "1")
+            .env("CUDA_TOOLKIT_PATH", &toolkit)
+            .env(
+                "PATH",
+                std::env::join_paths([Path::new(""), Path::new("."), Path::new("relative"), &path])
+                    .unwrap(),
+            );
+        let output = command
+            .output()
+            .expect("run discovery in an isolated process");
+        std::fs::remove_dir_all(base).unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let now = std::time::SystemTime::now()
@@ -507,69 +585,14 @@ mod tests {
     }
 
     #[test]
-    fn linux_usr_local_cuda_candidates_are_present() {
-        let root = PathBuf::from("/usr/local/cuda");
-        let roots =
-            root_candidates_from_env(Vec::<(OsString, OsString)>::new(), DefaultRoots::Linux);
-
-        assert!(roots.contains(&root));
-        assert!(include_candidates_from_roots(roots.clone()).contains(&root.join("include")));
-        assert!(
-            cuda_driver_lib_candidates_from_roots(roots.clone(), LINUX_TARGET)
-                .contains(&root.join("lib64"))
-        );
-        assert!(
-            cuda_driver_lib_candidates_from_roots(roots.clone(), LINUX_TARGET)
-                .contains(&root.join("lib64").join("stubs"))
-        );
-        assert!(
-            libnvvm_dll_candidates_from_roots(roots.clone(), LINUX_TARGET)
-                .contains(&root.join("nvvm").join("lib64").join("libnvvm.so"))
-        );
-        assert!(
-            nvjitlink_dll_candidates_from_roots(roots.clone(), LINUX_TARGET)
-                .contains(&root.join("lib64").join("libnvJitLink.so"))
-        );
-        assert!(
-            libdevice_candidates_from_roots(roots)
-                .contains(&root.join("nvvm").join("libdevice").join("libdevice.10.bc"))
-        );
-    }
-
-    #[test]
-    fn aarch64_linux_driver_candidates_use_sbsa_redistributable_layout() {
-        let root = PathBuf::from("/opt/cuda");
-        let candidates =
-            cuda_driver_lib_candidates_from_roots(vec![root.clone()], AARCH64_LINUX_TARGET);
-
-        assert!(candidates.contains(&root.join("lib64")));
-        assert!(candidates.contains(&root.join("lib64").join("stubs")));
-        assert!(candidates.contains(&root.join("targets").join("sbsa-linux").join("lib")));
-        assert!(
-            candidates.contains(
-                &root
-                    .join("targets")
-                    .join("sbsa-linux")
-                    .join("lib")
-                    .join("stubs")
-            )
-        );
-        assert!(!candidates.contains(&root.join("targets").join("x86_64-linux").join("lib")));
-    }
-
-    #[test]
     fn cuda_path_only_is_first_root() {
         let cuda_path = OsString::from(r"D:\NVIDIA\CUDA\current");
         let roots = root_candidates_from_env(
             vec![(OsString::from("CUDA_PATH"), cuda_path.clone())],
-            DefaultRoots::All,
+            DefaultRoots::Windows,
         );
 
         assert_eq!(roots.first(), Some(&PathBuf::from(cuda_path)));
-        assert_eq!(
-            include_candidates_from_roots(roots).first(),
-            Some(&PathBuf::from(r"D:\NVIDIA\CUDA\current").join("include"))
-        );
     }
 
     #[test]
@@ -585,7 +608,7 @@ mod tests {
                     OsString::from(r"D:\CUDA\from-toolkit-path"),
                 ),
             ],
-            DefaultRoots::All,
+            DefaultRoots::Windows,
         );
 
         assert_eq!(
@@ -603,98 +626,12 @@ mod tests {
         let root = PathBuf::from(r"D:\CUDA Toolkit Installs\current");
         let roots = root_candidates_from_env(
             vec![(OsString::from("CUDA_PATH"), root.clone().into_os_string())],
-            DefaultRoots::All,
+            DefaultRoots::Windows,
         );
 
-        assert!(include_candidates_from_roots(roots.clone()).contains(&root.join("include")));
-        assert!(
-            cuda_driver_lib_candidates_from_roots(roots.clone(), WINDOWS_TARGET)
-                .contains(&root.join("lib").join("x64"))
-        );
         assert!(
             libdevice_candidates_from_roots(roots)
                 .contains(&root.join("nvvm").join("libdevice").join("libdevice.10.bc"))
         );
-    }
-
-    #[test]
-    fn windows_runtime_dirs_cover_toolkit_layouts() {
-        let root = PathBuf::from(r"D:\CUDA Toolkit Installs\current");
-        let candidates = path_dirs_for_runtime_from_roots(vec![root.clone()], WINDOWS_TARGET);
-
-        assert_eq!(
-            candidates,
-            [
-                root.join("bin"),
-                root.join("bin").join("x64"),
-                root.join("nvvm").join("bin").join("x64"),
-            ]
-        );
-    }
-
-    fn libnvvm_dll_candidates_from_roots(roots: Vec<PathBuf>, target: &str) -> Vec<PathBuf> {
-        if is_windows_target(target) {
-            windows_runtime_library_candidates(&roots, &[], LIBNVVM_WINDOWS_PREFIX, |root| {
-                [
-                    root.join("nvvm").join("bin").join("x64"),
-                    root.join("nvvm").join("bin"),
-                ]
-            })
-        } else {
-            dedup(
-                roots
-                    .into_iter()
-                    .map(|root| root.join("nvvm").join("lib64").join("libnvvm.so"))
-                    .collect(),
-            )
-        }
-    }
-
-    fn nvjitlink_dll_candidates_from_roots(roots: Vec<PathBuf>, target: &str) -> Vec<PathBuf> {
-        if is_windows_target(target) {
-            windows_runtime_library_candidates(&roots, &[], NVJITLINK_WINDOWS_PREFIX, |root| {
-                [root.join("bin").join("x64"), root.join("bin")]
-            })
-        } else {
-            dedup(
-                roots
-                    .into_iter()
-                    .map(|root| root.join("lib64").join("libnvJitLink.so"))
-                    .collect(),
-            )
-        }
-    }
-
-    fn libdevice_candidates_from_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
-        dedup(
-            roots
-                .into_iter()
-                .map(|root| root.join("nvvm").join("libdevice").join("libdevice.10.bc"))
-                .collect(),
-        )
-    }
-
-    fn path_dirs_for_runtime_from_roots(roots: Vec<PathBuf>, target: &str) -> Vec<PathBuf> {
-        if is_windows_target(target) {
-            dedup(
-                roots
-                    .into_iter()
-                    .flat_map(|root| {
-                        [
-                            root.join("bin"),
-                            root.join("bin").join("x64"),
-                            root.join("nvvm").join("bin").join("x64"),
-                        ]
-                    })
-                    .collect(),
-            )
-        } else {
-            dedup(
-                roots
-                    .into_iter()
-                    .flat_map(|root| [root.join("lib64"), root.join("nvvm").join("lib64")])
-                    .collect(),
-            )
-        }
     }
 }
