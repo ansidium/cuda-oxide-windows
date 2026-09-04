@@ -226,7 +226,8 @@ fn windows_dll_version(value: &str, file_prefix: &str) -> Option<Vec<u32>> {
     }
     let version_with_suffix = value.get(file_prefix.len()..)?;
     let suffix_start = version_with_suffix.len().checked_sub(".dll".len())?;
-    let (version, suffix) = version_with_suffix.split_at(suffix_start);
+    let version = version_with_suffix.get(..suffix_start)?;
+    let suffix = version_with_suffix.get(suffix_start..)?;
     if !suffix.eq_ignore_ascii_case(".dll") {
         return None;
     }
@@ -539,6 +540,20 @@ mod tests {
 
         assert_eq!(roots.first(), Some(&PathBuf::from(r"D:\CUDA\v13.10")));
         assert_eq!(roots.get(1), Some(&PathBuf::from(r"D:\CUDA\v13.9")));
+    }
+
+    #[test]
+    fn windows_dll_scan_rejects_malformed_names_without_panicking() {
+        for name in [
+            "nvJitLink_\u{e9}abc",
+            "nvJitLink_\u{1f4a0}ab",
+            "nvJitLink_130_0.d\u{e9}",
+            "nvJitLink_130_0",
+            "nvJitLink_.dll",
+            "nvJitLink_4294967296.dll",
+        ] {
+            assert_eq!(windows_dll_version(name, NVJITLINK_WINDOWS_PREFIX), None);
+        }
     }
 
     #[test]
