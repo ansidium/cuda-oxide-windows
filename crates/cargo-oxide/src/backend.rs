@@ -9,13 +9,11 @@
 //!
 //! 1. `CUDA_OXIDE_BACKEND` env var (explicit override)
 //! 2. Project config (`.cargo/cuda-oxide.toml`)
-//! 3. Backend dynamic library next to the running `cargo-oxide` executable
-//!    (packaged release zip layout)
-//! 4. Local repo (detected by presence of `crates/rustc-codegen-cuda`)
-//! 5. Cached backend at `~/.cargo/cuda-oxide/<platform filename>`,
-//!    but only when it isn't older than the running `cargo-oxide` binary
-//! 6. Auto-fetch the pinned Windows-fork revision and build (one-time, or
-//!    after a stale-cache miss)
+//! 3. Backend dynamic library next to the running cargo-oxide executable
+//! 4. Local repository backend build
+//! 5. Cached backend matching the project's resolved cuda-oxide dependency
+//! 6. Build from that dependency's checkout, or the pinned fork revision
+//!    when the project has no cuda-oxide dependency.
 //!
 //! ## Cache staleness (issue #49)
 //!
@@ -86,6 +84,31 @@
 //! identities with guidance and exits instead of rebuilding. Any lookup that
 //! passes the fingerprint check deletes the marker, so a genuinely healed
 //! cache clears the memory.
+//!
+//! ## The backend follows the dependency
+//!
+//! Outside the repository, the backend source is the checkout Cargo made for
+//! the project's `cuda-device` / `cuda-host` dependency (see
+//! [`crate::backend_source`]), so the crates a kernel compiles against and
+//! the backend that lowers it always come from one commit. That commit is
+//! recorded next to the cached `.so` (`source-rev.txt`) and compared on every
+//! lookup; a project resolving a different commit rebuilds the cache from its
+//! own checkout. A path dependency is a local checkout and builds in place,
+//! the same way step 3 does. Dependency checkouts build into
+//! `~/.cargo/cuda-oxide/target`, one tree cargo-oxide owns (delete it to
+//! reclaim the space) that consecutive commits share their dependency builds
+//! in, rather than into Cargo's checkout.
+//!
+//! Under `cargo oxide` the rustup proxy exports `RUSTUP_TOOLCHAIN` for the
+//! project's toolchain, and every child `cargo`/`rustc`, the backend build
+//! included, uses it; a checkout's own `rust-toolchain.toml` gets no say.
+//! That file still states the nightly the commit was written for, and
+//! rustc_private APIs change between nightlies, so before any build the
+//! project's active toolchain is compared with that channel and a mismatch is
+//! reported up front, naming the channel to set, instead of spending minutes
+//! on a backend that fails to compile or to load. The toolchain heal marker
+//! above guards only the `main` clone path: a rebuild from a pinned
+//! dependency's checkout converges by construction.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -169,6 +192,8 @@ fn with_locked_backend_cache<T>(
     Ok(transaction(cache_dir))
 }
 
+use crate::backend_source::{self, CODEGEN_CRATE_SUBDIR, DependencySource};
+
 /// Finds the workspace root by walking up from CWD looking for Cargo.toml
 /// with a `crates/rustc-codegen-cuda` directory.
 pub fn find_workspace_root() -> Option<PathBuf> {
@@ -188,10 +213,10 @@ pub fn find_workspace_root() -> Option<PathBuf> {
 /// Discovery order:
 /// 1. `CUDA_OXIDE_BACKEND` env var
 /// 2. Project config (`.cargo/cuda-oxide.toml`)
-/// 3. Packaged backend next to the running `cargo-oxide` executable
-/// 4. Local repo build (crates/rustc-codegen-cuda)
-/// 5. Cached build at ~/.cargo/cuda-oxide/
-/// 6. Auto-fetch + build from git
+/// 3. Packaged backend next to the running executable
+/// 4. Local repository backend build
+/// 5. Cache matching the project's resolved dependency
+/// 6. Build from that dependency, or fetch the pinned fork revision
 pub fn find_or_build_backend(workspace_root: &Path, configured_backend: Option<&Path>) -> PathBuf {
     let host_target = active_host_target();
     let backend_filename = backend_filename_for_target(&host_target);
@@ -234,14 +259,60 @@ pub fn find_or_build_backend(workspace_root: &Path, configured_backend: Option<&
         return build_backend_from_source(&codegen_crate);
     }
 
+    // Standalone projects build the backend from their resolved dependency.
+    standalone_backend(workspace_root)
+}
+
+/// Backend for a project outside the repository (discovery steps 4 and 5).
+///
+/// The project's `Cargo.lock` decides the commit: the backend is built from
+/// the checkout Cargo made for the `cuda-device` / `cuda-host` dependency, and
+/// the shared cache is reused only when it records that same commit. See the
+/// module-level comment ("The backend follows the dependency").
+fn standalone_backend(project_dir: &Path) -> PathBuf {
+    let source = match backend_source::resolve_dependency_source(project_dir, false) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("Error: could not resolve this project's cuda-oxide dependency: {error}");
+            eprintln!(
+                "Every cuda-oxide crate in Cargo.toml must come from one git commit or one \
+                 local checkout. To bypass this, point CUDA_OXIDE_BACKEND at a backend built \
+                 for this project."
+            );
+            std::process::exit(1);
+        }
+    };
+
+    if let Some(source) = &source {
+        refuse_unloadable_backend(source.checkout(), &source.describe());
+        if source.rev().is_none() {
+            return build_backend_from_source(&source.codegen_crate());
+        }
+    }
+
     let cache_dir = cache_directory().unwrap_or_else(|| {
         eprintln!("Error: Cannot determine cache directory.");
         eprintln!("Set CARGO_HOME or HOME environment variable.");
         std::process::exit(1);
     });
-
-    with_locked_backend_cache(&cache_dir, |locked_cache_dir| {
-        find_or_build_cached_backend(locked_cache_dir, &backend_filename)
+    let backend_filename = backend_filename_for_target(&active_host_target());
+    with_locked_backend_cache(&cache_dir, |cache_dir| {
+        let source_dir = cache_dir.join("src").join(CODEGEN_CRATE_SUBDIR);
+        let expected_rev = source.as_ref().and_then(DependencySource::rev);
+        if source.is_none() && !source_checkout_matches_revision(&cache_dir.join("src")) {
+            invalidate_cache(cache_dir, &backend_filename);
+        }
+        if let Some(cached) = consult_backend_cache(
+            cache_dir,
+            source.is_none().then_some(source_dir.as_path()),
+            expected_rev,
+        ) {
+            return cached;
+        }
+        match &source {
+            Some(source) => build_and_cache(source, cache_dir),
+            None => auto_fetch_and_build(cache_dir, &backend_filename),
+        }
     })
     .unwrap_or_else(|error| {
         eprintln!("Failed to lock the cuda-oxide backend cache: {error}");
@@ -249,56 +320,206 @@ pub fn find_or_build_backend(workspace_root: &Path, configured_backend: Option<&
     })
 }
 
-/// Double-check and, when needed, rebuild the cache while its transaction lock
-/// is held by [`find_or_build_backend`].
-fn find_or_build_cached_backend(cache_dir: &Path, backend_filename: &str) -> PathBuf {
-    let cached_backend = cache_dir.join(backend_filename);
-    if cached_backend.exists() {
-        let source_root = cache_dir.join("src");
-        if !source_checkout_matches_revision(&source_root) {
+/// Builds the backend from the dependency's checkout and installs it into the
+/// shared cache with its commit recorded. The caller has already run
+/// [`refuse_unloadable_backend`] for this checkout.
+fn build_and_cache(source: &DependencySource, cache_dir: &Path) -> PathBuf {
+    let backend_filename = backend_filename_for_target(&active_host_target());
+    eprintln!(
+        "Building the cuda-oxide backend from {}...",
+        source.describe()
+    );
+    let codegen_crate = source.codegen_crate();
+    // The build tree goes beside the cache, not into Cargo's checkout: one
+    // place cargo-oxide owns, shared by every commit's dependency builds.
+    let built_so = build_backend_from_source_in(&codegen_crate, Some(&cache_dir.join("target")));
+    let so_path = install_backend_into(
+        cache_dir,
+        &backend_filename,
+        &built_so,
+        &codegen_crate,
+        source.rev(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!(
+            "Error: could not copy the backend into {}: {error}",
+            cache_dir.display()
+        );
+        std::process::exit(1);
+    });
+    eprintln!("✓ Backend cached at {}", so_path.display());
+    so_path
+}
+
+/// Refuses to build a backend the project could not build or load.
+///
+/// Under `cargo oxide` the rustup proxy exports `RUSTUP_TOOLCHAIN` for the
+/// project's toolchain, so every child `cargo`/`rustc`, the backend build
+/// included, uses that toolchain and the checkout's nested
+/// `rust-toolchain.toml` gets no say (it would with a bare `cargo-oxide`
+/// binary, which is not how users run it). That file still names the nightly
+/// the commit was written for, and rustc_private APIs change between
+/// nightlies: any other toolchain fails to compile the backend or builds one
+/// its rustc cannot load. So compare the active toolchain with that channel
+/// first and say which channel to set. Conservative: without rustup or
+/// without a toolchain file in the checkout, let the build proceed and surface
+/// its own errors.
+fn refuse_unloadable_backend(checkout: &Path, description: &str) {
+    let Some(report) = unloadable_backend_report(
+        description,
+        active_toolchain().as_deref(),
+        backend_source::pinned_channel(checkout).as_deref(),
+    ) else {
+        return;
+    };
+    eprint!("{report}");
+    std::process::exit(1);
+}
+
+/// `rustup show active-toolchain` from the process cwd: the toolchain the
+/// application build and every child process will use (`RUSTUP_TOOLCHAIN`
+/// from the proxy, else the project's `rust-toolchain.toml`, else rustup's
+/// default). `None` without rustup.
+fn active_toolchain() -> Option<String> {
+    let output = Command::new("rustup")
+        .args(["show", "active-toolchain"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|active| !active.is_empty())
+}
+
+/// The refusal text for a project whose active toolchain does not match the
+/// channel the checkout needs, or `None` when it does or either side is
+/// unknown. Pure, so the decision and the wording are testable without a
+/// process exit.
+fn unloadable_backend_report(
+    description: &str,
+    active: Option<&str>,
+    needed_channel: Option<&str>,
+) -> Option<String> {
+    let (Some(active), Some(channel)) = (active, needed_channel) else {
+        return None;
+    };
+    if crate::commands::active_toolchain_matches_channel(active, channel) {
+        return None;
+    }
+    let active_name = active
+        .lines()
+        .next()
+        .unwrap_or(active)
+        .split_whitespace()
+        .next()
+        .unwrap_or(active);
+    let lines = [
+        format!(
+            "Error: {description} needs Rust `{channel}` (its rust-toolchain.toml), but this \
+             project is using `{active_name}`."
+        ),
+        "The backend is a rustc plugin: it is built with, and only loads into, the toolchain \
+         this project uses, and rustc_private APIs change between nightlies."
+            .to_string(),
+        format!(
+            "Set `channel = \"{channel}\"` in this project's rust-toolchain.toml to match \
+             {description}, then re-run. To use a backend built some other way, point \
+             CUDA_OXIDE_BACKEND at it."
+        ),
+    ];
+    Some(format!("{}\n", lines.join("\n")))
+}
+
+/// Consults the shared backend cache at `cache_dir` (discovery step 4).
+///
+/// `source_dir` is the backend source the cache was built from when that
+/// source can change in place (the `main` clone); `expected_rev` is the commit
+/// the project's dependency resolves to, when it has one. Returns the cached
+/// `.so` when it is fresh. Returns `None` when the caller should fall through
+/// to a rebuild, after performing whichever invalidation the staleness verdict
+/// calls for. Exits the process with guidance when a toolchain mismatch
+/// already failed one heal attempt and rebuilding again cannot converge (see
+/// [`toolchain_heal_decision`]).
+fn consult_backend_cache(
+    cache_dir: &Path,
+    source_dir: Option<&Path>,
+    expected_rev: Option<&str>,
+) -> Option<PathBuf> {
+    let backend_filename = backend_filename_for_target(&active_host_target());
+    let cached_so = cache_dir.join(&backend_filename);
+    if !cached_so.exists() {
+        return None;
+    }
+    match cached_backend_status(&cached_so, source_dir, expected_rev) {
+        CacheStatus::Fresh => {
+            // The fingerprint check passed: end any heal cycle, so a future,
+            // unrelated mismatch gets its own one-shot heal attempt.
+            clear_heal_marker(cache_dir);
+            Some(cached_so)
+        }
+        CacheStatus::StaleVsBinary => {
+            invalidate_cache(cache_dir, &backend_filename);
+            None
+        }
+        CacheStatus::StaleVsToolchain if expected_rev.is_some() => {
+            // The rebuild source is the project's own checkout, and the caller
+            // already confirmed the project's toolchain is the one that commit
+            // needs, so this rebuild converges. The heal marker guards only
+            // the `main` clone path; drop any it left behind. The old `.so`
+            // stays until the replacement is installed over it.
             eprintln!(
-                "Cached backend source does not match pinned revision {}; \
-                 re-fetching it at {}.",
-                PINNED_SOURCE_REVISION,
-                cache_dir.display()
+                "Cached backend was built against a different Rust toolchain; rebuilding \
+                 from the project's dependency."
             );
-            invalidate_cache(cache_dir, backend_filename);
-        } else {
-            let source_dir = source_root.join("crates/rustc-codegen-cuda");
-            match cached_backend_status(&cached_backend, Some(&source_dir)) {
-                CacheStatus::Fresh => {
-                    clear_heal_marker(cache_dir);
-                    return cached_backend;
-                }
-                CacheStatus::StaleVsBinary => invalidate_cache(cache_dir, backend_filename),
-                CacheStatus::StaleVsToolchain => match toolchain_heal_decision(cache_dir) {
-                    ToolchainHealDecision::Heal => {
-                        eprintln!(
-                            "Cached backend was built against a different Rust \
-                             toolchain; re-fetching pinned source and rebuilding at {}.",
-                            cache_dir.display()
-                        );
-                        invalidate_cache(cache_dir, backend_filename);
-                    }
-                    ToolchainHealDecision::GiveUp { current, recorded } => {
-                        report_unhealable_toolchain_mismatch(&current, &recorded);
-                        std::process::exit(1);
-                    }
-                },
-                CacheStatus::StaleVsSource => {
-                    // The pinned checkout is still the exact source of truth,
-                    // so rebuild the library from it in place.
-                    eprintln!(
-                        "Cached backend source at {} is newer than the cached \
-                         library; rebuilding from it in place.",
-                        source_dir.display()
-                    );
-                }
+            clear_heal_marker(cache_dir);
+            None
+        }
+        CacheStatus::StaleVsToolchain => match toolchain_heal_decision(cache_dir) {
+            ToolchainHealDecision::Heal => {
+                eprintln!(
+                    "Cached backend was built against a different Rust \
+                     toolchain; re-cloning and rebuilding at {}.",
+                    cache_dir.display()
+                );
+                invalidate_cache(cache_dir, &backend_filename);
+                None
             }
+            ToolchainHealDecision::GiveUp { current, recorded } => {
+                report_unhealable_toolchain_mismatch(&current, &recorded);
+                std::process::exit(1);
+            }
+        },
+        CacheStatus::StaleVsDependency => {
+            // Fall through to a rebuild without deleting anything: the old
+            // `.so` and its record stay consistent for whichever project they
+            // belong to until `install_backend_into` replaces both, so a
+            // failed build never leaves the cache empty.
+            let recorded = recorded_source_rev(cache_dir)
+                .map(|rev| format!("cuda-oxide {}", backend_source::short_rev(&rev)))
+                .unwrap_or_else(|| "an unrecorded cuda-oxide commit".to_string());
+            eprintln!(
+                "Cached backend was built from {recorded}, but this project depends on \
+                 cuda-oxide {}; rebuilding from the project's dependency.",
+                backend_source::short_rev(expected_rev.unwrap_or("?"))
+            );
+            None
+        }
+        CacheStatus::StaleVsSource => {
+            // The cached source advanced; rebuild the `.so` from it in
+            // place. We do NOT invalidate the cache here, so the
+            // auto-fetch step below skips the clone (the source tree is
+            // still present) and rebuilds from the existing source.
+            eprintln!(
+                "Cached backend source at {} is newer than the cached \
+                 library; rebuilding from it in place.",
+                source_dir
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_default()
+            );
+            None
         }
     }
-
-    auto_fetch_and_build(cache_dir, backend_filename)
 }
 
 /// Returns where the backend dynamic library lives (or would live), with NO side
@@ -311,10 +532,9 @@ fn find_or_build_cached_backend(cache_dir: &Path, backend_filename: &str) -> Pat
 ///    so the caller can report the configured-but-absent path.
 /// 2. Project config (`.cargo/cuda-oxide.toml`), returned even when missing
 ///    so the caller can report the configured-but-absent path.
-/// 3. Packaged backend next to the running `cargo-oxide` executable.
-/// 4. Local repo host build path
-///    (`crates/rustc-codegen-cuda/target/<host>/<profile>/...`).
-/// 5. Cache path at `~/.cargo/cuda-oxide/<platform filename>`.
+/// 3. Packaged backend next to the running cargo-oxide executable.
+/// 4. Local repository or path dependency's host build path.
+/// 5. Cache path at ~/.cargo/cuda-oxide/<platform filename>.
 ///
 /// `cargo oxide doctor` uses this so that a diagnostic run never triggers a
 /// multi-minute backend build or a git clone before it can print anything.
@@ -337,6 +557,16 @@ pub fn backend_so_candidate(workspace_root: &Path, configured_backend: Option<&P
     let codegen_crate = workspace_root.join("crates/rustc-codegen-cuda");
     if codegen_crate.is_dir() {
         return backend_so_path_candidate(&codegen_crate);
+    }
+
+    // A path dependency builds in place (see `standalone_backend`), so its
+    // artifact is that checkout's own host build, not the shared cache.
+    // Read-only resolution: never fetches or writes; any failure (no
+    // Cargo.lock yet, no cargo) falls through to the cache path.
+    if let Ok(Some(source)) = backend_source::resolve_dependency_source(workspace_root, true)
+        && source.rev().is_none()
+    {
+        return backend_so_path_candidate(&source.codegen_crate());
     }
 
     cache_directory()
@@ -363,19 +593,31 @@ enum CacheStatus {
     /// an unloadable
     /// `.so` is stale regardless of mtimes.
     StaleVsToolchain,
+    /// The cached `.so` was built from a different cuda-oxide commit than the
+    /// one the project's dependency resolves to (or from an unrecorded one).
+    /// It loads fine but lowers the project's kernels with the wrong backend,
+    /// so it must be rebuilt from the project's own checkout.
+    StaleVsDependency,
 }
 
-/// Classifies the cached backend `.so` against the running `cargo-oxide`
-/// binary (the user upgraded the binary) and the newest backend source input
-/// (the developer advanced the source). When `source_dir` is `None`, or no
-/// source inputs can be found under it, only the binary check applies.
-/// Binary staleness takes precedence when both fire, since a binary upgrade
-/// requires a clean checkout of the embedded source revision.
+/// Classifies the cached backend `.so` against the active toolchain, the
+/// commit the project's dependency resolves to (`expected_rev`), the running
+/// `cargo-oxide` binary (the user upgraded the binary) and the newest backend
+/// source input (the developer advanced the source). When `source_dir` is
+/// `None`, or no source inputs can be found under it, the source check is
+/// skipped; when `expected_rev` is `None`, the commit check is skipped.
+/// Precedence when several fire: toolchain, dependency, binary, source. The
+/// first two make the cache wrong for this project outright; the binary check
+/// wants a fresh build regardless of source mtimes.
 ///
 /// Conservative on errors: if we can't stat the cached `.so`, we report
 /// [`CacheStatus::Fresh`] so a working cache is never invalidated on a failed
 /// metadata read.
-fn cached_backend_status(cached_so: &Path, source_dir: Option<&Path>) -> CacheStatus {
+fn cached_backend_status(
+    cached_so: &Path,
+    source_dir: Option<&Path>,
+    expected_rev: Option<&str>,
+) -> CacheStatus {
     let Ok(so_meta) = std::fs::metadata(cached_so) else {
         return CacheStatus::Fresh;
     };
@@ -390,6 +632,14 @@ fn cached_backend_status(cached_so: &Path, source_dir: Option<&Path>) -> CacheSt
         && toolchain_fingerprint_mismatch(cache_dir)
     {
         return CacheStatus::StaleVsToolchain;
+    }
+
+    // Dependency check: the cache must come from the commit this project
+    // compiles its kernels against.
+    if let (Some(cache_dir), Some(expected)) = (cached_so.parent(), expected_rev)
+        && dependency_rev_mismatch(cache_dir, expected)
+    {
+        return CacheStatus::StaleVsDependency;
     }
 
     let self_mtime = std::env::current_exe()
@@ -499,6 +749,65 @@ fn write_toolchain_fingerprint(cache_dir: &Path, build_dir: &Path) {
     if let Some(fp) = toolchain_fingerprint_in(build_dir) {
         let _ = std::fs::write(cache_dir.join(TOOLCHAIN_FINGERPRINT_FILE), fp);
     }
+}
+
+/// File next to the cached `.so` recording the cuda-oxide commit it was built
+/// from (the full hash).
+const SOURCE_REV_FILE: &str = "source-rev.txt";
+
+/// The commit recorded next to the cached `.so`, if any.
+fn recorded_source_rev(cache_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(cache_dir.join(SOURCE_REV_FILE))
+        .ok()
+        .map(|rev| rev.trim().to_string())
+        .filter(|rev| !rev.is_empty())
+}
+
+/// The commit the shared cache's backend was built from, for `doctor`.
+pub fn cached_backend_source_rev() -> Option<String> {
+    cache_directory().and_then(|dir| recorded_source_rev(&dir))
+}
+
+/// True when the cache was not built from `expected`. An unrecorded commit
+/// counts as a mismatch: such a cache predates this check (it was cloned from
+/// `main` at an unknown commit), and the one rebuild this triggers records
+/// the commit, so it cannot thrash.
+fn dependency_rev_mismatch(cache_dir: &Path, expected: &str) -> bool {
+    recorded_source_rev(cache_dir).as_deref() != Some(expected)
+}
+
+/// Records the commit the installed `.so` was built from, or forgets a stale
+/// record when the commit is unknown (a `main` clone, a checkout without git),
+/// so a later project can never match against a commit the cache did not come
+/// from. Best effort, like the fingerprint: a lost record costs one rebuild.
+fn record_source_rev(cache_dir: &Path, source_rev: Option<&str>) {
+    let path = cache_dir.join(SOURCE_REV_FILE);
+    match source_rev {
+        Some(rev) => {
+            let _ = std::fs::write(path, rev);
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// `HEAD` of the git repository containing `dir`, when there is one.
+///
+/// Used when the in-repo build is published to the shared cache. A dirty tree
+/// is recorded under its HEAD on purpose: the developer who runs `cargo oxide
+/// setup` wants projects on that commit to pick up the build they just made.
+fn repository_head(dir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|rev| !rev.is_empty())
 }
 
 /// File next to the cached `.so` recording the (active, recorded) fingerprint
@@ -653,34 +962,56 @@ fn invalidate_cache(cache_dir: &Path, backend_filename: &str) {
 fn clear_cache_contents(cache_dir: &Path, backend_filename: &str) {
     let _ = std::fs::remove_file(cache_dir.join(backend_filename));
     let _ = std::fs::remove_dir_all(cache_dir.join("src"));
+    // The record describes the `.so` just removed; without it, `doctor` would
+    // still report the commit of a backend that no longer exists.
+    let _ = std::fs::remove_file(cache_dir.join(SOURCE_REV_FILE));
 }
 
-/// Invalidate the shared cache and rebuild via auto-fetch (external projects).
+/// Rebuild the backend for the project in `project_dir` (external projects):
+/// from the commit its cuda-oxide dependency resolves to, in place for a path
+/// dependency, or from a fresh `main` clone without any dependency. The shared
+/// cache is cleared first whenever the project uses it.
 ///
-/// Returns the path to the freshly cached backend library.
-pub fn refresh_cached_backend() -> PathBuf {
-    let cache_dir = cache_directory().unwrap_or_else(|| {
-        eprintln!("Could not determine the cargo-oxide cache directory.");
-        std::process::exit(1);
-    });
-    let backend_filename = backend_filename_for_target(&active_host_target());
-
-    with_locked_backend_cache(&cache_dir, |locked_cache_dir| {
-        eprintln!(
-            "Clearing cached codegen backend at {}...",
-            locked_cache_dir.display()
-        );
-        clear_cache_contents(locked_cache_dir, &backend_filename);
-        auto_fetch_and_build(locked_cache_dir, &backend_filename)
-    })
-    .unwrap_or_else(|error| {
-        eprintln!("Failed to lock the cuda-oxide backend cache: {error}");
-        std::process::exit(1);
-    })
+/// Returns the path to the freshly built `.so`.
+pub fn refresh_cached_backend(project_dir: &Path) -> PathBuf {
+    // A path dependency builds in place and never touches the shared cache;
+    // clearing it would only cost other projects a rebuild. Read-only
+    // resolution here; the real one, which may fetch, runs in
+    // `standalone_backend`.
+    let builds_in_place = matches!(
+        backend_source::resolve_dependency_source(project_dir, true),
+        Ok(Some(ref source)) if source.rev().is_none()
+    );
+    if !builds_in_place {
+        if let Some(cache_dir) = cache_directory() {
+            let backend_filename = backend_filename_for_target(&active_host_target());
+            with_locked_backend_cache(&cache_dir, |dir| {
+                clear_cache_contents(dir, &backend_filename);
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("Failed to lock backend cache: {error}");
+                std::process::exit(1);
+            });
+        }
+    }
+    standalone_backend(project_dir)
 }
 
-/// Builds the backend from a local source tree.
+/// Builds the backend from a local source tree, with the build tree at
+/// `<codegen_crate>/target`: the layout the in-repo path, `cargo oxide setup`
+/// and the passive [`backend_so_path_candidate`] expect.
 pub fn build_backend_from_source(codegen_crate: &Path) -> PathBuf {
+    build_backend_from_source_in(codegen_crate, None)
+}
+
+/// Builds the backend from `codegen_crate`, with the build tree at
+/// `target_dir` when given and at `<codegen_crate>/target` otherwise.
+/// Dependency checkouts pass `~/.cargo/cuda-oxide/target`: one tree that
+/// cargo-oxide owns, that consecutive commits share their dependency builds
+/// in (pliron and friends rebuild only when they change), and that a user can
+/// delete to reclaim the space, instead of a build tree inside Cargo's
+/// checkout that nothing ever cleans up.
+pub fn build_backend_from_source_in(codegen_crate: &Path, target_dir: Option<&Path>) -> PathBuf {
     println!("Building rustc-codegen-cuda backend...");
     // The application build still honors these (codegen_env.rs folds them
     // into the composed flags), so say once why the backend build does not.
@@ -706,7 +1037,12 @@ pub fn build_backend_from_source(codegen_crate: &Path) -> PathBuf {
         .as_ref()
         .map(|s| rustc_sysroot_loader_dir(s, &host_target));
 
-    let mut cmd = backend_build_command(codegen_crate, loader_path.as_deref(), &host_target);
+    let mut cmd = backend_build_command_in(
+        codegen_crate,
+        target_dir,
+        loader_path.as_deref(),
+        &host_target,
+    );
     let output = cmd.output().unwrap_or_else(|error| {
         eprintln!("Failed to run cargo build for rustc-codegen-cuda: {error}");
         std::process::exit(1);
@@ -739,13 +1075,16 @@ pub fn build_backend_from_source(codegen_crate: &Path) -> PathBuf {
     so_path
 }
 
-fn backend_build_command(
+fn backend_build_command_in(
     codegen_crate: &Path,
+    target_dir: Option<&Path>,
     loader_path: Option<&Path>,
     host_target: &str,
 ) -> Command {
     let codegen_crate = absolute_path(codegen_crate);
-    let target_dir = codegen_crate.join("target");
+    let target_dir = target_dir
+        .map(absolute_path)
+        .unwrap_or_else(|| codegen_crate.join("target"));
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--locked", "--lib"]);
     if backend_build_profile(host_target) == "release" {
@@ -980,7 +1319,7 @@ pub enum CacheReport {
 /// Exposed so `doctor` can report the backend external projects resolve to,
 /// which is not the one the in-repo context uses.
 pub fn cached_backend_path() -> Option<PathBuf> {
-    cache_directory().map(|dir| dir.join("librustc_codegen_cuda.so"))
+    cache_directory().map(|dir| dir.join(backend_filename_for_target(&active_host_target())))
 }
 
 /// Compares a cached backend against one built locally.
@@ -1050,11 +1389,18 @@ fn auto_fetch_and_build(cache_dir: &Path, backend_filename: &str) -> PathBuf {
         }
     }
 
-    let codegen_crate = src_dir.join("crates/rustc-codegen-cuda");
+    refuse_unloadable_backend(&src_dir, "the pinned cuda-oxide checkout");
+    let codegen_crate = src_dir.join(CODEGEN_CRATE_SUBDIR);
     let built_backend = build_backend_from_source(&codegen_crate);
     if built_backend.exists() {
-        install_backend_into(cache_dir, backend_filename, &built_backend, &codegen_crate)
-            .expect("Failed to copy backend to cache");
+        install_backend_into(
+            cache_dir,
+            backend_filename,
+            &built_backend,
+            &codegen_crate,
+            None,
+        )
+        .expect("Failed to copy backend to cache");
         eprintln!("✓ Backend cached at {}", backend_path.display());
     }
 
@@ -1216,12 +1562,14 @@ fn fetch_source_at_revision(
 }
 
 /// Copies a freshly built backend into `cache_dir` and records the toolchain
-/// fingerprint beside it.
+/// fingerprint and the source commit beside it.
 ///
 /// The fingerprint must be written whenever the backend is. A backend installed
 /// without one falls back to the mtime checks, which cannot see a toolchain
 /// swap, so the next lookup would load a backend linked against the wrong
-/// `librustc_driver`.
+/// `librustc_driver`. The commit record follows the same rule: written with
+/// the `.so`, or removed when the commit is unknown (see
+/// [`record_source_rev`]).
 ///
 /// Takes the directories explicitly so it can be exercised without touching
 /// `CARGO_HOME`. `build_dir` is the backend source crate the `.so` was built
@@ -1232,6 +1580,7 @@ fn install_backend_into(
     backend_filename: &str,
     built_backend: &Path,
     build_dir: &Path,
+    source_rev: Option<&str>,
 ) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(cache_dir)?;
     let backend_path = cache_dir.join(backend_filename);
@@ -1240,11 +1589,22 @@ fn install_backend_into(
             (Ok(source), Ok(destination)) => source == destination,
             _ => false,
         };
+    // A failed copy must not retain an obsolete source revision.
+    record_source_rev(cache_dir, None);
     if !source_is_destination {
         std::fs::copy(built_backend, &backend_path)?;
     }
     write_toolchain_fingerprint(cache_dir, build_dir);
+    record_source_rev(cache_dir, source_rev);
     Ok(backend_path)
+}
+
+/// What [`publish_to_cache`] installed.
+pub struct PublishedBackend {
+    /// The cached `.so`.
+    pub path: PathBuf,
+    /// The commit recorded beside it, when the checkout is a git repository.
+    pub source_rev: Option<String>,
 }
 
 /// Publishes a freshly built backend to the shared cache at
@@ -1253,19 +1613,29 @@ fn install_backend_into(
 /// That path is what step 5 of the discovery order resolves to, and it is the
 /// only one a project outside this repository can reach: `find_workspace_root`
 /// walks up from the current directory looking for `crates/rustc-codegen-cuda`
-/// and finds nothing from an unrelated crate.
+/// and finds nothing from an unrelated crate. The checkout's HEAD is recorded
+/// beside the `.so`, so only projects whose dependency resolves to that commit
+/// reuse it.
 ///
 /// Returns `None` when the cache directory cannot be determined or the copy
 /// fails. Callers treat this as best effort: a failure leaves the in-repo build
 /// usable and costs external projects only a rebuild.
-pub fn publish_to_cache(built_so: &Path, codegen_crate: &Path) -> Option<PathBuf> {
+pub fn publish_to_cache(built_so: &Path, codegen_crate: &Path) -> Option<PublishedBackend> {
     let cache_dir = cache_directory()?;
     let backend_filename = backend_filename_for_target(&active_host_target());
-    with_locked_backend_cache(&cache_dir, |locked_cache_dir| {
-        install_backend_into(locked_cache_dir, &backend_filename, built_so, codegen_crate)
+    let source_rev = repository_head(codegen_crate);
+    let path = with_locked_backend_cache(&cache_dir, |locked_cache_dir| {
+        install_backend_into(
+            locked_cache_dir,
+            &backend_filename,
+            built_so,
+            codegen_crate,
+            source_rev.as_deref(),
+        )
     })
     .ok()?
-    .ok()
+    .ok()?;
+    Some(PublishedBackend { path, source_rev })
 }
 
 /// Returns the active rustc sysroot path.
@@ -1455,7 +1825,8 @@ mod tests {
         let codegen = root.join("codegen");
         let rustc_lib = root.join("rustc").join("lib");
         let target_dir = codegen.join("target");
-        let command = backend_build_command(&codegen, Some(&rustc_lib), "x86_64-unknown-linux-gnu");
+        let command =
+            backend_build_command_in(&codegen, None, Some(&rustc_lib), "x86_64-unknown-linux-gnu");
 
         let cargo_target_dir = command
             .get_envs()
@@ -1651,7 +2022,7 @@ mod tests {
     fn windows_backend_build_command_uses_release_profile() {
         let root = tempdir();
         let codegen = root.join("codegen");
-        let command = backend_build_command(&codegen, None, "x86_64-pc-windows-msvc");
+        let command = backend_build_command_in(&codegen, None, None, "x86_64-pc-windows-msvc");
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -1731,7 +2102,7 @@ mod tests {
         );
 
         assert_eq!(
-            cached_backend_status(&so, None),
+            cached_backend_status(&so, None, None),
             CacheStatus::StaleVsBinary,
             "cache backdated by 1y must be stale vs the running binary"
         );
@@ -1751,7 +2122,7 @@ mod tests {
         );
 
         assert_eq!(
-            cached_backend_status(&so, None),
+            cached_backend_status(&so, None, None),
             CacheStatus::Fresh,
             "cache postdating the test binary must be reported fresh"
         );
@@ -1764,22 +2135,27 @@ mod tests {
     fn not_stale_when_cache_file_missing() {
         let dir = tempdir();
         let so = dir.join("does_not_exist.so");
-        assert_eq!(cached_backend_status(&so, None), CacheStatus::Fresh);
+        assert_eq!(cached_backend_status(&so, None, None), CacheStatus::Fresh);
     }
 
     #[test]
-    fn clear_cache_contents_removes_so_and_src_tree() {
+    fn clear_cache_contents_removes_so_src_tree_and_commit_record() {
         let dir = tempdir();
         let so = dir.join("librustc_codegen_cuda.so");
         let src = dir.join("src/crates/rustc-codegen-cuda");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(&so, b"old").unwrap();
         std::fs::write(src.join("lib.rs"), b"fn main() {}").unwrap();
+        std::fs::write(dir.join(SOURCE_REV_FILE), "aaaa1111").unwrap();
 
         clear_cache_contents(&dir, "librustc_codegen_cuda.so");
 
         assert!(!so.exists());
         assert!(!dir.join("src").exists());
+        assert!(
+            !dir.join(SOURCE_REV_FILE).exists(),
+            "a record without its .so would misreport a backend that is gone"
+        );
     }
 
     /// A backend source input newer than the cached `.so` must report
@@ -1808,7 +2184,7 @@ mod tests {
         write_with_mtime(&dir.join("Cargo.toml"), b"[package]", SystemTime::now());
 
         assert_eq!(
-            cached_backend_status(&so, Some(&dir)),
+            cached_backend_status(&so, Some(&dir), None),
             CacheStatus::StaleVsSource,
             "source newer than cached .so must be stale vs source (rebuild in place)"
         );
@@ -1838,7 +2214,7 @@ mod tests {
         );
 
         assert_eq!(
-            cached_backend_status(&so, Some(&dir)),
+            cached_backend_status(&so, Some(&dir), None),
             CacheStatus::Fresh,
             "source older than cached .so must be reported fresh"
         );
@@ -1857,7 +2233,7 @@ mod tests {
         );
         let absent = dir.join("no-such-src-tree");
         assert_eq!(
-            cached_backend_status(&so, Some(&absent)),
+            cached_backend_status(&so, Some(&absent), None),
             CacheStatus::Fresh,
             "absent source tree must fall back to binary-only (fresh here)"
         );
@@ -1884,7 +2260,7 @@ mod tests {
         );
 
         assert_eq!(
-            cached_backend_status(&so, Some(&dir)),
+            cached_backend_status(&so, Some(&dir), None),
             CacheStatus::StaleVsBinary,
             "binary staleness must win over source staleness"
         );
@@ -2024,7 +2400,7 @@ mod tests {
 
         let cache = dir.join("cache");
         let backend_filename = "backend.bin";
-        let installed = install_backend_into(&cache, backend_filename, &source, &dir)
+        let installed = install_backend_into(&cache, backend_filename, &source, &dir, None)
             .expect("install must succeed");
 
         assert_eq!(
@@ -2062,7 +2438,7 @@ mod tests {
         let source = dir.join("built.so");
         std::fs::write(&source, b"fresh").unwrap();
 
-        let installed = install_backend_into(&cache, backend_filename, &source, &dir)
+        let installed = install_backend_into(&cache, backend_filename, &source, &dir, None)
             .expect("install must succeed");
 
         assert_eq!(
@@ -2084,7 +2460,7 @@ mod tests {
         let source = cache.join(backend_filename);
         std::fs::write(&source, b"built").unwrap();
 
-        let installed = install_backend_into(&cache, backend_filename, &source, &dir)
+        let installed = install_backend_into(&cache, backend_filename, &source, &dir, None)
             .expect("install must succeed");
 
         assert_eq!(installed, source);
@@ -2111,7 +2487,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            cached_backend_status(&so, None),
+            cached_backend_status(&so, None, None),
             CacheStatus::StaleVsToolchain,
             "a recorded fingerprint differing from the active toolchain must be stale"
         );
@@ -2131,7 +2507,7 @@ mod tests {
         std::fs::write(dir.join(TOOLCHAIN_FINGERPRINT_FILE), fp).unwrap();
 
         assert_eq!(
-            cached_backend_status(&so, None),
+            cached_backend_status(&so, None, None),
             CacheStatus::Fresh,
             "a matching fingerprint with fresh mtimes must be fresh"
         );
@@ -2148,7 +2524,7 @@ mod tests {
         write_with_mtime(&so, b"built", SystemTime::now() + year);
         // No fingerprint file written.
         assert_eq!(
-            cached_backend_status(&so, None),
+            cached_backend_status(&so, None, None),
             CacheStatus::Fresh,
             "absent fingerprint must defer to mtime checks (fresh here)"
         );
@@ -2172,7 +2548,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            cached_backend_status(&so, None),
+            cached_backend_status(&so, None, None),
             CacheStatus::StaleVsToolchain,
             "toolchain mismatch must win over binary staleness"
         );
@@ -2237,17 +2613,415 @@ mod tests {
         };
         let year = Duration::from_secs(365 * 24 * 60 * 60);
         let dir = tempdir();
-        let so = dir.join("librustc_codegen_cuda.so");
+        let so = dir.join(backend_filename_for_target(&active_host_target()));
         write_with_mtime(&so, b"built", SystemTime::now() + year);
         std::fs::write(dir.join(TOOLCHAIN_FINGERPRINT_FILE), fp).unwrap();
         std::fs::write(dir.join(TOOLCHAIN_HEAL_MARKER_FILE), "stale heal memory").unwrap();
 
-        assert_eq!(cached_backend_status(&so, None), CacheStatus::Fresh);
-        clear_heal_marker(&dir);
+        assert_eq!(
+            consult_backend_cache(&dir, None, None),
+            Some(so),
+            "a matching fingerprint with fresh mtimes must reuse the cache"
+        );
         assert!(
             !dir.join(TOOLCHAIN_HEAL_MARKER_FILE).exists(),
             "a passing fingerprint check must clear the heal marker"
         );
+    }
+
+    /// The cache records the cuda-oxide commit it was built from. A project
+    /// whose dependency resolves to another commit must not load it, however
+    /// fresh the mtimes look: its kernels compile against `cuda-device` at one
+    /// commit and would be lowered by a backend from another.
+    #[test]
+    fn stale_when_cache_was_built_from_another_commit() {
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        write_with_mtime(&so, b"built", SystemTime::now() + year);
+        std::fs::write(dir.join(SOURCE_REV_FILE), "aaaa1111\n").unwrap();
+
+        assert_eq!(
+            cached_backend_status(&so, None, Some("bbbb2222")),
+            CacheStatus::StaleVsDependency,
+            "a cache from another commit must be stale for this project"
+        );
+    }
+
+    #[test]
+    fn fresh_when_cache_matches_the_dependency_commit() {
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        write_with_mtime(&so, b"built", SystemTime::now() + year);
+        std::fs::write(dir.join(SOURCE_REV_FILE), "aaaa1111\n").unwrap();
+
+        assert_eq!(
+            cached_backend_status(&so, None, Some("aaaa1111")),
+            CacheStatus::Fresh,
+            "a cache from the project's own commit must be reused"
+        );
+    }
+
+    /// A cache with no recorded commit predates this check: it came from a
+    /// `main` clone at an unknown commit. When the project pins one, rebuild
+    /// once; the rebuild records the commit, so this fires once, not forever.
+    #[test]
+    fn unrecorded_commit_is_stale_when_the_project_pins_one() {
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        write_with_mtime(&so, b"built", SystemTime::now() + year);
+
+        assert_eq!(
+            cached_backend_status(&so, None, Some("aaaa1111")),
+            CacheStatus::StaleVsDependency,
+            "an unrecorded commit cannot be trusted to match the project's"
+        );
+    }
+
+    /// A project with no cuda-oxide dependency pins nothing, so whatever
+    /// commit the cache records is no reason to rebuild.
+    #[test]
+    fn recorded_commit_is_ignored_when_the_project_pins_none() {
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        write_with_mtime(&so, b"built", SystemTime::now() + year);
+        std::fs::write(dir.join(SOURCE_REV_FILE), "aaaa1111\n").unwrap();
+
+        assert_eq!(
+            cached_backend_status(&so, None, None),
+            CacheStatus::Fresh,
+            "no expected commit means no commit check"
+        );
+    }
+
+    /// An unloadable `.so` is stale whichever commit it came from, so the
+    /// toolchain verdict (and its heal guard) keeps the highest precedence.
+    #[test]
+    fn toolchain_staleness_takes_precedence_over_dependency() {
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        write_with_mtime(&so, b"built", SystemTime::now() + year);
+        std::fs::write(
+            dir.join(TOOLCHAIN_FINGERPRINT_FILE),
+            "rustc 0.0.0 (deadbeef 1970-01-01)",
+        )
+        .unwrap();
+        std::fs::write(dir.join(SOURCE_REV_FILE), "aaaa1111\n").unwrap();
+
+        assert_eq!(
+            cached_backend_status(&so, None, Some("bbbb2222")),
+            CacheStatus::StaleVsToolchain,
+            "toolchain mismatch must win over a commit mismatch"
+        );
+    }
+
+    /// A binary upgrade and a commit change both rebuild from the project's
+    /// checkout; the commit verdict wins so the message names the real cause.
+    #[test]
+    fn dependency_staleness_takes_precedence_over_binary() {
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        // Backdate the `.so` so binary-staleness would otherwise fire.
+        write_with_mtime(&so, b"built", SystemTime::now() - year);
+        std::fs::write(dir.join(SOURCE_REV_FILE), "aaaa1111\n").unwrap();
+
+        assert_eq!(
+            cached_backend_status(&so, None, Some("bbbb2222")),
+            CacheStatus::StaleVsDependency,
+            "commit mismatch must win over binary staleness"
+        );
+    }
+
+    /// Installing writes the commit beside the `.so`, and installing a build
+    /// of unknown origin removes any earlier record: a stale record would let
+    /// a later project match a cache that did not come from its commit.
+    #[test]
+    fn installing_records_the_source_commit_and_forgets_an_unknown_one() {
+        let dir = tempdir();
+        let source = dir.join("built.so");
+        std::fs::write(&source, b"built").unwrap();
+        let cache = dir.join("cache");
+
+        let filename = backend_filename_for_target(&active_host_target());
+        install_backend_into(&cache, &filename, &source, &dir, Some("aaaa1111")).expect("install");
+        assert_eq!(
+            std::fs::read_to_string(cache.join(SOURCE_REV_FILE)).unwrap(),
+            "aaaa1111",
+            "installing must record the source commit"
+        );
+
+        install_backend_into(&cache, &filename, &source, &dir, None).expect("install");
+        assert!(
+            !cache.join(SOURCE_REV_FILE).exists(),
+            "a build of unknown origin must not keep the previous commit record"
+        );
+    }
+
+    /// A commit mismatch falls through to a rebuild without deleting anything:
+    /// the old `.so` and its record stay consistent for the project they
+    /// belong to until the replacement is installed over them, so a failed
+    /// build never empties the cache. It must not touch the heal marker
+    /// machinery either, which belongs to toolchain mismatches.
+    #[test]
+    fn dependency_mismatch_keeps_the_old_cache_until_replaced() {
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join(backend_filename_for_target(&active_host_target()));
+        write_with_mtime(&so, b"built", SystemTime::now() + year);
+        std::fs::write(dir.join(SOURCE_REV_FILE), "aaaa1111\n").unwrap();
+
+        assert_eq!(
+            consult_backend_cache(&dir, None, Some("bbbb2222")),
+            None,
+            "a cache from another commit must not be handed out"
+        );
+        assert!(
+            so.exists(),
+            "the old backend stays until the replacement lands"
+        );
+        assert_eq!(
+            recorded_source_rev(&dir).as_deref(),
+            Some("aaaa1111"),
+            "the old record stays with the old backend"
+        );
+        assert!(
+            !dir.join(TOOLCHAIN_HEAL_MARKER_FILE).exists(),
+            "a commit mismatch is not a toolchain heal attempt"
+        );
+    }
+
+    /// A toolchain mismatch with a pinned dependency must not consult the
+    /// heal-marker gate: the rebuild comes from the project's own checkout and
+    /// converges, so a marker left by the `main` clone path (or by the
+    /// previous cargo-oxide, whose users this fix targets) is dropped rather
+    /// than turned into a "cannot converge" exit. The old `.so` stays until
+    /// the replacement is installed. Without a pinned dependency the gate
+    /// still applies.
+    #[test]
+    fn toolchain_mismatch_with_a_pinned_dependency_rebuilds_instead_of_giving_up() {
+        let Some(current) = current_toolchain_fingerprint() else {
+            return; // no rustc here; nothing to observe
+        };
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join(backend_filename_for_target(&active_host_target()));
+        write_with_mtime(&so, b"built", SystemTime::now() + year);
+        let recorded = "rustc 0.0.0 (deadbeef 1970-01-01)";
+        std::fs::write(dir.join(TOOLCHAIN_FINGERPRINT_FILE), recorded).unwrap();
+        std::fs::write(
+            dir.join(TOOLCHAIN_HEAL_MARKER_FILE),
+            heal_marker_content(&current, recorded),
+        )
+        .unwrap();
+
+        assert_eq!(
+            consult_backend_cache(&dir, None, Some("aaaa1111")),
+            None,
+            "a toolchain mismatch must fall through to a rebuild from the dependency"
+        );
+        assert!(
+            so.exists(),
+            "the old backend stays until the replacement lands"
+        );
+        assert!(
+            !dir.join(TOOLCHAIN_HEAL_MARKER_FILE).exists(),
+            "the heal marker belongs to the main-clone path and must be dropped"
+        );
+
+        std::fs::write(
+            dir.join(TOOLCHAIN_HEAL_MARKER_FILE),
+            heal_marker_content(&current, recorded),
+        )
+        .unwrap();
+        assert_eq!(
+            toolchain_heal_decision(&dir),
+            ToolchainHealDecision::GiveUp {
+                current,
+                recorded: recorded.to_string(),
+            },
+            "without a pinned dependency the same marker still means \"already tried\""
+        );
+    }
+
+    /// Dependency checkouts build into the shared cache's `target`, not into
+    /// Cargo's checkout; the in-repo default stays `<crate>/target`.
+    #[test]
+    fn backend_build_command_honours_a_target_dir_override() {
+        let dir = tempdir();
+        let codegen = dir.join("codegen");
+        let target = dir.join("cache/target");
+        let command =
+            backend_build_command_in(&codegen, Some(&target), None, &active_host_target());
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--target-dir", target.to_str().unwrap()])
+        );
+        let cargo_target_dir = command
+            .get_envs()
+            .find_map(|(key, value)| (key == OsStr::new("CARGO_TARGET_DIR")).then_some(value));
+        assert_eq!(cargo_target_dir.flatten(), Some(target.as_os_str()));
+        assert_eq!(command.get_current_dir(), Some(codegen.as_path()));
+
+        let default = backend_build_command_in(&codegen, None, None, &active_host_target());
+        let args = default
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--target-dir", codegen.join("target").to_str().unwrap()])
+        );
+    }
+
+    /// The refusal compares the ACTIVE toolchain (what the proxy exported and
+    /// what will build and load the backend) with the channel the checkout
+    /// needs, fires only when both are known and differ, tolerates rustup's
+    /// host-suffixed names, and names the channel to set plus the escape
+    /// hatch. Comparing two `rustc -vV` fingerprints instead would never fire
+    /// under `cargo oxide`, where `RUSTUP_TOOLCHAIN` makes both resolve alike.
+    #[test]
+    fn unloadable_backend_report_compares_channels_and_names_the_fix() {
+        let dep = "cuda-oxide 596a6353de (git dependency)";
+        let april = "nightly-2026-04-03-x86_64-unknown-linux-gnu (overridden by environment \
+                     variable RUSTUP_TOOLCHAIN)";
+        let august =
+            "nightly-2026-08-28-x86_64-unknown-linux-gnu (overridden by '/p/rust-toolchain.toml')";
+
+        assert_eq!(
+            unloadable_backend_report(dep, None, Some("nightly-2026-08-28")),
+            None,
+            "no rustup means no verdict; let the build proceed"
+        );
+        assert_eq!(
+            unloadable_backend_report(dep, Some(april), None),
+            None,
+            "a checkout without a toolchain file pins nothing to compare with"
+        );
+        assert_eq!(
+            unloadable_backend_report(dep, Some(august), Some("nightly-2026-08-28")),
+            None,
+            "the host-suffixed active name matches its channel"
+        );
+
+        let report = unloadable_backend_report(dep, Some(april), Some("nightly-2026-08-28"))
+            .expect("a different channel must be refused");
+        assert!(
+            report.contains("needs Rust `nightly-2026-08-28`"),
+            "{report}"
+        );
+        assert!(
+            report.contains("using `nightly-2026-04-03-x86_64-unknown-linux-gnu`"),
+            "the active toolchain must be named without rustup's trailing reason: {report}"
+        );
+        assert!(
+            report.contains(
+                "Set `channel = \"nightly-2026-08-28\"` in this project's rust-toolchain.toml"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("CUDA_OXIDE_BACKEND"), "{report}");
+    }
+
+    /// The commit verdict outranks the source-mtime verdict: the wrong commit
+    /// is the wrong backend whatever the mtimes say.
+    #[test]
+    fn dependency_staleness_takes_precedence_over_source() {
+        let year = Duration::from_secs(365 * 24 * 60 * 60);
+        let dir = tempdir();
+        let so = dir.join("librustc_codegen_cuda.so");
+        write_with_mtime(&so, b"built", SystemTime::now() + year);
+        std::fs::write(dir.join(SOURCE_REV_FILE), "aaaa1111\n").unwrap();
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        write_with_mtime(
+            &src.join("lib.rs"),
+            b"// newer",
+            SystemTime::now() + year + year,
+        );
+
+        assert_eq!(
+            cached_backend_status(&so, Some(&dir), Some("bbbb2222")),
+            CacheStatus::StaleVsDependency,
+            "commit mismatch must win over source staleness"
+        );
+    }
+
+    /// `setup` records the repository HEAD beside the published `.so`, and
+    /// `dependency_rev_mismatch` compares it byte for byte with the 40-hex
+    /// commit Cargo reports. So it must be the full hash, trimmed, resolved
+    /// from a directory inside the repository, and unaffected by a dirty tree.
+    #[test]
+    fn repository_head_is_the_full_commit_of_the_enclosing_repo() {
+        let repo = tempdir();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+        };
+        if !git(&["init", "-q"]).is_ok_and(|output| output.status.success()) {
+            return; // no git here; nothing to observe
+        }
+        let committed = git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .unwrap();
+        assert!(
+            committed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&committed.stderr)
+        );
+        let expected = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).unwrap().stdout)
+            .trim()
+            .to_string();
+        assert_eq!(expected.len(), 40, "git must report the full hash");
+
+        let nested = repo.join(CODEGEN_CRATE_SUBDIR);
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            repository_head(&nested),
+            Some(expected.clone()),
+            "HEAD must resolve from the backend crate directory inside the repo"
+        );
+
+        std::fs::write(repo.join("dirty.txt"), b"uncommitted").unwrap();
+        assert_eq!(
+            repository_head(&nested),
+            Some(expected),
+            "a dirty tree is recorded under its HEAD"
+        );
+
+        let outside = tempdir();
+        let in_a_repo = Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(&outside)
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !in_a_repo {
+            assert_eq!(
+                repository_head(&outside),
+                None,
+                "outside any repository there is nothing to record"
+            );
+        }
     }
 
     fn tempdir() -> PathBuf {

@@ -16,6 +16,12 @@ use super::*;
 const GIT_REPO: &str = backend::PINNED_SOURCE_REPOSITORY;
 const GIT_REV: &str = backend::PINNED_SOURCE_REVISION;
 
+/// crates.io release of the host-side runtime shared with cutile-rs
+/// (`cuda-core`, `cuda-async`). The device and host glue crates above still
+/// come from this repository; the runtime is published from NVlabs/cutile-rs
+/// and the SIMT surface lives under its `simt` modules.
+pub(super) const SHARED_HOST_CRATES_VERSION: &str = "0.3.1";
+
 const RUST_TOOLCHAIN_TOML: &str = include_str!("../../../../rust-toolchain.toml");
 const CARGO_CONFIG_TOML: &str = include_str!("../../../../.cargo/config.toml");
 
@@ -113,9 +119,9 @@ edition = "2024"
 [dependencies]
 cuda-device = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
 cuda-host = {{ git = "{GIT_REPO}", rev = "{GIT_REV}", features = ["async"] }}
-cuda-core = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
-cuda-async = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
-cuda-bindings = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
+# Shared host-side runtime, published from NVlabs/cutile-rs.
+cuda-core = "{SHARED_HOST_CRATES_VERSION}"
+cuda-async = "{SHARED_HOST_CRATES_VERSION}"
 tokio = {{ version = "1", features = ["rt", "rt-multi-thread", "macros"] }}
 "#
         )
@@ -131,7 +137,8 @@ edition = "2024"
 [dependencies]
 cuda-device = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
 cuda-host = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
-cuda-core = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
+# Shared host-side runtime, published from NVlabs/cutile-rs.
+cuda-core = "{SHARED_HOST_CRATES_VERSION}"
 "#
         )
     }
@@ -139,9 +146,9 @@ cuda-core = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
 
 fn scaffold_main_rs(async_mode: bool) -> String {
     if async_mode {
-        r#"use cuda_async::device_context::init_device_contexts;
-use cuda_async::device_operation::DeviceOperation;
-use cuda_core::LaunchConfig;
+        r#"use cuda_async::simt::device_context::{init_device_contexts, with_cuda_context};
+use cuda_async::simt::device_operation::DeviceOperation;
+use cuda_core::simt::LaunchConfig;
 use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_module;
 
@@ -161,8 +168,8 @@ mod kernels {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use cuda_async::device_box::DeviceBox;
-    use cuda_core::memory::{malloc_async, memcpy_dtoh_async, memcpy_htod_async};
+    use cuda_async::simt::device_box::DeviceBox;
+    use cuda_core::simt::memory::{malloc_async, memcpy_dtoh_async, memcpy_htod_async};
     use std::mem;
 
     init_device_contexts(0, 1)?;
@@ -172,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a_host: Vec<f32> = (0..N).map(|i| i as f32).collect();
     let b_host: Vec<f32> = (0..N).map(|i| (i * 2) as f32).collect();
 
-    let (a_dev, b_dev, mut c_dev) = cuda_async::device_context::with_cuda_context(0, |ctx| {
+    let (a_dev, b_dev, mut c_dev) = with_cuda_context(0, |ctx| {
         let stream = ctx.default_stream();
         let num_bytes = N * mem::size_of::<f32>();
         unsafe {
@@ -203,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .sync()?;
 
     let mut c_host = vec![0.0f32; N];
-    cuda_async::device_context::with_cuda_context(0, |ctx| {
+    with_cuda_context(0, |ctx| {
         let stream = ctx.default_stream();
         unsafe {
             memcpy_dtoh_async(
@@ -352,14 +359,7 @@ mod tests {
             (false, ["cuda-device", "cuda-host", "cuda-core"].as_slice()),
             (
                 true,
-                [
-                    "cuda-device",
-                    "cuda-host",
-                    "cuda-core",
-                    "cuda-async",
-                    "cuda-bindings",
-                ]
-                .as_slice(),
+                ["cuda-device", "cuda-host", "cuda-core", "cuda-async"].as_slice(),
             ),
         ] {
             let manifest = scaffold_cargo_toml("pin-test", async_mode);
@@ -367,6 +367,13 @@ mod tests {
             let dependencies = parsed["dependencies"].as_table().unwrap();
 
             for name in expected_dependencies {
+                if !matches!(*name, "cuda-device" | "cuda-host") {
+                    assert_eq!(
+                        dependencies[*name].as_str(),
+                        Some(SHARED_HOST_CRATES_VERSION)
+                    );
+                    continue;
+                }
                 let dependency = dependencies[*name].as_table().unwrap();
                 assert_eq!(dependency["git"].as_str(), Some(GIT_REPO));
                 assert_eq!(dependency["rev"].as_str(), Some(GIT_REV));

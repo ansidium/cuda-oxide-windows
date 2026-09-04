@@ -11,7 +11,7 @@ from a fresh checkout. If you just want to run an example, the
 | Dependency       | Version                       | Purpose                                                     |
 |:-----------------|:----------------------------- |:------------------------------------------------------------|
 | **Rust**         | Latest stable                 | Compiler toolchain with `rustc-dev` for the codegen backend |
-| **CUDA Toolkit** | 12.x+                         | Driver API, `nvcc`, PTX assembler                           |
+| **CUDA Toolkit** | 13.0+ (with cuRAND headers)   | Driver API, `nvcc`, PTX assembler; `curand.h` for bindgen   |
 | **Clang**        | 21+ (`clang-21` pkg)          | `bindgen` in host `cuda-bindings` needs clang's headers     |
 | **Linux**        | Tested on Ubuntu 24.04        | Upstream-compatible path                                    |
 | **Windows**      | Windows 10 22H2/11, MSVC      | Experimental fork path, `x86_64-pc-windows-msvc` only       |
@@ -64,7 +64,7 @@ Make sure the CUDA toolkit is on your `PATH`:
 
 ```bash
 export PATH="/usr/local/cuda/bin:$PATH"
-nvcc --version   # should print 12.x or later
+nvcc --version   # should print 13.x or later
 ```
 
 If you are building on a system without a GPU (e.g. CI), the toolkit is still
@@ -141,8 +141,10 @@ sudo apt install clang-21   # or libclang-common-21-dev
 
 ## Build the workspace
 
-The main workspace contains the user-facing crates (`cuda-device`, `cuda-core`,
-`cuda-async`, etc.) and the build tooling (`cargo-oxide`):
+The main workspace contains the user-facing crates (`cuda-device`, `cuda-host`,
+`cuda-macros`, etc.) and the build tooling (`cargo-oxide`). The host runtime
+(`cuda-bindings`, `cuda-core`, `cuda-async`) is shared with cutile-rs and comes
+from crates.io:
 
 ```bash
 cargo build
@@ -246,9 +248,10 @@ Standard `cargo doc` works for the workspace crates:
 cargo doc --no-deps --open
 ```
 
-This generates rustdoc for `cuda-device`, `cuda-core`, `cuda-async`, and all
+This generates rustdoc for `cuda-device`, `cuda-host`, `cuda-macros`, and all
 other workspace members. The codegen backend is excluded since it is not a
-workspace member.
+workspace member, and the shared host runtime (`cuda-core`, `cuda-async`) is
+documented from cutile-rs.
 
 ## Workspace structure
 
@@ -260,9 +263,8 @@ cuda-oxide/
 │   ├── cuda-device/          # Device intrinsics (#![no_std])
 │   ├── cuda-host/            # Host launch APIs
 │   ├── cuda-macros/          # Proc macros (#[kernel], #[device], gpu_printf!)
-│   ├── cuda-bindings/        # Raw bindgen FFI to cuda.h
-│   ├── cuda-core/            # Safe RAII wrappers (CudaContext, DeviceBuffer)
-│   ├── cuda-async/           # Async execution (DeviceOperation, DeviceFuture)
+│   │                         # (cuda-bindings, cuda-core, cuda-async come from
+│   │                         #  NVlabs/cutile-rs; SIMT API under their simt modules)
 │   ├── cargo-oxide/          # Cargo subcommand
 │   ├── rustc-codegen-cuda/   # Codegen backend (not a workspace member)
 │   ├── mir-importer/         # MIR → Pliron IR translation

@@ -12,7 +12,7 @@ extra-rustflags = ["-Zinline-mir=no"]
 [dependencies]
 cuda-device = { path = "../../../cuda-device" }
 cuda-host = { path = "../../../cuda-host" }
-cuda-core = { path = "../../../cuda-core" }
+cuda-core = "0.3.1"
 
 # The mir-importer intercepts `DisjointSlice::len` only when rustc's MIR
 # inliner leaves the call intact. cargo-oxide reads this package metadata and

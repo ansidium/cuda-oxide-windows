@@ -9,8 +9,8 @@ This section walks through everything you need to get `cargo oxide run vecadd` w
 | Requirement      | Version             | Notes                                                         |
 |------------------|---------------------|---------------------------------------------------------------|
 | **Linux**        | Ubuntu 24.04 tested | Other distros may work but are untested                       |
-| **NVIDIA GPU**   | Ampere+ (sm_80+)    | Driver 545+ recommended                                       |
-| **CUDA Toolkit** | 12.x+               | `nvcc` and `cuda.h` must be available                         |
+| **NVIDIA GPU**   | Ampere+ (sm_80+)    | Driver 580+ (a CUDA 13.x driver; loaded at run time)          |
+| **CUDA Toolkit** | 13.0+               | `nvcc`, `cuda.h` and `curand.h` must be available             |
 | **LLVM**         | 21+                 | Must include the NVPTX backend                                |
 | **Clang**        | 21+                 | `clang-21` — needed by `bindgen` for host `cuda-bindings`     |
 | **Rust**         | Latest stable       | Selected by `rust-toolchain.toml`                             |
@@ -34,7 +34,7 @@ installed.
 The host does not need the CUDA Toolkit installed. It does need:
 
 - an NVIDIA GPU
-- an NVIDIA driver compatible with CUDA 13.0
+- an NVIDIA driver compatible with CUDA 13.0 (R580 or newer)
 - Docker with the NVIDIA Container Toolkit installed
 
 With a devcontainer-aware editor, open the repository and choose "Reopen in
