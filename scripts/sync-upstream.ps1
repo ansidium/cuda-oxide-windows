@@ -169,10 +169,9 @@ function Invoke-Checks {
 
     $checks = @(
         [pscustomobject]@{ Name = 'cargo test -p cargo-oxide'; Args = @('test', '-p', 'cargo-oxide') },
-        [pscustomobject]@{ Name = 'cargo test -p cuda-core --lib'; Args = @('test', '-p', 'cuda-core', '--lib') },
-        [pscustomobject]@{ Name = 'cargo test -p cuda-async'; Args = @('test', '-p', 'cuda-async') },
-        [pscustomobject]@{ Name = 'cargo test -p cuda-host'; Args = @('test', '-p', 'cuda-host') },
-        [pscustomobject]@{ Name = 'cargo test -p oxide-artifacts --features object'; Args = @('test', '-p', 'oxide-artifacts', '--features', 'object') },
+        [pscustomobject]@{ Name = 'cargo test -p cuda-toolkit-discovery -p libnvvm-sys -p nvjitlink-sys'; Args = @('test', '-p', 'cuda-toolkit-discovery', '-p', 'libnvvm-sys', '-p', 'nvjitlink-sys') },
+        [pscustomobject]@{ Name = 'cargo test -p cuda-host --features async'; Args = @('test', '-p', 'cuda-host', '--features', 'async') },
+        [pscustomobject]@{ Name = 'cargo test --manifest-path crates/oxide-artifacts/Cargo.toml --features object'; Args = @('test', '--manifest-path', 'crates/oxide-artifacts/Cargo.toml', '--features', 'object') },
         [pscustomobject]@{ Name = 'cargo clippy --workspace -- -D warnings'; Args = @('clippy', '--workspace', '--', '-D', 'warnings') },
         [pscustomobject]@{ Name = 'cargo doc --no-deps --workspace'; Args = @('doc', '--no-deps', '--workspace') }
     )

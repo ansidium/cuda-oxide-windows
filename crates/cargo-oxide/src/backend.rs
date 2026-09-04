@@ -982,17 +982,15 @@ pub fn refresh_cached_backend(project_dir: &Path) -> PathBuf {
         backend_source::resolve_dependency_source(project_dir, true),
         Ok(Some(ref source)) if source.rev().is_none()
     );
-    if !builds_in_place {
-        if let Some(cache_dir) = cache_directory() {
-            let backend_filename = backend_filename_for_target(&active_host_target());
-            with_locked_backend_cache(&cache_dir, |dir| {
-                clear_cache_contents(dir, &backend_filename);
-            })
-            .unwrap_or_else(|error| {
-                eprintln!("Failed to lock backend cache: {error}");
-                std::process::exit(1);
-            });
-        }
+    if !builds_in_place && let Some(cache_dir) = cache_directory() {
+        let backend_filename = backend_filename_for_target(&active_host_target());
+        with_locked_backend_cache(&cache_dir, |dir| {
+            clear_cache_contents(dir, &backend_filename);
+        })
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to lock backend cache: {error}");
+            std::process::exit(1);
+        });
     }
     standalone_backend(project_dir)
 }

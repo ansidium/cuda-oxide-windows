@@ -1,5 +1,3 @@
-cargo-features = ["profile-rustflags"]
-
 [package]
 name = "reborrow"
 version = "0.1.0"
@@ -19,5 +17,5 @@ cuda-core = "0.3.1"
 # in every build of this example, without borrowing the device debug mode for
 # it. (A global RUSTFLAGS entry would re-key every dependency unit and force a
 # full second dependency-tree build in CI; see disjoint_slice_len.)
-[profile.release.package.reborrow]
-rustflags = ["-Zmir-opt-level=0"]
+[package.metadata.cuda-oxide]
+extra-rustflags = ["-Zmir-opt-level=0"]

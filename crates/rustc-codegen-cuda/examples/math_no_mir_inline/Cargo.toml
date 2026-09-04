@@ -1,5 +1,3 @@
-cargo-features = ["profile-rustflags"]
-
 [package]
 name = "math_no_mir_inline"
 version = "0.1.0"
@@ -23,5 +21,5 @@ cuda-core = "0.3.1"
 # itself. Scoping the flag to this one crate keeps the shared dependency tree
 # identical to every other example; a global RUSTFLAGS entry would re-key every
 # dependency unit and force a full second dependency-tree build in CI.
-[profile.release.package.math_no_mir_inline]
-rustflags = ["-Zinline-mir=no"]
+[package.metadata.cuda-oxide]
+extra-rustflags = ["-Zinline-mir=no"]

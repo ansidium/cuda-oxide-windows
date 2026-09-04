@@ -78,10 +78,9 @@ No-GPU sync checks after merge:
 ```powershell
 cargo fmt --all --check
 cargo test -p cargo-oxide
-cargo test -p cuda-core --lib
-cargo test -p cuda-async
-cargo test -p cuda-host
-cargo test -p oxide-artifacts --features object
+cargo test -p cuda-toolkit-discovery -p libnvvm-sys -p nvjitlink-sys
+cargo test -p cuda-host --features async
+cargo test --manifest-path crates/oxide-artifacts/Cargo.toml --features object
 cargo clippy --workspace -- -D warnings
 cargo doc --no-deps --workspace
 ```
