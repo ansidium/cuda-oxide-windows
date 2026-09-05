@@ -9,7 +9,7 @@ This section walks through installing cuda-oxide, creating a project, writing a 
 If you haven't already, install the build tool with the stable toolchain:
 
 ```bash
-cargo +stable install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev f5d11395c27069120929e5a8e29c9d4e61feeeed cargo-oxide
+cargo +stable install --locked --git https://github.com/ansidium/cuda-oxide-windows.git --rev fd78fdebddfc5f9363ef5668fc88eabdacf73940 cargo-oxide
 ```
 
 Verify that your environment is set up correctly:
