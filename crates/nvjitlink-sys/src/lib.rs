@@ -708,11 +708,13 @@ struct WindowsFileInformation {
 #[cfg(windows)]
 fn windows_file_identity(file: &File) -> Option<(u32, u64)> {
     let mut information = std::mem::MaybeUninit::<WindowsFileInformation>::uninit();
+    // SAFETY: file keeps the handle live; the output has the Win32 C layout and size.
     let succeeded =
         unsafe { get_file_information_by_handle(file.as_raw_handle(), information.as_mut_ptr()) };
     if succeeded == 0 {
         return None;
     }
+    // SAFETY: a nonzero result initializes every field of the output structure.
     let information = unsafe { information.assume_init() };
     let file_index =
         (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
@@ -920,6 +922,7 @@ fn windows_module_path(module: isize) -> Option<PathBuf> {
 
     loop {
         let mut buffer = vec![0_u16; capacity];
+        // SAFETY: the caller retains the module; buffer is writable for size elements.
         let copied = unsafe {
             get_module_file_name_w(
                 module,
@@ -949,6 +952,8 @@ fn open_windows_library(path: &Path) -> Option<(Library, PathBuf)> {
     };
 
     // Resolve dependencies beside this DLL or in trusted loader directories, not the CWD.
+    // SAFETY: path is canonical and comes from explicit configuration or Toolkit discovery.
+    // Loading executes library initializers, as required by this runtime binding.
     let native = unsafe {
         WindowsLibrary::load_with_flags(
             path,
@@ -957,8 +962,9 @@ fn open_windows_library(path: &Path) -> Option<(Library, PathBuf)> {
     }
     .ok()?;
     let handle = native.into_raw();
-    let loaded_path = windows_module_path(handle);
+    // SAFETY: into_raw transferred this live handle; restore its sole owning wrapper.
     let native = unsafe { WindowsLibrary::from_raw(handle) };
+    let loaded_path = windows_module_path(handle);
     loaded_path.map(|path| (native.into(), path))
 }
 

@@ -306,6 +306,7 @@ fn libdevice_candidates_from_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
     const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 
