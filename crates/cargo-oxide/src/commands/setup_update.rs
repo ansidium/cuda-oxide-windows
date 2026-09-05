@@ -45,7 +45,7 @@ pub fn setup(ctx: &Context) {
     // projects whose cuda-oxide dependency resolves to this checkout's HEAD
     // pick it up; any other project rebuilds from its own dependency.
     match backend::publish_to_cache(&ctx.backend_so, &ctx.codegen_crate) {
-        Some(published) => {
+        Ok(published) => {
             println!();
             println!("✓ Published to {}", published.path.display());
             match published.source_rev {
@@ -58,9 +58,9 @@ pub fn setup(ctx: &Context) {
                 ),
             }
         }
-        None => {
+        Err(error) => {
             eprintln!();
-            eprintln!("Warning: could not publish the backend to the shared cache.");
+            eprintln!("Warning: could not publish the backend to the shared cache: {error}");
             eprintln!("Projects outside this repo may keep using an older build.");
             eprintln!("Set CUDA_OXIDE_BACKEND to this build to override.");
         }

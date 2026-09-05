@@ -7,6 +7,10 @@ keeping Linux behavior upstream-compatible. Windows support is scoped to
 developer enablement, CI canaries, smoke scripts, and narrow compatibility
 helpers needed for `x86_64-pc-windows-msvc`.
 
+The shared host runtime is pinned to `ansidium/cutile-rs` for MSVC enum ABI
+fixes. The isolated backend uses the in-tree COFF artifact writer; host
+crates use the published artifact format and types.
+
 ## Upstream Repository
 
 - Upstream: https://github.com/NVlabs/cuda-oxide

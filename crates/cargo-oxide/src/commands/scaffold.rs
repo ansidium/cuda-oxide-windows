@@ -16,11 +16,13 @@ use super::*;
 const GIT_REPO: &str = backend::PINNED_SOURCE_REPOSITORY;
 const GIT_REV: &str = backend::PINNED_SOURCE_REVISION;
 
-/// crates.io release of the host-side runtime shared with cutile-rs
-/// (`cuda-core`, `cuda-async`). The device and host glue crates above still
-/// come from this repository; the runtime is published from NVlabs/cutile-rs
-/// and the SIMT surface lives under its `simt` modules.
-pub(super) const SHARED_HOST_CRATES_VERSION: &str = "0.3.1";
+const WORKSPACE_CARGO_TOML: &str = include_str!("../../../../Cargo.toml");
+
+fn shared_host_dependency(name: &str) -> toml::Value {
+    let manifest: toml::Value =
+        toml::from_str(WORKSPACE_CARGO_TOML).expect("embedded workspace manifest is valid TOML");
+    manifest["workspace"]["dependencies"][name].clone()
+}
 
 const RUST_TOOLCHAIN_TOML: &str = include_str!("../../../../rust-toolchain.toml");
 const CARGO_CONFIG_TOML: &str = include_str!("../../../../.cargo/config.toml");
@@ -107,7 +109,9 @@ cargo oxide run
 }
 
 fn scaffold_cargo_toml(name: &str, async_mode: bool) -> String {
+    let shared_core = shared_host_dependency("cuda-core");
     if async_mode {
+        let shared_async = shared_host_dependency("cuda-async");
         format!(
             r#"[package]
 name = "{name}"
@@ -119,9 +123,8 @@ edition = "2024"
 [dependencies]
 cuda-device = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
 cuda-host = {{ git = "{GIT_REPO}", rev = "{GIT_REV}", features = ["async"] }}
-# Shared host-side runtime, published from NVlabs/cutile-rs.
-cuda-core = "{SHARED_HOST_CRATES_VERSION}"
-cuda-async = "{SHARED_HOST_CRATES_VERSION}"
+cuda-core = {shared_core}
+cuda-async = {shared_async}
 tokio = {{ version = "1", features = ["rt", "rt-multi-thread", "macros"] }}
 "#
         )
@@ -137,8 +140,7 @@ edition = "2024"
 [dependencies]
 cuda-device = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
 cuda-host = {{ git = "{GIT_REPO}", rev = "{GIT_REV}" }}
-# Shared host-side runtime, published from NVlabs/cutile-rs.
-cuda-core = "{SHARED_HOST_CRATES_VERSION}"
+cuda-core = {shared_core}
 "#
         )
     }
@@ -368,10 +370,7 @@ mod tests {
 
             for name in expected_dependencies {
                 if !matches!(*name, "cuda-device" | "cuda-host") {
-                    assert_eq!(
-                        dependencies[*name].as_str(),
-                        Some(SHARED_HOST_CRATES_VERSION)
-                    );
+                    assert_eq!(dependencies[*name], shared_host_dependency(name));
                     continue;
                 }
                 let dependency = dependencies[*name].as_table().unwrap();

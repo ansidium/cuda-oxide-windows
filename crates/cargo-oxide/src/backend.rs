@@ -534,7 +534,7 @@ fn consult_backend_cache(
 ///    so the caller can report the configured-but-absent path.
 /// 3. Packaged backend next to the running cargo-oxide executable.
 /// 4. Local repository or path dependency's host build path.
-/// 5. Cache path at ~/.cargo/cuda-oxide/<platform filename>.
+/// 5. Cache path at `~/.cargo/cuda-oxide/<platform filename>`.
 ///
 /// `cargo oxide doctor` uses this so that a diagnostic run never triggers a
 /// multi-minute backend build or a git clone before it can print anything.
@@ -1347,16 +1347,22 @@ fn cache_directory() -> Option<PathBuf> {
     dirs_path().map(|d| d.join("cuda-oxide"))
 }
 
-/// Resolves the Cargo home directory (`$CARGO_HOME` or `$HOME/.cargo`).
+/// Resolves Cargo home, including the native Windows user profile fallback.
 fn dirs_path() -> Option<PathBuf> {
-    std::env::var("CARGO_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".cargo"))
-        })
+    dirs_path_from_env(|name| std::env::var_os(name), cfg!(windows))
+}
+
+fn dirs_path_from_env(
+    mut get_env: impl FnMut(&str) -> Option<std::ffi::OsString>,
+    windows: bool,
+) -> Option<PathBuf> {
+    if let Some(path) = get_env("CARGO_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    let home = get_env("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| windows.then(|| get_env("USERPROFILE")).flatten())?;
+    (!home.is_empty()).then(|| PathBuf::from(home).join(".cargo"))
 }
 
 /// Fetches the pinned cuda-oxide Windows-fork revision into the cache directory
@@ -1615,11 +1621,11 @@ pub struct PublishedBackend {
 /// beside the `.so`, so only projects whose dependency resolves to that commit
 /// reuse it.
 ///
-/// Returns `None` when the cache directory cannot be determined or the copy
+/// Returns an error when the cache directory cannot be determined or the copy
 /// fails. Callers treat this as best effort: a failure leaves the in-repo build
 /// usable and costs external projects only a rebuild.
-pub fn publish_to_cache(built_so: &Path, codegen_crate: &Path) -> Option<PublishedBackend> {
-    let cache_dir = cache_directory()?;
+pub fn publish_to_cache(built_so: &Path, codegen_crate: &Path) -> Result<PublishedBackend, String> {
+    let cache_dir = cache_directory().ok_or("cannot determine the backend cache directory")?;
     let backend_filename = backend_filename_for_target(&active_host_target());
     let source_rev = repository_head(codegen_crate);
     let path = with_locked_backend_cache(&cache_dir, |locked_cache_dir| {
@@ -1630,10 +1636,9 @@ pub fn publish_to_cache(built_so: &Path, codegen_crate: &Path) -> Option<Publish
             codegen_crate,
             source_rev.as_deref(),
         )
-    })
-    .ok()?
-    .ok()?;
-    Some(PublishedBackend { path, source_rev })
+    })?
+    .map_err(|error| format!("publish backend to {}: {error}", cache_dir.display()))?;
+    Ok(PublishedBackend { path, source_rev })
 }
 
 /// Returns the active rustc sysroot path.
@@ -1812,6 +1817,53 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn cargo_home_discovery_preserves_overrides_and_windows_profile_fallback() {
+        for (cargo_home, home, profile, windows, expected) in [
+            (
+                Some("custom-cargo"),
+                Some("home"),
+                Some("profile"),
+                true,
+                Some(PathBuf::from("custom-cargo")),
+            ),
+            (
+                None,
+                Some("home"),
+                Some("profile"),
+                true,
+                Some(PathBuf::from("home/.cargo")),
+            ),
+            (
+                None,
+                None,
+                Some("profile"),
+                true,
+                Some(PathBuf::from("profile/.cargo")),
+            ),
+            (
+                Some(""),
+                Some(""),
+                Some("profile"),
+                true,
+                Some(PathBuf::from("profile/.cargo")),
+            ),
+            (None, None, Some("profile"), false, None),
+            (None, None, Some(""), true, None),
+        ] {
+            let actual = dirs_path_from_env(
+                |name| match name {
+                    "CARGO_HOME" => cargo_home.map(Into::into),
+                    "HOME" => home.map(Into::into),
+                    "USERPROFILE" => profile.map(Into::into),
+                    _ => None,
+                },
+                windows,
+            );
+            assert_eq!(actual, expected);
+        }
+    }
 
     /// The codegen backend is part of the cuda-oxide toolchain, not the
     /// application being debugged/sanitized. A user-supplied
