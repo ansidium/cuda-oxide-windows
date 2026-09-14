@@ -43,6 +43,24 @@ fn overloaded_symbols_require_distinct_resolved_identities() {
 }
 
 #[test]
+fn overlay_hash_uses_repository_relative_paths() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest_path = repo_root.join("intrinsics/overlay.toml");
+    let (overlay, actual) = read_overlay(&repo_root, &manifest_path).unwrap();
+    let mut expected = Vec::new();
+    append_overlay_hash_input(
+        &mut expected,
+        "intrinsics/overlay.toml",
+        &std::fs::read(manifest_path).unwrap(),
+    );
+    for shard in &overlay.shards {
+        let contents = std::fs::read(repo_root.join("intrinsics").join(shard)).unwrap();
+        append_overlay_hash_input(&mut expected, &format!("intrinsics/{shard}"), &contents);
+    }
+    assert_eq!(actual, crate::util::sha256_bytes(&expected));
+}
+
+#[test]
 fn overlay_manifest_loads_sorted_family_shards() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let (overlay, hash) =

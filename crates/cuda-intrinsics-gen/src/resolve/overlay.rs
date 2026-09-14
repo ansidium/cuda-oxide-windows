@@ -92,7 +92,7 @@ pub(super) fn read_overlay(
         }
         previous = Some(shard_name.as_str());
 
-        let relative = Path::new("intrinsics").join(shard_name);
+        let relative = format!("intrinsics/{shard_name}");
         let path = repo_root.join(&relative);
         let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         let mut shard: OverlayShardFile =
@@ -379,13 +379,7 @@ pub(super) fn read_overlay(
             );
         }
 
-        append_overlay_hash_input(
-            &mut hash_input,
-            relative
-                .to_str()
-                .context("overlay shard path is not valid UTF-8")?,
-            &bytes,
-        );
+        append_overlay_hash_input(&mut hash_input, &relative, &bytes);
         overlay.intrinsics.extend(shard.intrinsics);
     }
 

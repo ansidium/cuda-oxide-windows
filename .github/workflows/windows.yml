@@ -72,6 +72,9 @@ jobs:
         shell: pwsh
         run: .\.github\scripts\install-libffi.ps1
 
+      - name: Test generator path provenance
+        run: cargo test --locked -p cuda-intrinsics-gen overlay_hash_uses_repository_relative_paths
+
       - name: Test CUDA discovery and runtime loading
         shell: pwsh
         run: |
