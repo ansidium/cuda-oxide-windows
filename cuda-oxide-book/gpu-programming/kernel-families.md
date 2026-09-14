@@ -509,9 +509,8 @@ CUDA kernels.
 
 ```rust
 use cuda_host::{
-    KernelFamily, KernelFamilyBuildError, KernelFamilyId, KernelProblem,
-    KernelSelector, KernelVariant, NoKernelSelectionCache, SelectionMode,
-    SelectionSource,
+    KernelFamily, KernelFamilyBuildError, KernelFamilyId, KernelProblem, KernelSelector,
+    KernelVariant, NoKernelSelectionCache, SelectionMode, SelectionSource,
 };
 use std::convert::Infallible;
 use std::error::Error;

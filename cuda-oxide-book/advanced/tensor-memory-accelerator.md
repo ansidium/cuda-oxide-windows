@@ -101,8 +101,8 @@ memory into a shared memory destination. They are available for 1D through
 5D tensors:
 
 ```rust
-use cuda_device::tma::{cp_async_bulk_tensor_2d_g2s, TmaDescriptor};
 use cuda_device::barrier::Barrier;
+use cuda_device::tma::{TmaDescriptor, cp_async_bulk_tensor_2d_g2s};
 
 unsafe fn load_tile(
     smem_dst: *mut u8,
@@ -151,8 +151,8 @@ TMA completion tracking relies on `ManagedBarrier` (or the raw `mbarrier_*`
 functions). The typestate API enforces the lifecycle at the type level:
 
 ```rust
-use cuda_device::barrier::{Barrier, ManagedBarrier, TmaBarrierHandle, Uninit, Ready};
 use cuda_device::SharedArray;
+use cuda_device::barrier::{Barrier, ManagedBarrier, Ready, TmaBarrierHandle, Uninit};
 
 #[kernel]
 pub fn tma_load_kernel(desc: *const TmaDescriptor) {
@@ -206,9 +206,7 @@ instead of barriers:
 
 ```rust
 use cuda_device::tma::{
-    cp_async_bulk_tensor_2d_s2g,
-    cp_async_bulk_commit_group,
-    cp_async_bulk_wait_group,
+    cp_async_bulk_commit_group, cp_async_bulk_tensor_2d_s2g, cp_async_bulk_wait_group,
 };
 
 unsafe {

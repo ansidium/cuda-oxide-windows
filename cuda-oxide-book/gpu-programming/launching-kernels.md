@@ -53,9 +53,9 @@ PreparedLaunch<K>  -> safe launch of exactly K
 GPU execution can still overlap the host until you synchronize.
 
 ```rust
-use cuda_device::{cuda_module, kernel, thread, DisjointSlice};
 use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
+use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
 #[cuda_module]
 mod kernels {
@@ -124,7 +124,7 @@ Declare the kernel's geometry when it is part of correctness:
 
 ```rust
 use cuda_core::LaunchConfig1D;
-use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract, thread, DisjointSlice};
+use cuda_device::{DisjointSlice, cuda_module, kernel, launch_bounds, launch_contract, thread};
 
 #[cuda_module]
 mod contracted {
@@ -190,8 +190,8 @@ meaningful for their domain:
 
 ```rust
 use cuda_device::config::{
-    Atom, AtomKind, AtomSpec, Block, Global, Policy, PolicyId, RowMajor, Shape1,
-    Thread, Tile, TileSpec,
+    Atom, AtomKind, AtomSpec, Block, Global, Policy, PolicyId, RowMajor, Shape1, Thread, Tile,
+    TileSpec,
 };
 
 enum XorRotate {}
@@ -289,9 +289,7 @@ responsible for choosing its namespace and preventing duplicate IDs.
 Policy-associated constants can be used by supported compile-time attributes:
 
 ```rust
-use cuda_device::{
-    cuda_module, kernel, launch_bounds, launch_contract, thread,
-};
+use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract, thread};
 
 #[cuda_module]
 mod kernels {
@@ -691,7 +689,7 @@ memory via **distributed shared memory** (DSMEM). To launch with clusters, add
 `#[cluster_launch]` to the kernel and include `cluster_dim` in the launch:
 
 ```rust
-use cuda_device::{kernel, cluster, cluster_launch, DisjointSlice};
+use cuda_device::{DisjointSlice, cluster, cluster_launch, kernel};
 
 #[kernel]
 #[cluster_launch(4, 1, 1)]
@@ -739,7 +737,7 @@ owned-async) then submits through `cuLaunchKernelEx` with the
 `CU_LAUNCH_ATTRIBUTE_COOPERATIVE` attribute set:
 
 ```rust
-use cuda_device::{cooperative_launch, grid, kernel, DisjointSlice};
+use cuda_device::{DisjointSlice, cooperative_launch, grid, kernel};
 
 #[cuda_module]
 mod kernels {

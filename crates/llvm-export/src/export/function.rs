@@ -140,7 +140,9 @@ impl<'a> ModuleExportState<'a> {
         let debug_attachment = if !is_external
             && matches!(
                 address_space,
-                crate::types::address_space::GLOBAL | crate::types::address_space::SHARED
+                crate::types::address_space::GLOBAL
+                    | crate::types::address_space::SHARED
+                    | crate::types::address_space::CONSTANT
             ) {
             match ops::debug_global_variable(self.ctx, global.get_operation()) {
                 Some(info) => {

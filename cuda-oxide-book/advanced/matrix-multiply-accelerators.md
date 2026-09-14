@@ -79,8 +79,7 @@ the hardware instructions. A typical usage pattern:
 
 ```rust
 use cuda_device::wgmma::{
-    make_smem_desc, wgmma_fence, wgmma_commit_group, wgmma_wait_group,
-    wgmma_mma_m64n64k16_f32_bf16,
+    make_smem_desc, wgmma_commit_group, wgmma_fence, wgmma_mma_m64n64k16_f32_bf16, wgmma_wait_group,
 };
 
 // After TMA has loaded A and B tiles into shared memory...
@@ -206,8 +205,8 @@ file but dedicated to matrix accumulation. It must be explicitly allocated
 and deallocated:
 
 ```rust
-use cuda_device::tcgen05::{TmemGuard, TmemUninit, TmemReady};
 use cuda_device::SharedArray;
+use cuda_device::tcgen05::{TmemGuard, TmemReady, TmemUninit};
 
 static mut TMEM_ADDR: SharedArray<u32, 1> = SharedArray::UNINIT;
 
@@ -244,11 +243,7 @@ tcgen05 uses two descriptors per MMA instruction:
 **Instruction descriptor** — encodes the MMA configuration:
 
 ```rust
-use cuda_device::tcgen05::{
-    Tcgen05InstructionDescriptor,
-    Tcgen05ElementType,
-    Tcgen05MmaShape,
-};
+use cuda_device::tcgen05::{Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape};
 
 let idesc = Tcgen05InstructionDescriptor::builder()
     .shape(Tcgen05MmaShape::M128_N128)
@@ -276,7 +271,7 @@ One thread issues the MMA instruction, then all threads wait on a
 barrier:
 
 ```rust
-use cuda_device::tcgen05::{tcgen05_mma_f16, tcgen05_commit};
+use cuda_device::tcgen05::{tcgen05_commit, tcgen05_mma_f16};
 
 if thread::threadIdx_x() == 0 {
     unsafe {
@@ -304,10 +299,7 @@ registers and then use `stmatrix` to write to shared memory:
 ```rust
 use cuda_device::convert::cvt_bf16x2_f32;
 use cuda_device::tcgen05::{
-    tcgen05_ld_16x256b_pure,
-    tcgen05_load_wait,
-    stmatrix_m8n8_x2,
-    TmemF32x4,
+    TmemF32x4, stmatrix_m8n8_x2, tcgen05_ld_16x256b_pure, tcgen05_load_wait,
 };
 
 unsafe {

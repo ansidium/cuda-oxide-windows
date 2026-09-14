@@ -105,6 +105,28 @@ jobs:
       - name: Verify every device call the book shows resolves
         run: bash scripts/check-book-api-names.sh
 
+  # A book block is pasted into an edition-2024 `cargo oxide new` project, where
+  # the first `cargo fmt` reorders its `use` lines (`{DisjointSlice, kernel,
+  # thread}`, crates sorted). The code is right either way, so nothing fails and
+  # the book drifts from the toolchain and from itself: #1241 found 47 blocks
+  # on the old order across 18 pages, after #1193 had fixed the scaffold
+  # templates with a test that runs the real rustfmt. Only the top-level `use`
+  # region of each block is formatted, so teaching layout in signatures and
+  # bodies, and partial snippets with no enclosing item, never trip it.
+  book-import-order:
+    name: book import order
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      # rustfmt comes from rust-toolchain.toml's component list through the
+      # rustup proxy, as in fmt.yml, so the order checked is the pinned
+      # nightly's. No cargo, no CUDA toolkit, no network beyond the toolchain.
+      - name: Verify the book's Rust blocks use rustfmt's import order
+        run: bash scripts/check-book-import-order.sh
+
   # The dialect-nvvm book page prints the catalog SHA-256 and states its own
   # freshness rule: if the stamp no longer matches, every count on the page
   # predates the catalog being read. Nothing enforced that rule, so the page

@@ -71,6 +71,8 @@ mod kernels {
     pub fn test_option(val: u32, mut out: DisjointSlice<u32>) {
         let idx = thread::index_1d();
         if let Some(out_elem) = out.get_mut(idx) {
+            // `get_mut` has returned: this PC belongs only to the kernel.
+            // CUDA_OXIDE_DEBUG_INLINE_CALLER_BREAKPOINT
             let maybe: Option<u32> = if val > 0 { Some(val) } else { None };
             let result = maybe.unwrap_or_default();
             *out_elem = result;

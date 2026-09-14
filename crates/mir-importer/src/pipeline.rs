@@ -83,6 +83,12 @@ pub struct CollectedFunction {
     pub export_name: String,
     /// rustc MIR source-scope data used to build inlined debug scopes.
     pub debug_source_scopes: Option<llvm_export::ops::DebugSourceScopeMap>,
+    /// rustc's statement-level debug assignments, aligned with stable MIR.
+    ///
+    /// Stable MIR omits these records, so the codegen bridge carries them in a
+    /// sidecar. Full debug uses supported events to keep affected pointer values
+    /// in stack slots; other modes emit no extra code.
+    pub statement_debug_info: Option<StatementDebugInfoMap>,
     /// True if the function is marked `#[inline(always)]` in rustc's
     /// `CodegenFnAttrs`. The stable_mir API does not expose inline hints, so
     /// this is queried via `rustc_middle::TyCtxt::codegen_fn_attrs` in
@@ -96,6 +102,40 @@ pub struct CollectedFunction {
     /// This preserves Rust's inline intent for device helpers and avoids
     /// making helper boundaries depend entirely on later optimizer heuristics.
     pub is_inline_always: bool,
+}
+
+/// Per-function statement debug records aligned with the stable MIR body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatementDebugInfoMap {
+    /// One entry per MIR basic block, in block-index order.
+    pub blocks: Vec<StatementDebugInfoBlock>,
+}
+
+/// Debug records attached to one MIR basic block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatementDebugInfoBlock {
+    /// Records emitted immediately before each primary statement. The vector
+    /// length must equal the corresponding stable MIR statement count.
+    pub before_statements: Vec<Vec<StatementDebugInfo>>,
+    /// Records emitted after the last statement and immediately before the
+    /// block terminator.
+    pub before_terminator: Vec<StatementDebugInfo>,
+}
+
+/// The subset of rustc's internal `StmtDebugInfo` needed by code generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatementDebugInfo {
+    /// At this point, source variables associated with `destination` are
+    /// represented by the address of `place`.
+    AssignRef {
+        destination: rustc_public::mir::Local,
+        place: rustc_public::mir::Place,
+    },
+    /// The source variables associated with this local no longer have a valid
+    /// value and must be reported as unavailable.
+    InvalidAssign {
+        destination: rustc_public::mir::Local,
+    },
 }
 
 /// Device artifact format produced by a successful pipeline run.
@@ -338,13 +378,17 @@ fn attach_debug_global_variables(
                 .deref(ctx)
                 .get_result(0)
                 .get_type(ctx);
-            let is_as1 = result_ty
+            let is_debuggable_device_global = result_ty
                 .deref(ctx)
                 .downcast_ref::<dialect_mir::types::MirPtrType>()
                 .is_some_and(|pointer| {
-                    pointer.address_space == dialect_mir::types::address_space::GLOBAL
+                    matches!(
+                        pointer.address_space,
+                        dialect_mir::types::address_space::GLOBAL
+                            | dialect_mir::types::address_space::CONSTANT
+                    )
                 });
-            if is_as1
+            if is_debuggable_device_global
                 && let Some(key) = global
                     .get_attr_global_key(ctx)
                     .map(|key| String::from(key.clone()))
@@ -490,6 +534,7 @@ pub fn run_pipeline(
             &mut legaliser,
             config.debug_kind,
             func.debug_source_scopes.as_ref(),
+            func.statement_debug_info.as_ref(),
         )
         .map_err(|e| {
             // Use .disp(&ctx) for rich error formatting with location and backtrace
@@ -712,6 +757,146 @@ mod tests {
         assert_eq!(config.target_arch, None);
         assert_eq!(config.device_arch_hint, None);
         assert_eq!(config.debug_kind, DebugKind::Off);
+    }
+
+    #[test]
+    fn static_debug_identity_attaches_to_as1_and_as4_only() {
+        use dialect_mir::ops::{MirFuncOp, MirGlobalAllocOp};
+        use dialect_mir::types::MirPtrType;
+        use pliron::builtin::attributes::{StringAttr, TypeAttr};
+        use pliron::builtin::ops::ModuleOp;
+        use pliron::builtin::types::{FunctionType, IntegerType, Signedness};
+        use pliron::r#type::TypeHandle;
+
+        fn append_global(
+            ctx: &mut Context,
+            block: pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+            result_ty: TypeHandle,
+            value_ty: TypeHandle,
+            key: &str,
+        ) -> pliron::context::Ptr<Operation> {
+            let op = Operation::new(
+                ctx,
+                MirGlobalAllocOp::get_concrete_op_info(),
+                vec![result_ty],
+                vec![],
+                vec![],
+                0,
+            );
+            let global = MirGlobalAllocOp::new(op);
+            global.set_attr_global_type(ctx, TypeAttr::new(value_ty));
+            global.set_attr_global_key(ctx, StringAttr::new(key.to_string()));
+            op.insert_at_back(block, ctx);
+            op
+        }
+
+        fn info(name: &str, line: i32) -> DebugGlobalVariableInfo {
+            DebugGlobalVariableInfo {
+                name: name.to_string(),
+                namespace: vec!["debug_fixture".to_string(), "kernels".to_string()],
+                ty: DebugLocalTypeKind::Basic {
+                    name: "u32".to_string(),
+                    size_bits: 32,
+                    encoding: "DW_ATE_unsigned",
+                },
+                declaration: DebugSourcePosition {
+                    file: std::path::PathBuf::from("/tmp/debug_fixture.rs"),
+                    line,
+                    column: 1,
+                },
+                is_local_to_unit: true,
+                is_function_local: false,
+            }
+        }
+
+        let mut ctx = Context::new();
+        crate::translator::register_dialects(&mut ctx);
+
+        let module = ModuleOp::new(&mut ctx, "debug_attachment".try_into().unwrap());
+        let module_region = module.get_operation().deref(&ctx).get_region(0);
+        let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+        let function_ty = FunctionType::get(&ctx, vec![], vec![]);
+        let function_op = Operation::new(
+            &mut ctx,
+            MirFuncOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            1,
+        );
+        let function = MirFuncOp::new(&mut ctx, function_op, TypeAttr::new(function_ty.into()));
+        function.set_symbol_name(&mut ctx, "kernel".try_into().unwrap());
+        function_op.insert_at_back(module_block, &ctx);
+        let function_region = function_op.deref(&ctx).get_region(0);
+        let function_block = pliron::basic_block::BasicBlock::new(&mut ctx, None, vec![]);
+        function_block.insert_at_back(function_region, &ctx);
+
+        let value_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let as1_ty: TypeHandle = MirPtrType::get_global(&mut ctx, value_ty, false).into();
+        let as4_ty: TypeHandle = MirPtrType::get_constant(&mut ctx, value_ty, false).into();
+        let as3_ty: TypeHandle = MirPtrType::get_shared(&mut ctx, value_ty, false).into();
+        let as0_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, value_ty, false).into();
+        let ordinary = append_global(&mut ctx, function_block, as1_ty, value_ty, "ordinary");
+        let constant = append_global(&mut ctx, function_block, as4_ty, value_ty, "constant");
+        let wrong_address_space = append_global(
+            &mut ctx,
+            function_block,
+            as3_ty,
+            value_ty,
+            "wrong-address-space",
+        );
+        let generic_address_space = append_global(
+            &mut ctx,
+            function_block,
+            as0_ty,
+            value_ty,
+            "generic-address-space",
+        );
+        let missing_identity = append_global(
+            &mut ctx,
+            function_block,
+            as4_ty,
+            value_ty,
+            "missing-identity",
+        );
+
+        let ordinary_info = info("GLOBAL_COUNTER", 7);
+        let constant_info = info("SCALE", 11);
+        let wrong_address_space_info = info("NOT_A_STATIC_STORAGE_CLASS", 13);
+        let globals = BTreeMap::from([
+            ("ordinary".to_string(), ordinary_info.clone()),
+            ("constant".to_string(), constant_info.clone()),
+            ("wrong-address-space".to_string(), wrong_address_space_info),
+            (
+                "generic-address-space".to_string(),
+                info("MUST_NOT_ATTACH_TO_AS0", 15),
+            ),
+        ]);
+
+        attach_debug_global_variables(&mut ctx, function_op, &globals);
+
+        assert_eq!(
+            llvm_export::ops::debug_global_variable(&ctx, ordinary),
+            Some(ordinary_info),
+            "ordinary AS1 globals must retain their source identity"
+        );
+        assert_eq!(
+            llvm_export::ops::debug_global_variable(&ctx, constant),
+            Some(constant_info),
+            "constant-memory AS4 globals must retain their source identity"
+        );
+        assert!(
+            llvm_export::ops::debug_global_variable(&ctx, wrong_address_space).is_none(),
+            "the importer gate must not attach static metadata to other pointer address spaces"
+        );
+        assert!(
+            llvm_export::ops::debug_global_variable(&ctx, generic_address_space).is_none(),
+            "the importer allow-list must fail closed for AS0 rather than accepting every non-shared address space"
+        );
+        assert!(
+            llvm_export::ops::debug_global_variable(&ctx, missing_identity).is_none(),
+            "an uncollected global key must continue to fail closed"
+        );
     }
 
     #[test]

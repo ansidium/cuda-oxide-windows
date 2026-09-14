@@ -12,8 +12,8 @@ any Rust function. The compiler monomorphizes each specialization into a
 separate PTX entry point:
 
 ```rust
-use cuda_device::{kernel, thread, DisjointSlice};
 use core::ops::Mul;
+use cuda_device::{DisjointSlice, kernel, thread};
 
 #[kernel]
 pub fn scale<T: Copy + Mul<Output = T>>(
@@ -91,9 +91,7 @@ A policy type groups tuning choices for one generic kernel:
 #![allow(incomplete_features)]
 
 use cuda_core::LaunchConfig1D;
-use cuda_device::{
-    cuda_module, kernel, launch_bounds, launch_contract, thread, DisjointSlice,
-};
+use cuda_device::{DisjointSlice, cuda_module, kernel, launch_bounds, launch_contract, thread};
 
 trait TransformPolicy {
     const MAX_THREADS: u32;
@@ -156,9 +154,7 @@ argument, and the GPU does not choose a policy at runtime.
 A policy can also carry metadata-only descriptions:
 
 ```rust
-use cuda_device::config::{
-    Atom, AtomKind, Block, Global, RowMajor, Shape1, Thread, Tile,
-};
+use cuda_device::config::{Atom, AtomKind, Block, Global, RowMajor, Shape1, Thread, Tile};
 
 type BlockTile = Tile<Shape1<1024>, RowMajor, Global, Block>;
 
@@ -362,7 +358,7 @@ Kernels can be defined in a library crate and launched from a binary crate:
 
 ```rust
 // In lib crate `my_kernels`:
-use cuda_device::{cuda_module, kernel, thread, DisjointSlice};
+use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
 #[cuda_module]
 pub mod kernels {

@@ -75,6 +75,7 @@ pub fn codegen_run(
             bin,
             no_fmad,
             unchecked_indexing,
+            device_debug,
             &materialization,
             app_args,
         );
@@ -232,11 +233,12 @@ pub fn codegen_sanitize(
             target_arch,
             detected_device_arch.as_deref(),
             None,
-            InteropDeviceBuildOptions {
+            InteropDeviceBuildOptions::for_route(
+                InteropDeviceBuildRoute::Sanitize,
                 no_fmad,
                 unchecked_indexing,
-                sanitizer_line_tables: true,
-            },
+                device_debug,
+            ),
             &materialization,
         );
         let binary = build_host_cargo(ctx, example, &example_dir, features, bin, verbose);
@@ -333,6 +335,7 @@ pub fn codegen_build(
             device_features,
             no_fmad,
             unchecked_indexing,
+            device_debug,
             &materialization,
         );
         return;

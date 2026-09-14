@@ -227,7 +227,7 @@ wraps a mutable slice and only allows writes through a `ThreadIndex` whose
 this ensures each thread accesses a unique element:
 
 ```rust
-use cuda_device::{kernel, DisjointSlice};
+use cuda_device::{DisjointSlice, kernel};
 
 #[kernel]
 pub fn double(input: &[f32], mut out: DisjointSlice<f32>) {
@@ -297,7 +297,7 @@ in both speed and scope.
 When the size is known at compile time, use `SharedArray<T, N>`:
 
 ```rust
-use cuda_device::{kernel, thread, SharedArray, DisjointSlice};
+use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
 static mut TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
 
@@ -334,7 +334,7 @@ When the size depends on runtime parameters, use `DynamicSharedArray<T>` and
 specify the allocation size via `LaunchConfig::shared_mem_bytes`:
 
 ```rust
-use cuda_device::{kernel, thread, DynamicSharedArray, DisjointSlice};
+use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, thread};
 
 #[kernel]
 pub fn dynamic_smem_example(input: &[f32], mut out: DisjointSlice<f32>) {

@@ -255,8 +255,10 @@ fn create_device_global(
     };
     global_op.set_address_space(ctx, spec.addr_space);
     global_op.set_source_global_key(ctx, spec.key);
-    if spec.addr_space == llvm_export::types::address_space::GLOBAL
-        && let Some(info) = spec.debug_info
+    if matches!(
+        spec.addr_space,
+        llvm_export::types::address_space::GLOBAL | llvm_export::types::address_space::CONSTANT
+    ) && let Some(info) = spec.debug_info
     {
         llvm::set_debug_global_variable(ctx, global_op.get_operation(), info);
     }

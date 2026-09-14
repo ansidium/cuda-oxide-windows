@@ -8,8 +8,9 @@ license = "Apache-2.0"
 # Mark as standalone crate (not part of parent workspace)
 [workspace]
 
-# SM100a+ TMA Multicast (Tensor Memory Accelerator) example.
-# Requires Blackwell datacenter GPUs (B100/B200/GB200).
+# TMA Multicast (Tensor Memory Accelerator) example, sm_90+ per the PTX ISA.
+# cargo oxide run builds for the detected GPU (verified on sm_120; the
+# Hopper run is tracked in #966).
 # Build with:
 #   cargo oxide run tma_multicast
 

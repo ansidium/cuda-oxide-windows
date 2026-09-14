@@ -440,10 +440,6 @@ pub mod ops {
     /// and emitted as `align N` during export.
     const OP_ALIGNMENT_KEY: &str = "cuda_oxide_op_alignment";
 
-    /// Op-attribute key controlling whether a GEP is emitted with LLVM's
-    /// `inbounds` promise. Absence denotes an in-bounds GEP.
-    const GEP_INBOUNDS_KEY: &str = "cuda_oxide_gep_inbounds";
-
     /// Op-attribute key controlling whether an inline asm op is emitted with
     /// LLVM's `sideeffect` marker. Absent means true, matching the conservative
     /// default for user-authored inline PTX.
@@ -466,24 +462,6 @@ pub mod ops {
             .get::<BoolAttr>(&key)
             .map(|attr| bool::from((*attr).clone()))
             .unwrap_or(false)
-    }
-
-    /// Stamp the source pointer arithmetic contract onto an LLVM GEP.
-    pub fn set_gep_inbounds(ctx: &mut Context, op: Ptr<Operation>, inbounds: bool) {
-        let key = Identifier::try_new(GEP_INBOUNDS_KEY.to_string()).expect("valid identifier");
-        op.deref_mut(ctx)
-            .attributes
-            .set(key, BoolAttr::new(inbounds));
-    }
-
-    /// Return whether an LLVM GEP carries the `inbounds` promise.
-    pub fn gep_inbounds(ctx: &Context, op: Ptr<Operation>) -> bool {
-        let key = Identifier::try_new(GEP_INBOUNDS_KEY.to_string()).expect("valid identifier");
-        op.deref(ctx)
-            .attributes
-            .get::<BoolAttr>(&key)
-            .map(|attr| bool::from(attr.clone()))
-            .unwrap_or(true)
     }
 
     /// Debug type metadata for a local variable described by `llvm.dbg.declare`.
@@ -1172,6 +1150,21 @@ pub mod ops {
         pub declaration: Option<DebugSourcePosition>,
     }
 
+    /// An additional whole source variable backed by the same MIR
+    /// storage/value as the primary [`DebugLocalVariableInfo`].
+    ///
+    /// Optimized MIR may deliberately map multiple source bindings to one
+    /// local (for example, after reference propagation).  Each binding keeps
+    /// its own name, type, argument index, scope, and declaration position and
+    /// therefore needs its own `DILocalVariable` rather than being disguised
+    /// as a zero-offset projection.
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    pub struct DebugWholeVariableInfo {
+        pub variable: DebugLocalVariableInfo,
+        pub source_scope: Option<u32>,
+        pub declaration: Option<DebugSourcePosition>,
+    }
+
     /// One operation in a multi-value LLVM debug expression.
     ///
     /// `Arg(N)` selects the Nth operand from the `DIArgList`. The remaining
@@ -1268,6 +1261,7 @@ pub mod ops {
     const DEBUG_LOCAL_DECL_COLUMN_KEY: &str = "cuda_oxide_debug_local_decl_column";
     const DEBUG_LOCAL_SCOPE_KEY: &str = "cuda_oxide_debug_local_scope";
     const DEBUG_GLOBAL_INFO_KEY: &str = "cuda_oxide_debug_global_info";
+    const DEBUG_WHOLE_ALIAS_COUNT_KEY: &str = "cuda_oxide_debug_whole_alias_count";
     const DEBUG_PROJECTED_COUNT_KEY: &str = "cuda_oxide_debug_projected_count";
     const DEBUG_FRAGMENT_COUNT_KEY: &str = "cuda_oxide_debug_fragment_count";
     const DEBUG_VALUE_EXPRESSION_KEY: &str = "cuda_oxide_debug_value_expression";
@@ -1397,6 +1391,117 @@ pub mod ops {
             argument_index,
             ty,
         })
+    }
+
+    /// Attach additional whole-variable identities backed by this slot/value.
+    pub fn set_debug_whole_variable_aliases(
+        ctx: &mut Context,
+        op: Ptr<Operation>,
+        aliases: &[DebugWholeVariableInfo],
+    ) {
+        set_string_attr(
+            ctx,
+            op,
+            DEBUG_WHOLE_ALIAS_COUNT_KEY,
+            aliases.len().to_string(),
+        );
+
+        for (index, info) in aliases.iter().enumerate() {
+            set_string_attr(
+                ctx,
+                op,
+                &debug_whole_alias_key(index, "name"),
+                info.variable.name.clone(),
+            );
+            if let Some(argument_index) = info.variable.argument_index {
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_whole_alias_key(index, "arg"),
+                    argument_index.to_string(),
+                );
+            }
+
+            let mut encoded = String::new();
+            serialize_debug_type(&info.variable.ty, &mut encoded);
+            set_string_attr(ctx, op, &debug_whole_alias_key(index, "type"), encoded);
+            if let Some(source_scope) = info.source_scope {
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_whole_alias_key(index, "scope"),
+                    source_scope.to_string(),
+                );
+            }
+            if let Some(declaration) = &info.declaration {
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_whole_alias_key(index, "file"),
+                    declaration.file.to_string_lossy().into_owned(),
+                );
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_whole_alias_key(index, "line"),
+                    declaration.line.to_string(),
+                );
+                set_string_attr(
+                    ctx,
+                    op,
+                    &debug_whole_alias_key(index, "column"),
+                    declaration.column.to_string(),
+                );
+            }
+        }
+    }
+
+    /// Read additional whole-variable identities attached to a slot/value.
+    /// Malformed entries are skipped individually and the count is bounded.
+    pub fn debug_whole_variable_aliases(
+        ctx: &Context,
+        op: Ptr<Operation>,
+    ) -> Vec<DebugWholeVariableInfo> {
+        let count = get_string_attr(ctx, op, DEBUG_WHOLE_ALIAS_COUNT_KEY)
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or(0);
+        if count > 1024 {
+            return Vec::new();
+        }
+
+        let mut aliases = Vec::with_capacity(count);
+        for index in 0..count {
+            let Some(name) = get_string_attr(ctx, op, &debug_whole_alias_key(index, "name")) else {
+                continue;
+            };
+            let argument_index = get_string_attr(ctx, op, &debug_whole_alias_key(index, "arg"))
+                .and_then(|arg| arg.parse::<u16>().ok());
+            let Some(encoded) = get_string_attr(ctx, op, &debug_whole_alias_key(index, "type"))
+            else {
+                continue;
+            };
+            let mut pos = 0;
+            let Some(ty) = deserialize_debug_type(encoded.as_bytes(), &mut pos) else {
+                continue;
+            };
+            if pos != encoded.len() {
+                continue;
+            }
+            let source_scope = get_string_attr(ctx, op, &debug_whole_alias_key(index, "scope"))
+                .and_then(|scope| scope.parse::<u32>().ok());
+            let declaration = debug_whole_alias_declaration(ctx, op, index);
+
+            aliases.push(DebugWholeVariableInfo {
+                variable: DebugLocalVariableInfo {
+                    name,
+                    argument_index,
+                    ty,
+                },
+                source_scope,
+                declaration,
+            });
+        }
+        aliases
     }
 
     /// Attach the source identity and semantic type of a Rust static to an op.
@@ -2133,6 +2238,10 @@ pub mod ops {
         format!("cuda_oxide_debug_projected_{index}_{field}")
     }
 
+    fn debug_whole_alias_key(index: usize, field: &str) -> String {
+        format!("cuda_oxide_debug_whole_alias_{index}_{field}")
+    }
+
     fn debug_fragment_key(index: usize, field: &str) -> String {
         format!("cuda_oxide_debug_fragment_{index}_{field}")
     }
@@ -2151,6 +2260,28 @@ pub mod ops {
             .parse()
             .ok()?;
         let column = get_string_attr(ctx, op, &debug_projected_key(index, "column"))?
+            .parse()
+            .ok()?;
+        if line <= 0 || column <= 0 {
+            return None;
+        }
+        Some(DebugSourcePosition { file, line, column })
+    }
+
+    fn debug_whole_alias_declaration(
+        ctx: &Context,
+        op: Ptr<Operation>,
+        index: usize,
+    ) -> Option<DebugSourcePosition> {
+        let file = PathBuf::from(get_string_attr(
+            ctx,
+            op,
+            &debug_whole_alias_key(index, "file"),
+        )?);
+        let line = get_string_attr(ctx, op, &debug_whole_alias_key(index, "line"))?
+            .parse()
+            .ok()?;
+        let column = get_string_attr(ctx, op, &debug_whole_alias_key(index, "column"))?
             .parse()
             .ok()?;
         if line <= 0 || column <= 0 {

@@ -11,7 +11,7 @@ root.
 ### Kernel and Device Attributes
 
 ```rust
-use cuda_device::{kernel, device, launch_bounds, cluster_launch, cooperative_launch};
+use cuda_device::{cluster_launch, cooperative_launch, device, kernel, launch_bounds};
 
 #[kernel]
 pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) { /* ... */ }
@@ -69,7 +69,7 @@ and 65,536 cloned operations. Larger requests warn and are not unrolled.
 ### Debug and PTX Macros
 
 ```rust
-use cuda_device::{gpu_printf, gpu_assert, ptx_asm};
+use cuda_device::{gpu_assert, gpu_printf, ptx_asm};
 
 gpu_printf!("thread %d: val = %f\n", idx as i32, val as f64);
 gpu_assert!(val.is_finite());
@@ -98,10 +98,9 @@ returns `CUDA_ERROR_ASSERT`.
 
 ```rust
 use cuda_device::config::{
-    Atom, AtomKind, AtomSpec, Block, Cluster, ColumnMajor, Global, Layout,
-    MemorySpace, Policy, PolicyId, Register, RowMajor, Scope, Shape, Shape1,
-    Shape2, Shape3, Shared, TensorMemory, Thread, Tile, TileSpec, Warp,
-    WarpGroup,
+    Atom, AtomKind, AtomSpec, Block, Cluster, ColumnMajor, Global, Layout, MemorySpace, Policy,
+    PolicyId, Register, RowMajor, Scope, Shape, Shape1, Shape2, Shape3, Shared, TensorMemory,
+    Thread, Tile, TileSpec, Warp, WarpGroup,
 };
 ```
 
@@ -288,7 +287,7 @@ match the buffer layout. See {ref}`Check a tile once <check-a-tile-once>`.
 ## Shared Memory
 
 ```rust
-use cuda_device::{SharedArray, DynamicSharedArray, thread};
+use cuda_device::{DynamicSharedArray, SharedArray, thread};
 
 #[kernel]
 pub fn tiled(data: &[f32], mut out: DisjointSlice<f32>) {
@@ -327,7 +326,7 @@ thread::sync_threads();   // __syncthreads() equivalent
 ### Managed Barriers (Hopper+)
 
 ```rust
-use cuda_device::{ManagedBarrier, TmaBarrierHandle, Uninit, Ready};
+use cuda_device::{ManagedBarrier, Ready, TmaBarrierHandle, Uninit};
 
 // Typestate lifecycle: Uninit → Ready → Invalidated
 let bar: TmaBarrierHandle<Uninit> = TmaBarrierHandle::from_static(ptr);
@@ -401,7 +400,7 @@ shuffle moves bits and does not interpret them.
 ### Scoped GPU Atomics
 
 ```rust
-use cuda_device::atomic::{DeviceAtomicU32, AtomicOrdering};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 
 static COUNTER: DeviceAtomicU32 = DeviceAtomicU32::new(0);
 
@@ -430,7 +429,7 @@ GPU code, defaulting to system scope.
 
 ```rust
 use cuda_device::tma::TmaDescriptor;
-use cuda_device::tma::{cp_async_bulk_tensor_2d_g2s, cp_async_bulk_commit_group};
+use cuda_device::tma::{cp_async_bulk_commit_group, cp_async_bulk_tensor_2d_g2s};
 
 // Host: build descriptor (128 bytes, opaque)
 // Device: issue async bulk copy
@@ -491,8 +490,8 @@ shared memory. Operands described by SMEM descriptors; accumulator in registers.
 ## Tensor Cores — tcgen05 (Blackwell, SM 100+)
 
 ```rust
-use cuda_device::tcgen05::{TmemGuard, TmemUninit, TmemReady};
 use cuda_device::SharedArray;
+use cuda_device::tcgen05::{TmemGuard, TmemReady, TmemUninit};
 
 static mut TMEM_SLOT: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
 

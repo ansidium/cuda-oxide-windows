@@ -12,7 +12,7 @@
 //! - mbarrier: Barrier-based completion tracking
 //!
 //! Note: This example requires Hopper (sm_90) or newer GPUs.
-//! For TMA multicast (sm_100a), see the `tma_multicast` example.
+//! For TMA multicast (also sm_90+), see the `tma_multicast` example.
 //!
 //! Build and run with:
 //!   cargo oxide run tma_copy

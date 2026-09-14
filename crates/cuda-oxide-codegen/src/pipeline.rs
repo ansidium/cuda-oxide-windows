@@ -7,7 +7,7 @@
 //!
 //! Frontends stop after assembling a `dialect-mir` module. This module owns
 //! every destructive compiler stage after that boundary so the rustc frontend
-//! and the experimental frontend cannot silently diverge.
+//! and the standalone frontend cannot silently diverge.
 
 use crate::error::PipelineError;
 use crate::export::{

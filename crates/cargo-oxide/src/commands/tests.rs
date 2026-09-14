@@ -55,6 +55,12 @@ fn has_backend_identity_cfg(flags: &[&str]) -> bool {
     })
 }
 
+fn has_full_debug_cfg(flags: &[&str]) -> bool {
+    flags
+        .windows(2)
+        .any(|pair| pair == ["--cfg", FULL_DEBUG_GET_MUT_OUTLINE_CFG])
+}
+
 fn is_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1110,18 +1116,14 @@ fn sanitizer_detects_options_that_weaken_success_status() {
 fn sanitize_interop_codegen_defaults_to_line_tables_and_forwards_no_fmad() {
     let ctx = test_context(OxideConfig::default());
     let mut cmd = Command::new("cargo");
-
-    apply_interop_device_codegen_options_with_env(
-        &mut cmd,
-        &ctx,
+    let options = InteropDeviceBuildOptions::for_route(
+        InteropDeviceBuildRoute::Sanitize,
+        true,
         false,
-        InteropDeviceBuildOptions {
-            no_fmad: true,
-            unchecked_indexing: false,
-            sanitizer_line_tables: true,
-        },
-        false,
+        DeviceDebug::Off,
     );
+
+    apply_interop_device_codegen_options_with_env(&mut cmd, &ctx, false, options, None);
 
     assert_eq!(command_env(&cmd, "CUDA_OXIDE_NO_FMA").as_deref(), Some("1"));
     assert_eq!(
@@ -1129,16 +1131,17 @@ fn sanitize_interop_codegen_defaults_to_line_tables_and_forwards_no_fmad() {
         Some("line-tables")
     );
 
-    let fingerprint = sanitize_codegen_fingerprint(
+    let fingerprint = interop_codegen_fingerprint_with_env(
         &ctx,
         false,
-        true,
-        false,
-        DeviceDebug::Off,
+        options,
         Some("sm_80"),
         None,
-        Some(Path::new("/tmp/generated-ptx")),
+        Path::new("/tmp/generated-ptx"),
+        false,
+        None,
         &MaterializationMode::default(),
+        &BTreeMap::new(),
     );
     apply_codegen_configuration(
         &mut cmd,
@@ -1183,8 +1186,13 @@ fn standard_interop_codegen_forwards_no_fmad_without_debug_override() {
         &mut cmd,
         &ctx,
         false,
-        InteropDeviceBuildOptions::standard(true, false),
-        false,
+        InteropDeviceBuildOptions::for_route(
+            InteropDeviceBuildRoute::Build,
+            true,
+            false,
+            DeviceDebug::Off,
+        ),
+        None,
     );
 
     assert_eq!(command_env(&cmd, "CUDA_OXIDE_NO_FMA").as_deref(), Some("1"));
@@ -1192,21 +1200,251 @@ fn standard_interop_codegen_forwards_no_fmad_without_debug_override() {
 }
 
 #[test]
+fn interop_build_run_and_sanitize_routes_forward_device_debug() {
+    let ctx = test_context(OxideConfig::default());
+
+    for (route, requested, expected, sanitizer_line_tables) in [
+        (
+            InteropDeviceBuildRoute::Build,
+            DeviceDebug::Full,
+            "full",
+            false,
+        ),
+        (
+            InteropDeviceBuildRoute::Run,
+            DeviceDebug::LineTables,
+            "line",
+            false,
+        ),
+        (
+            InteropDeviceBuildRoute::Sanitize,
+            DeviceDebug::Full,
+            "full",
+            true,
+        ),
+    ] {
+        let options = InteropDeviceBuildOptions::for_route(route, false, false, requested);
+        assert_eq!(options.device_debug, requested);
+        assert_eq!(options.sanitizer_line_tables, sanitizer_line_tables);
+
+        let mut cmd = Command::new("cargo");
+        apply_interop_device_codegen_options_with_env(&mut cmd, &ctx, false, options, None);
+        assert_eq!(
+            command_env(&cmd, "CUDA_OXIDE_DEBUG").as_deref(),
+            Some(expected),
+            "{route:?} must forward its CLI debug policy"
+        );
+
+        let mut encoded = "base".to_string();
+        append_full_debug_rustflags(&mut encoded, &cmd, None);
+        let flags = decoded_rustflags(&encoded);
+        if requested == DeviceDebug::Full {
+            assert!(
+                has_full_debug_cfg(&flags),
+                "{route:?} omitted full-debug cfg"
+            );
+            for required in FULL_DEBUG_MIR_RUSTFLAGS {
+                assert!(flags.contains(required), "{route:?} omitted {required}");
+            }
+        } else {
+            assert_eq!(flags, ["base"]);
+        }
+    }
+}
+
+#[test]
+fn sanitize_interop_debug_precedence_is_cli_then_ambient_then_project_then_default() {
+    struct Case {
+        label: &'static str,
+        cli: DeviceDebug,
+        inherited: Option<&'static str>,
+        project: Option<&'static str>,
+        expected: &'static str,
+    }
+
+    let cases = [
+        Case {
+            label: "CLI full outranks ambient and project",
+            cli: DeviceDebug::Full,
+            inherited: Some("line"),
+            project: Some("off"),
+            expected: "full",
+        },
+        Case {
+            label: "CLI line tables outrank ambient and project",
+            cli: DeviceDebug::LineTables,
+            inherited: Some("full"),
+            project: Some("off"),
+            expected: "line",
+        },
+        Case {
+            label: "ambient opt-out outranks project and sanitizer default",
+            cli: DeviceDebug::Off,
+            inherited: Some("off"),
+            project: Some("full"),
+            expected: "off",
+        },
+        Case {
+            label: "project setting outranks sanitizer default",
+            cli: DeviceDebug::Off,
+            inherited: None,
+            project: Some("full"),
+            expected: "full",
+        },
+        Case {
+            label: "sanitizer supplies line tables only as the final default",
+            cli: DeviceDebug::Off,
+            inherited: None,
+            project: None,
+            expected: "line-tables",
+        },
+    ];
+
+    for case in cases {
+        let ctx = test_context(OxideConfig {
+            env: case
+                .project
+                .map(|value| vec![("CUDA_OXIDE_DEBUG".to_string(), value.to_string())])
+                .unwrap_or_default(),
+            ..OxideConfig::default()
+        });
+        let options = InteropDeviceBuildOptions::for_route(
+            InteropDeviceBuildRoute::Sanitize,
+            false,
+            false,
+            case.cli,
+        );
+        let mut cmd = Command::new("cargo");
+        apply_interop_device_codegen_options_with_env(
+            &mut cmd,
+            &ctx,
+            false,
+            options,
+            case.inherited.map(OsStr::new),
+        );
+
+        assert_eq!(
+            command_env(&cmd, "CUDA_OXIDE_DEBUG").as_deref(),
+            Some(case.expected),
+            "{}",
+            case.label
+        );
+    }
+}
+
+#[test]
+fn interop_fingerprint_tracks_effective_device_debug_policy() {
+    let ctx = test_context(OxideConfig::default());
+    let project_full = test_context(OxideConfig {
+        env: vec![("CUDA_OXIDE_DEBUG".to_string(), "full".to_string())],
+        ..OxideConfig::default()
+    });
+    let materialization = MaterializationMode::default();
+    let empty_env = BTreeMap::new();
+    let mut inherited_full = BTreeMap::new();
+    inherited_full.insert("CUDA_OXIDE_DEBUG".to_string(), b"full".to_vec());
+    let mut inherited_off = BTreeMap::new();
+    inherited_off.insert("CUDA_OXIDE_DEBUG".to_string(), b"off".to_vec());
+    let options = |route, debug| InteropDeviceBuildOptions::for_route(route, false, false, debug);
+    let fingerprint = |ctx: &Context, options, inherited_env: &BTreeMap<String, Vec<u8>>| {
+        interop_codegen_fingerprint_with_env(
+            ctx,
+            false,
+            options,
+            Some("sm_80"),
+            None,
+            Path::new("/tmp/cuda-oxide-artifacts"),
+            false,
+            None,
+            &materialization,
+            inherited_env,
+        )
+    };
+
+    let off = options(InteropDeviceBuildRoute::Build, DeviceDebug::Off);
+    let line = options(InteropDeviceBuildRoute::Build, DeviceDebug::LineTables);
+    let full = options(InteropDeviceBuildRoute::Build, DeviceDebug::Full);
+    assert_ne!(
+        fingerprint(&ctx, off, &empty_env),
+        fingerprint(&ctx, line, &empty_env)
+    );
+    assert_ne!(
+        fingerprint(&ctx, off, &empty_env),
+        fingerprint(&ctx, full, &empty_env)
+    );
+    assert_ne!(
+        fingerprint(&ctx, line, &empty_env),
+        fingerprint(&ctx, full, &empty_env)
+    );
+
+    // A CLI policy replaces inherited and project values in both the command
+    // and its cache identity, rather than producing irrelevant identities.
+    assert_eq!(
+        fingerprint(&ctx, line, &empty_env),
+        fingerprint(&ctx, line, &inherited_full)
+    );
+    assert_eq!(
+        fingerprint(&ctx, line, &empty_env),
+        fingerprint(&project_full, line, &empty_env)
+    );
+    // Without a CLI level, project configuration participates in the key and
+    // an inherited value replaces it, mirroring command-environment order.
+    assert_eq!(
+        fingerprint(&project_full, off, &empty_env),
+        fingerprint(&ctx, full, &empty_env)
+    );
+    assert_eq!(
+        fingerprint(&project_full, off, &inherited_off),
+        fingerprint(&ctx, off, &inherited_off)
+    );
+
+    // Sanitizer's implicit line-table request is output-affecting even though
+    // it is not represented by a CLI DeviceDebug variant.
+    let sanitize_default = options(InteropDeviceBuildRoute::Sanitize, DeviceDebug::Off);
+    assert_ne!(
+        fingerprint(&ctx, off, &empty_env),
+        fingerprint(&ctx, sanitize_default, &empty_env)
+    );
+    assert_eq!(
+        fingerprint(&ctx, line, &empty_env),
+        fingerprint(&ctx, sanitize_default, &empty_env),
+        "implicit sanitizer line tables and explicit line tables have identical device semantics"
+    );
+    assert_eq!(
+        fingerprint(&ctx, full, &empty_env),
+        fingerprint(
+            &ctx,
+            options(InteropDeviceBuildRoute::Sanitize, DeviceDebug::Full),
+            &empty_env,
+        ),
+        "the sanitize route must not fork the cache when CLI full already fixes the policy"
+    );
+    assert_eq!(
+        fingerprint(&ctx, off, &inherited_full),
+        fingerprint(&ctx, sanitize_default, &inherited_full),
+        "ambient full suppresses the sanitizer default in both command and cache identity"
+    );
+}
+
+#[test]
 fn interop_fingerprint_tracks_artifact_mode_and_device_features() {
     let ctx = test_context(OxideConfig::default());
+    let options = InteropDeviceBuildOptions::for_route(
+        InteropDeviceBuildRoute::Build,
+        false,
+        false,
+        DeviceDebug::Off,
+    );
     let fingerprint = |emit_nvvm_ir: bool, device_features: Option<&str>| {
         interop_codegen_fingerprint(
             &ctx,
             false,
-            false,
-            false,
-            DeviceDebug::Off,
+            options,
             Some("sm_120a"),
             None,
             Path::new("/tmp/cuda-oxide-artifacts"),
             emit_nvvm_ir,
             device_features,
-            false,
             &MaterializationMode::default(),
         )
     };
@@ -1227,8 +1465,13 @@ fn interop_codegen_forwards_unchecked_indexing() {
         &mut cmd,
         &ctx,
         false,
-        InteropDeviceBuildOptions::standard(false, true),
-        false,
+        InteropDeviceBuildOptions::for_route(
+            InteropDeviceBuildRoute::Run,
+            false,
+            true,
+            DeviceDebug::Off,
+        ),
+        None,
     );
 
     assert_eq!(
@@ -1706,11 +1949,13 @@ extra-rustflags = ["--cfg", "model=\"alpha beta\""]
 }
 
 #[test]
-fn encoded_rustflags_remove_legacy_global_codegen_fingerprints() {
+fn encoded_rustflags_remove_wrapper_owned_codegen_cfgs() {
     let encoded = [
         "--cfg",
         "cuda_oxide_internal_codegen_env=\"inherited\"",
         "--cfg=cuda_oxide_internal_materializer_provenance=\"inherited\"",
+        "--cfg",
+        FULL_DEBUG_GET_MUT_OUTLINE_CFG,
         "--cfg",
         "keep_inherited",
     ]
@@ -1721,12 +1966,17 @@ fn encoded_rustflags_remove_legacy_global_codegen_fingerprints() {
         &[
             "--cfg".to_string(),
             "cuda_oxide_internal_codegen_env=\"configured\"".to_string(),
+            "--cfg=cuda_oxide_internal_outline_disjoint_get_mut_v1".to_string(),
+            "--cfg".to_string(),
+            "cuda_oxide_internal_outline_disjoint_get_mut_v1_extra".to_string(),
             "--cfg".to_string(),
             "keep_configured".to_string(),
         ],
         &[
             "--cfg".to_string(),
             "cuda_oxide_internal_materializer_provenance=\"explicit\"".to_string(),
+            "--cfg".to_string(),
+            "cuda_oxide_internal_outline_disjoint_get_mut_v1=\"spoofed\"".to_string(),
             "--cfg".to_string(),
             "keep_explicit".to_string(),
         ],
@@ -1735,11 +1985,27 @@ fn encoded_rustflags_remove_legacy_global_codegen_fingerprints() {
     );
     let flags = decoded_rustflags(&rustflags);
 
-    assert!(!flags.iter().any(|flag| {
-        flag.contains(LEGACY_CODEGEN_FINGERPRINT_CFG)
-            || flag.contains(LEGACY_MATERIALIZER_PROVENANCE_CFG)
-    }));
-    for retained in ["keep_configured", "keep_inherited", "keep_explicit"] {
+    let is_wrapper_owned_cfg = |flag: &&str| {
+        let value = flag.strip_prefix("--cfg=").unwrap_or(flag);
+        [
+            LEGACY_CODEGEN_FINGERPRINT_CFG,
+            LEGACY_MATERIALIZER_PROVENANCE_CFG,
+            FULL_DEBUG_GET_MUT_OUTLINE_CFG,
+        ]
+        .iter()
+        .any(|name| {
+            value
+                .strip_prefix(name)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('='))
+        })
+    };
+    assert!(!flags.iter().any(is_wrapper_owned_cfg));
+    for retained in [
+        "cuda_oxide_internal_outline_disjoint_get_mut_v1_extra",
+        "keep_configured",
+        "keep_inherited",
+        "keep_explicit",
+    ] {
         assert!(flags.contains(&retained));
     }
 }
@@ -4286,42 +4552,45 @@ fn passthrough_fingerprint_separates_the_device_debug_policies() {
     assert_ne!(fp(&line_tables), fp(&full));
 }
 
-/// Full debug disables only the two MIR passes that erase debugger-visible
-/// state (scalar replacement splits closure environments, single-use const
-/// folding removes constant locals' places); every other MIR optimization
-/// stays on, so the importer sees release-build MIR shapes.
+/// Full debug excludes only SROA and `SingleUseConsts`.
+/// `ReferencePropagation` and MIR inlining stay enabled; a private cfg outlines
+/// only `DisjointSlice::get_mut` to keep CUDA-GDB frame ranges accurate.
 #[test]
-fn full_device_debug_disables_only_debug_hostile_mir_passes() {
+fn full_device_debug_applies_only_the_targeted_debug_controls() {
     let cmd = Command::new("cargo");
     let mut encoded = "base".to_string();
 
-    append_full_debug_mir_rustflag(&mut encoded, &cmd, Some("full"));
+    append_full_debug_rustflags(&mut encoded, &cmd, Some("full"));
 
     assert_eq!(
         decoded_rustflags(&encoded),
         [
             "base",
+            "--cfg",
+            FULL_DEBUG_GET_MUT_OUTLINE_CFG,
             "-Zmir-enable-passes=-ScalarReplacementOfAggregates,-SingleUseConsts"
         ]
     );
     assert!(!encoded.contains("mir-opt-level"), "{encoded}");
+    assert!(!encoded.contains("inline-mir"), "{encoded}");
 }
 
 #[test]
-fn numeric_full_debug_alias_selects_the_same_mir_flag() {
-    // The backend accepts `CUDA_OXIDE_DEBUG=2` as full debug; the shared
-    // parser guarantees the build policy agrees, so `2` must select the same
-    // MIR flag as `full`.
+fn numeric_full_debug_alias_selects_the_same_rustc_controls() {
+    // The shared parser makes `CUDA_OXIDE_DEBUG=2` select the same rustc
+    // controls as `full`.
     let mut cmd = Command::new("cargo");
     cmd.env("CUDA_OXIDE_DEBUG", "2");
     let mut encoded = "base".to_string();
 
-    append_full_debug_mir_rustflag(&mut encoded, &cmd, None);
+    append_full_debug_rustflags(&mut encoded, &cmd, None);
 
     assert_eq!(
         decoded_rustflags(&encoded),
         [
             "base",
+            "--cfg",
+            FULL_DEBUG_GET_MUT_OUTLINE_CFG,
             "-Zmir-enable-passes=-ScalarReplacementOfAggregates,-SingleUseConsts"
         ]
     );
@@ -4333,7 +4602,7 @@ fn line_tables_keep_normal_mir_optimization() {
     cmd.env("CUDA_OXIDE_DEBUG", "line");
     let mut encoded = "base".to_string();
 
-    append_full_debug_mir_rustflag(&mut encoded, &cmd, None);
+    append_full_debug_rustflags(&mut encoded, &cmd, None);
 
     assert_eq!(decoded_rustflags(&encoded), ["base"]);
 }
@@ -4344,9 +4613,51 @@ fn explicit_line_tables_override_inherited_full_debug_for_mir_optimization() {
     cmd.env("CUDA_OXIDE_DEBUG", "line");
     let mut encoded = "base".to_string();
 
-    append_full_debug_mir_rustflag(&mut encoded, &cmd, Some("full"));
+    append_full_debug_rustflags(&mut encoded, &cmd, Some("full"));
 
     assert_eq!(decoded_rustflags(&encoded), ["base"]);
+}
+
+#[test]
+fn non_full_codegen_profiles_do_not_activate_the_targeted_debug_cfg() {
+    for profile in [
+        CodegenProfilePolicy::CargoSelected,
+        CodegenProfilePolicy::ReleaseLike,
+        CodegenProfilePolicy::ReleaseLikeWithDebugInfo,
+    ] {
+        for (debug, inherited) in [
+            (None, None),
+            (Some("off"), Some("full")),
+            (Some("line"), Some("full")),
+        ] {
+            let mut encoded = build_encoded_rustflags_with_existing(
+                Path::new("/tmp/librustc_codegen_cuda.so"),
+                profile,
+                &[],
+                &[],
+                None,
+                None,
+            );
+            let mut cmd = Command::new("cargo");
+            if let Some(debug) = debug {
+                cmd.env("CUDA_OXIDE_DEBUG", debug);
+            }
+
+            append_full_debug_rustflags(&mut encoded, &cmd, inherited);
+
+            let flags = decoded_rustflags(&encoded);
+            assert!(
+                !has_full_debug_cfg(&flags),
+                "{profile:?}/{debug:?}: {flags:?}"
+            );
+            assert!(
+                !flags
+                    .iter()
+                    .any(|flag| FULL_DEBUG_MIR_RUSTFLAGS.contains(flag)),
+                "{profile:?}/{debug:?}: {flags:?}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

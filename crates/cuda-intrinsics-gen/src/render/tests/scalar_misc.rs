@@ -667,7 +667,10 @@ fn clc_rendering_preserves_api_and_uses_typed_llvm_routes() {
     assert!(importer.contains("cuda_device::clc::clc_try_cancel"));
     assert!(importer.contains("ClcTryCancelOp::get_concrete_op_info()"));
     assert!(importer.contains("ClcQueryIsCanceledOp::get_concrete_op_info()"));
-    assert!(importer.contains("helpers::emit_store_result_and_goto"));
+    // Destination is prepared before the intrinsic op is built, then the
+    // result is written through it: two typed helper routes, in that order.
+    assert!(importer.contains("helpers::prepare_destination_write("));
+    assert!(importer.contains("helpers::emit_prepared_result_and_goto("));
 
     let lowering = render_lowering(&catalog, "test-hash");
     assert!(lowering.contains("clc::convert_generated_clc_query"));

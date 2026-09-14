@@ -22,7 +22,7 @@ pub enum IketInstrumentation {
 
 /// Explicit backend knobs; replaces every `CUDA_OXIDE_*` env read inside the
 /// backend. `run_pipeline` (mir-importer) builds one from the environment at
-/// its own boundary. The experimental API builds one from typed compile
+/// its own boundary. The standalone API builds one from typed compile
 /// options without reading the environment.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -34,7 +34,7 @@ pub struct BackendOptions {
     /// Human-readable name for whatever set `target_arch`, used only to
     /// describe target provenance in diagnostics and errors (e.g.
     /// `"CUDA_OXIDE_TARGET"` for the env-driven rustc pipeline, or a
-    /// caller-facing description for the standalone experimental API).
+    /// caller-facing description for the standalone API).
     ///
     /// Keep this in step with `target_arch`: whoever writes one writes the
     /// other, or a target error names a source the caller never used.

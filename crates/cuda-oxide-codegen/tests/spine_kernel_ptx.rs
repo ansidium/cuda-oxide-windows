@@ -8,7 +8,7 @@
 //!
 //! This builds the irreducible `out[i] = a[i] + b[i]` kernel directly in
 //! `dialect-mir` + `dialect-nvvm` (no rustc, no CubeCL), drives it through
-//! the experimental `Compiler`, and asserts the emitted PTX carries a
+//! the standalone `Compiler`, and asserts the emitted PTX carries a
 //! `.visible .entry` for `sm_120` that `ptxas` compiles to a cubin. The kernel
 //! constructed here is the recipe a later CubeCL-walk task mirrors.
 //!

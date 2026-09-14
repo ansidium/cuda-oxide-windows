@@ -190,7 +190,7 @@ jobs:
       - name: Probe every declared LLVM-NVPTX target
         run: |
           # Stock runners do not carry the recorded CUDA 13.3 ptxas binary.
-          # Probe the current stable toolchain's llc and require exact emitted PTX.
+          # Compare the current stable toolchain's llc and require exact emitted PTX.
           toolchain_libdir="$(rustc --print target-libdir)"
           llc="$(dirname "${toolchain_libdir}")/bin/llc"
           cargo run -p cuda-intrinsics-gen -- probe --all --llc "${llc}" --skip-terminal --per-target

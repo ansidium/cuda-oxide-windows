@@ -111,7 +111,7 @@ fn link_libdevice(
 /// output (issue #150: an LLVM 22 `opt` emits sizeless
 /// `llvm.lifetime.start/end` intrinsics that an LLVM 21 `llc` rejects).
 ///
-/// Returns the optimized path plus caller-owned diagnostics. Experimental v1
+/// Returns the optimized path plus caller-owned diagnostics. The standalone v1 API
 /// is strict; the legacy rustc path retains its warn-and-continue behavior.
 /// LLVM's verifier prints this when a module's debug metadata is malformed.
 /// It then strips every debug node instead of failing, so `opt` and `llc`
@@ -540,7 +540,7 @@ pub(crate) fn generate_ptx_discovered(
 
 /// Generate PTX with an already-resolved toolchain.
 ///
-/// The experimental compiler uses this entry point so discovery is explicit
+/// The standalone compiler uses this entry point so discovery is explicit
 /// and one [`LlvmToolchain`] can be reused across compilations.
 pub(crate) fn generate_ptx_with_toolchain(
     module: PtxModule<'_>,
@@ -646,12 +646,12 @@ fn generate_ptx_impl(
     // from the exact llc input below because linking and optimization can also
     // introduce backend intrinsics (notably llvm.stacksave/stackrestore).
     //
-    // Full-debug is a `-G`-style build: it keeps every local in memory and
-    // describes it with `llvm.dbg.declare`. Running `opt -O2` would promote
-    // those slots to registers and collapse their live ranges, turning most
-    // in-scope locals into `<optimized out>` under cuda-gdb. So we feed the
-    // unoptimized IR straight to llc when variable info is requested, matching
-    // nvcc `-G`. (llc itself is invoked at `-O0` for the same builds below.)
+    // Full-debug is a `-G`-style build: it keeps eligible imported locals in
+    // memory and describes them with `llvm.dbg.declare`. Running `opt -O2`
+    // would promote those slots to registers and collapse their live ranges,
+    // turning most in-scope locals into `<optimized out>` under cuda-gdb. So we
+    // feed the unoptimized IR straight to llc when variable info is requested,
+    // matching nvcc `-G`. (llc itself uses `-O0` for these builds below.)
     let optimized = if debug_kind.variables_enabled() {
         if opts.verbose {
             record_diagnostic(
@@ -1111,7 +1111,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn legacy_opt_failure_warns_but_experimental_mode_fails() {
+    fn legacy_opt_failure_warns_but_standalone_mode_fails() {
         let opt_path = posix_utility("false");
         let toolchain = LlvmToolchain {
             llc_path: posix_utility("true"),

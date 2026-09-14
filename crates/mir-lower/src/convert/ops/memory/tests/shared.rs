@@ -558,3 +558,106 @@ fn shared_and_device_global_indices_are_per_module_not_process_global() {
         );
     }
 }
+
+/// Append a `mir.extern_shared` (dynamic shared memory) to `block` with the
+/// given launch-contract alignment and byte offset into the pool.
+fn append_extern_shared(
+    ctx: &mut Context,
+    block: Ptr<BasicBlock>,
+    alignment: u64,
+    byte_offset: u64,
+) -> Ptr<Operation> {
+    let i8_ty: TypeHandle = IntegerType::get(ctx, 8, Signedness::Signless).into();
+    let shared_i8 = MirPtrType::get_shared(ctx, i8_ty, true);
+    let op = Operation::new(
+        ctx,
+        mir::MirExternSharedOp::get_concrete_op_info(),
+        vec![shared_i8.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    let extern_shared = mir::MirExternSharedOp::new(op);
+    extern_shared.set_alignment_value(ctx, alignment);
+    extern_shared.set_byte_offset_value(ctx, byte_offset);
+    op.insert_at_back(block, ctx);
+    op
+}
+
+/// A `mir.extern_shared` with a nonzero byte offset addresses into an extern
+/// `[0 x i8]` addrspace(3) global whose real size only exists at launch, so
+/// the lowering cannot promise LLVM's `inbounds` allocated-object contract
+/// for that GEP:
+///
+/// ```text
+/// @__dynamic_smem_*  external addrspace(3) global [0 x i8]      size known at launch only
+///        |
+///        +-- getelementptr i8, ptr addrspace(3) @__dynamic_smem_*, i64 64     plain: fine
+///        +-- getelementptr inbounds i8, ...                                    promise we cannot keep
+/// ```
+///
+/// Before the upstream no-wrap flags, the exporter treated an unset attribute
+/// as `inbounds`, so this GEP shipped as `getelementptr inbounds`. It must
+/// stay a plain `getelementptr`.
+///
+/// Scope: today the importer only sets `byte_offset = 0` on this op (that is
+/// `DynamicSharedArray::get()`); `offset(N)` goes through a separate
+/// `mir.ptr_offset`. So this locks the op's own contract; the `offset(N)`
+/// path real kernels take is a separate follow-up.
+#[test]
+fn extern_shared_byte_offset_gep_carries_no_no_wrap_flags() {
+    use llvm_export::attributes::GepNoWrapFlags;
+
+    let mut ctx = make_ctx();
+    let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+    append_extern_shared(&mut ctx, block, 16, 64);
+    append_mir_return(&mut ctx, block, vec![]);
+
+    crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+    let body = kernel_blocks(&ctx, module_ptr);
+    let gep = find_first::<llvm::GetElementPtrOp>(&ctx, &body)
+        .expect("a nonzero byte offset must lower to one llvm.gep");
+    assert_eq!(
+        gep.no_wrap_flags(&ctx),
+        GepNoWrapFlags::empty(),
+        "the dynamic shared-memory GEP must not claim inbounds, nusw, or nuw"
+    );
+
+    let module = Operation::get_op::<pliron::builtin::ops::ModuleOp>(module_ptr, &ctx)
+        .expect("lowered top-level op is a module");
+    let ir = llvm_export::export::export_module_to_string(&ctx, &module).expect("export");
+    assert!(
+        ir.contains("getelementptr i8,"),
+        "the byte-offset GEP must export as a plain i8 getelementptr:\n{ir}"
+    );
+    assert!(
+        !ir.contains("getelementptr inbounds"),
+        "the dynamic shared-memory GEP must not export as inbounds:\n{ir}"
+    );
+}
+
+/// Control for the test above: `DynamicSharedArray::get()` (offset 0) is
+/// just the pool base, so the lowering hands back the `llvm.addressof`
+/// directly and there is no GEP whose flags could be wrong.
+#[test]
+fn extern_shared_zero_byte_offset_is_the_bare_address_of() {
+    let mut ctx = make_ctx();
+    let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+    append_extern_shared(&mut ctx, block, 16, 0);
+    append_mir_return(&mut ctx, block, vec![]);
+
+    crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+    let body = kernel_blocks(&ctx, module_ptr);
+    assert_eq!(
+        count_ops::<llvm::GetElementPtrOp>(&ctx, &body),
+        0,
+        "a zero byte offset must not emit a GEP at all"
+    );
+    assert_eq!(
+        count_ops::<llvm::AddressOfOp>(&ctx, &body),
+        1,
+        "a zero byte offset lowers to exactly one llvm.addressof of the pool"
+    );
+}

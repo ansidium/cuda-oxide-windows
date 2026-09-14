@@ -13,7 +13,7 @@ use llvm_export::{
         DebugFragmentVariableInfo, DebugGlobalVariableInfo, DebugLocalTypeKind,
         DebugLocalVariableInfo, DebugProjectedVariableInfo, DebugSourcePosition, DebugSourceScope,
         DebugSourceScopeLocation, DebugSourceScopeMap, DebugValueExpression,
-        DebugValueExpressionOp, DebugValueListOp, DebugValueOp, FuncOp,
+        DebugValueExpressionOp, DebugValueListOp, DebugValueOp, DebugWholeVariableInfo, FuncOp,
         GlobalInitializerRelocation, GlobalOp, GlobalOpExt, ReturnOp, StoreOp,
         encode_global_initializer_relocations,
     },
@@ -425,22 +425,55 @@ fn full_debug_metadata_emits_dbg_declare_for_tagged_allocas() {
     let ptr = AllocaOp::new(&mut ctx, ptr_ty.into(), one_val);
     let ptr_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/kernel.rs", 32, 9);
     ptr.get_operation().deref_mut(&ctx).set_loc(ptr_loc);
+    let ptr_debug_ty = DebugLocalTypeKind::TypedPointer {
+        name: "*mut f32".to_string(),
+        size_bits: 64,
+        pointee: Box::new(DebugLocalTypeKind::Basic {
+            name: "f32".to_string(),
+            size_bits: 32,
+            encoding: "DW_ATE_float",
+        }),
+    };
     llvm_export::ops::set_debug_local_variable(
         &mut ctx,
         ptr.get_operation(),
         DebugLocalVariableInfo {
             name: "ptr".to_string(),
             argument_index: None,
-            ty: DebugLocalTypeKind::TypedPointer {
-                name: "*mut f32".to_string(),
-                size_bits: 64,
-                pointee: Box::new(DebugLocalTypeKind::Basic {
-                    name: "f32".to_string(),
-                    size_bits: 32,
-                    encoding: "DW_ATE_float",
+            ty: ptr_debug_ty.clone(),
+        },
+    );
+    llvm_export::ops::set_debug_whole_variable_aliases(
+        &mut ctx,
+        ptr.get_operation(),
+        &[
+            DebugWholeVariableInfo {
+                variable: DebugLocalVariableInfo {
+                    name: "first".to_string(),
+                    argument_index: None,
+                    ty: ptr_debug_ty.clone(),
+                },
+                source_scope: None,
+                declaration: Some(DebugSourcePosition {
+                    file: PathBuf::from("/tmp/cuda-oxide/tests/kernel.rs"),
+                    line: 32,
+                    column: 13,
                 }),
             },
-        },
+            DebugWholeVariableInfo {
+                variable: DebugLocalVariableInfo {
+                    name: "second".to_string(),
+                    argument_index: None,
+                    ty: ptr_debug_ty,
+                },
+                source_scope: None,
+                declaration: Some(DebugSourcePosition {
+                    file: PathBuf::from("/tmp/cuda-oxide/tests/kernel.rs"),
+                    line: 33,
+                    column: 13,
+                }),
+            },
+        ],
     );
     ptr.get_operation().insert_at_back(entry, &ctx);
 
@@ -560,6 +593,16 @@ fn full_debug_metadata_emits_dbg_declare_for_tagged_allocas() {
     assert!(
         ir.contains("!DILocalVariable(name: \"ptr\", scope: !"),
         "local debug metadata should omit the arg field:\n{ir}"
+    );
+    assert!(
+        ir.contains("!DILocalVariable(name: \"first\", scope: !")
+            && ir.contains("!DILocalVariable(name: \"second\", scope: !"),
+        "each whole identity sharing the ptr alloca must get its own DILocalVariable:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("call void @llvm.dbg.declare").count(),
+        7,
+        "five allocas plus two aliases must produce seven independent dbg.declare calls:\n{ir}"
     );
     assert!(
         ir.contains("!DIBasicType(name: \"u32\", size: 32, encoding: DW_ATE_unsigned)"),
@@ -768,6 +811,217 @@ fn full_debug_metadata_describes_as1_global_with_semantic_rust_type() {
     assert_eq!(
         line_tables, off,
         "a global-only module must not gain variable metadata outside full debug"
+    );
+}
+
+#[test]
+fn full_debug_metadata_describes_as4_constant_with_semantic_rust_type() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "constant_debug".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Signless);
+    let storage_ty = ArrayType::get(&ctx, i8_ty.into(), 4);
+    let linkage_name = reserved_oxide_symbols::constant_symbol("kernels_L11C5_SCALE");
+    let constant = GlobalOp::new_with_alignment(
+        &mut ctx,
+        linkage_name.as_str().try_into().unwrap(),
+        storage_ty.into(),
+        4,
+    );
+    constant.set_address_space(&mut ctx, llvm_export::types::address_space::CONSTANT);
+    constant.set_initializer_hex(&mut ctx, "00000000");
+    llvm_export::ops::set_debug_global_variable(
+        &mut ctx,
+        constant.get_operation(),
+        &DebugGlobalVariableInfo {
+            name: "SCALE".to_string(),
+            namespace: vec!["constant_debug".to_string(), "kernels".to_string()],
+            ty: DebugLocalTypeKind::Struct {
+                name: "ConstantMemory".to_string(),
+                size_bits: 32,
+                members: vec![llvm_export::ops::DebugTypeMember {
+                    name: "0".to_string(),
+                    offset_bits: 0,
+                    ty: DebugLocalTypeKind::Struct {
+                        name: "UnsafeCell".to_string(),
+                        size_bits: 32,
+                        members: vec![llvm_export::ops::DebugTypeMember {
+                            name: "value".to_string(),
+                            offset_bits: 0,
+                            ty: DebugLocalTypeKind::Basic {
+                                name: "f32".to_string(),
+                                size_bits: 32,
+                                encoding: "DW_ATE_float",
+                            },
+                        }],
+                    },
+                }],
+            },
+            declaration: DebugSourcePosition {
+                file: PathBuf::from("/tmp/cuda-oxide/tests/constant.rs"),
+                line: 11,
+                column: 5,
+            },
+            is_local_to_unit: false,
+            is_function_local: false,
+        },
+    );
+    constant.get_operation().insert_at_back(module_block, &ctx);
+
+    // A synthetically tagged AS5 global makes the exporter allow-list
+    // adversarial: adding AS4 must not accidentally enable arbitrary spaces.
+    let unsupported = GlobalOp::new_with_alignment(
+        &mut ctx,
+        "local_space_sentinel".try_into().unwrap(),
+        storage_ty.into(),
+        4,
+    );
+    unsupported.set_address_space(&mut ctx, llvm_export::types::address_space::LOCAL);
+    unsupported.set_initializer_hex(&mut ctx, "00000000");
+    llvm_export::ops::set_debug_global_variable(
+        &mut ctx,
+        unsupported.get_operation(),
+        &DebugGlobalVariableInfo {
+            name: "MUST_NOT_APPEAR".to_string(),
+            namespace: vec!["constant_debug".to_string()],
+            ty: DebugLocalTypeKind::Basic {
+                name: "u32".to_string(),
+                size_bits: 32,
+                encoding: "DW_ATE_unsigned",
+            },
+            declaration: DebugSourcePosition {
+                file: PathBuf::from("/tmp/cuda-oxide/tests/constant.rs"),
+                line: 15,
+                column: 5,
+            },
+            is_local_to_unit: true,
+            is_function_local: false,
+        },
+    );
+    unsupported
+        .get_operation()
+        .insert_at_back(module_block, &ctx);
+
+    let full = export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &DebugConfig {
+            inner: PtxExportConfig,
+            debug_kind: DebugKind::Full,
+        },
+    )
+    .expect("full constant-memory debug export succeeds");
+
+    let definition = full
+        .lines()
+        .find(|line| line.starts_with(&format!("@{linkage_name} = ")))
+        .expect("constant-memory definition");
+    assert!(
+        definition.contains("addrspace(4) global [4 x i8] c\"\\00\\00\\00\\00\"")
+            && definition.contains(", align 4, !dbg !"),
+        "physical AS4 byte storage must retain a global debug attachment:\n{full}"
+    );
+    assert!(
+        full.contains(&format!(
+            "distinct !DIGlobalVariable(name: \"SCALE\", linkageName: \"{linkage_name}\""
+        )),
+        "DWARF must separate the Rust leaf name from constant-memory linkage:\n{full}"
+    );
+    assert!(
+        full.lines()
+            .find(|line| line.contains("distinct !DIGlobalVariable(name: \"SCALE\""))
+            .is_some_and(|line| line.contains("isLocal: false, isDefinition: true")),
+        "a host-settable constant symbol must retain external visibility:\n{full}"
+    );
+    assert!(
+        full.contains("!DINamespace(name: \"constant_debug\", scope: null)")
+            && full.contains("!DINamespace(name: \"kernels\", scope: !"),
+        "the crate/module namespace must scope the AS4 source name:\n{full}"
+    );
+
+    let f32_id = metadata_id(
+        &full,
+        "!DIBasicType(name: \"f32\", size: 32, encoding: DW_ATE_float)",
+    );
+    let value_member_id = metadata_id(
+        &full,
+        &format!(
+            "!DIDerivedType(tag: DW_TAG_member, name: \"value\", baseType: {f32_id}, size: 32, offset: 0)"
+        ),
+    );
+    let unsafe_cell_elements_id = metadata_id(&full, &format!("!{{{value_member_id}}}"));
+    let unsafe_cell_id = metadata_id(
+        &full,
+        &format!(
+            "!DICompositeType(tag: DW_TAG_structure_type, name: \"UnsafeCell\", size: 32, elements: {unsafe_cell_elements_id})"
+        ),
+    );
+    let wrapper_member_id = metadata_id(
+        &full,
+        &format!(
+            "!DIDerivedType(tag: DW_TAG_member, name: \"0\", baseType: {unsafe_cell_id}, size: 32, offset: 0)"
+        ),
+    );
+    let wrapper_elements_id = metadata_id(&full, &format!("!{{{wrapper_member_id}}}"));
+    let wrapper_id = metadata_id(
+        &full,
+        &format!(
+            "!DICompositeType(tag: DW_TAG_structure_type, name: \"ConstantMemory\", size: 32, elements: {wrapper_elements_id})"
+        ),
+    );
+    assert!(
+        full.lines()
+            .find(|line| line.contains("distinct !DIGlobalVariable(name: \"SCALE\""))
+            .is_some_and(|line| line.contains(&format!("type: {wrapper_id},"))),
+        "the AS4 DIE must use the ConstantMemory/UnsafeCell/f32 source graph, not physical [4 x i8] storage:\n{full}"
+    );
+
+    let variable_id = metadata_id(
+        &full,
+        "distinct !DIGlobalVariable(name: \"SCALE\", linkageName:",
+    );
+    let expression_line = full
+        .lines()
+        .find(|line| line.contains(&format!("!DIGlobalVariableExpression(var: {variable_id},")))
+        .expect("constant-memory global expression");
+    assert!(
+        expression_line.ends_with("expr: !DIExpression())"),
+        "AS4 must keep the empty LLVM expression that NVPTX lowers to address class 4:\n{full}"
+    );
+    assert!(
+        full.contains("emissionKind: FullDebug, globals: !"),
+        "the compile unit must retain the AS4 expression:\n{full}"
+    );
+    let unsupported_definition = full
+        .lines()
+        .find(|line| line.starts_with("@local_space_sentinel = "))
+        .expect("unsupported-space sentinel definition");
+    assert!(
+        !unsupported_definition.contains("!dbg") && !full.contains("MUST_NOT_APPEAR"),
+        "the exporter must continue to reject debug globals outside AS1/AS3/AS4:\n{full}"
+    );
+
+    let off = export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &DebugConfig {
+            inner: PtxExportConfig,
+            debug_kind: DebugKind::Off,
+        },
+    )
+    .expect("non-debug export succeeds");
+    let line_tables = export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &DebugConfig {
+            inner: PtxExportConfig,
+            debug_kind: DebugKind::LineTables,
+        },
+    )
+    .expect("line-table export succeeds");
+    assert_eq!(
+        line_tables, off,
+        "AS4 variable metadata must remain gated to full debug"
     );
 }
 

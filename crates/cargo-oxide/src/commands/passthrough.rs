@@ -26,8 +26,9 @@ pub enum DeviceDebug {
     Off,
     /// Preserve source line mappings without disabling optimization.
     LineTables,
-    /// Emit full debug information; the LLVM side runs unoptimized (nvcc `-G`) and
-    /// only the two debugger-hostile MIR passes are disabled.
+    /// Emit full debug information; the LLVM side runs unoptimized (nvcc `-G`),
+    /// debugger-hostile MIR passes are disabled, and `DisjointSlice::get_mut`
+    /// is temporarily non-inline for accurate NVPTX frame ranges.
     Full,
 }
 

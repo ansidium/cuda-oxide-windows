@@ -297,7 +297,7 @@ The stream is assigned later, by the scheduling policy.
 until the `ExecutionContext` is available:
 
 ```rust
-use cuda_async::simt::device_operation::{with_context, value};
+use cuda_async::simt::device_operation::{value, with_context};
 use cuda_core::simt::memory::{malloc_async, memcpy_htod_async};
 
 fn h2d(host_data: Vec<f32>) -> impl DeviceOperation<Output = DeviceBox<[f32]>> {
