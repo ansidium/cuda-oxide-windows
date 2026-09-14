@@ -1132,7 +1132,7 @@ impl<'tcx> DeviceCollector<'tcx> {
             // kind (a reified `#[target_feature]` fn, say) must be checked.
             if !matches!(
                 func.instance.def,
-                InstanceKind::Shim(ShimKind::DropGlue(..) | ShimKind::FnPtrAsPtr(..))
+                InstanceKind::Shim(ShimKind::DropGlue(..) | ShimKind::FnPtrAddr(..))
             ) {
                 self.check_host_cpu_only(def_id, ctx.user_span, &ctx, None);
             }
